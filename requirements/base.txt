@@ -1,0 +1,11 @@
+django>=4.2,<5.0
+djangorestframework
+djangorestframework-simplejwt
+psycopg2-binary
+django-cors-headers
+django-filter
+django-redis
+celery
+redis
+python-decouple
+gunicorn

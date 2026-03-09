@@ -1,0 +1,11 @@
+-r base.txt
+
+django-debug-toolbar
+django-extensions
+ipython
+flake8
+black
+isort
+pytest
+pytest-django
+factory-boy
