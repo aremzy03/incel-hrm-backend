@@ -1,13 +1,20 @@
 from django.contrib.auth import get_user_model
 from django.shortcuts import get_object_or_404
-from rest_framework import generics, permissions, status
+from rest_framework import generics, permissions, status, viewsets
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
-from .models import Role, UserRole
+from .models import Department, Role, UserRole
 from .permissions import IsHR
-from .serializers import RegisterSerializer, RoleSerializer, UserRoleSerializer, UserSerializer
+from .serializers import (
+    DepartmentSerializer,
+    RegisterSerializer,
+    RoleSerializer,
+    UserDepartmentUpdateSerializer,
+    UserRoleSerializer,
+    UserSerializer,
+)
 
 User = get_user_model()
 
@@ -19,6 +26,8 @@ __all__ = [
     "RoleListCreateView",
     "AssignRoleView",
     "RemoveRoleView",
+    "DepartmentViewSet",
+    "UserDepartmentUpdateView",
 ]
 
 
@@ -46,6 +55,43 @@ class MeView(APIView):
 
     def get(self, request):
         return Response(UserSerializer(request.user).data)
+
+
+# ---------------------------------------------------------------------------
+# Departments
+# ---------------------------------------------------------------------------
+
+class DepartmentViewSet(viewsets.ModelViewSet):
+    """
+    GET    /api/v1/departments/       — anyone (no auth required)
+    POST   /api/v1/departments/       — HR or admin
+    GET    /api/v1/departments/:id/   — anyone (no auth required)
+    PUT    /api/v1/departments/:id/   — HR or admin
+    PATCH  /api/v1/departments/:id/   — HR or admin
+    DELETE /api/v1/departments/:id/   — HR or admin
+    """
+
+    queryset = Department.objects.all()
+    serializer_class = DepartmentSerializer
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [permissions.AllowAny()]
+        return [permissions.IsAuthenticated(), IsHR() | permissions.IsAdminUser()]
+
+
+class UserDepartmentUpdateView(APIView):
+    """PATCH /api/v1/users/:id/department/ — HR or admin only."""
+
+    permission_classes = [permissions.IsAuthenticated, IsHR | permissions.IsAdminUser]
+
+    def patch(self, request, user_id):
+        user = get_object_or_404(User, pk=user_id)
+        serializer = UserDepartmentUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user.department = serializer.validated_data["department"]
+        user.save(update_fields=["department", "updated_at"])
+        return Response(UserSerializer(user).data)
 
 
 # ---------------------------------------------------------------------------

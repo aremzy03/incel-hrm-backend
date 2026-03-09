@@ -3,22 +3,27 @@ Leave management API views.
 
 Viewset summary
 ---------------
-LeaveTypeViewSet        – ReadOnly, any authenticated user
-LeaveBalanceViewSet     – ReadOnly, role-filtered queryset + ?employee=&year= filters
-LeaveRequestViewSet     – Full CRUD minus DELETE, role-filtered queryset
+LeaveTypeViewSet           – ReadOnly, any authenticated user
+LeaveBalanceViewSet        – ReadOnly, role-filtered queryset + ?employee=&year= filters
+LeaveRequestViewSet        – Full CRUD minus DELETE, role-filtered queryset
   custom actions:
-    POST  submit/:id/   – Employee: DRAFT → PENDING_MANAGER
-    POST  approve/:id/  – Stage-based role transitions
-    POST  reject/:id/   – Matching approver at current stage (comment required)
-    POST  cancel/:id/   – Employee (own DRAFT/PENDING_MANAGER) or HR (any active)
-    GET   logs/:id/     – Approval audit trail (HR, Manager, ED, or request owner)
+    POST  submit/:id/      – Employee: DRAFT → PENDING_MANAGER
+    POST  approve/:id/     – Stage-based role transitions
+    POST  reject/:id/      – Matching approver at current stage (comment required)
+    POST  cancel/:id/      – Employee (own DRAFT/PENDING_MANAGER) or HR (any active)
+    GET   logs/:id/        – Approval audit trail (HR, Manager, ED, or request owner)
+DepartmentCalendarView     – GET /api/v1/calendar/  dept-scoped approved leave
 """
 
+import datetime
+
 from django.db import transaction
+from django.db.models import Q
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from apps.accounts.models import RoleName
 from apps.accounts.permissions import IsEmployee, IsHR
@@ -32,6 +37,7 @@ from .models import (
     LeaveType,
 )
 from .serializers import (
+    CalendarEntrySerializer,
     LeaveApprovalLogSerializer,
     LeaveBalanceSerializer,
     LeaveRequestCreateSerializer,
@@ -280,7 +286,6 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
             if next_status == LeaveRequestStatus.APPROVED:
                 _deduct_leave_balance(leave_request)
-                # TODO: update department calendar when Dept model is available
 
             _create_log(
                 leave_request=leave_request,
@@ -409,4 +414,72 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
         logs_qs = leave_request.logs.select_related("actor").all()
         serializer = LeaveApprovalLogSerializer(logs_qs, many=True)
+        return Response(serializer.data)
+
+
+# ---------------------------------------------------------------------------
+# Department Calendar
+# ---------------------------------------------------------------------------
+
+_PRIVILEGED_ROLES = frozenset({
+    RoleName.HR,
+    RoleName.EXECUTIVE_DIRECTOR,
+    RoleName.MANAGING_DIRECTOR,
+})
+
+
+class DepartmentCalendarView(APIView):
+    """
+    GET /api/v1/calendar/?year=<int>&month=<int>[&department=<uuid>]
+
+    Returns approved leave requests scoped by the caller's role:
+      - Employee / Line Manager → own department only
+      - HR / ED / MD / staff    → all departments (optionally filtered)
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        today = datetime.date.today()
+        year = int(request.query_params.get("year", today.year))
+        month = request.query_params.get("month")
+
+        qs = (
+            LeaveRequest.objects
+            .filter(status=LeaveRequestStatus.APPROVED)
+            .select_related("employee__department", "leave_type")
+        )
+
+        if month:
+            month = int(month)
+            period_start = datetime.date(year, month, 1)
+            if month == 12:
+                period_end = datetime.date(year + 1, 1, 1)
+            else:
+                period_end = datetime.date(year, month + 1, 1)
+            qs = qs.filter(
+                Q(start_date__lt=period_end) & Q(end_date__gte=period_start)
+            )
+        else:
+            qs = qs.filter(
+                Q(start_date__year=year) | Q(end_date__year=year)
+            )
+
+        has_privilege = (
+            user.is_staff
+            or any(user.has_role(r) for r in _PRIVILEGED_ROLES)
+        )
+
+        if has_privilege:
+            dept_filter = request.query_params.get("department")
+            if dept_filter:
+                qs = qs.filter(employee__department_id=dept_filter)
+        else:
+            if not user.department_id:
+                return Response([])
+            qs = qs.filter(employee__department_id=user.department_id)
+
+        qs = qs.order_by("start_date")
+        serializer = CalendarEntrySerializer(qs, many=True)
         return Response(serializer.data)

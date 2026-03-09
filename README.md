@@ -47,8 +47,8 @@ export DJANGO_SETTINGS_MODULE=hrm_backend.settings.prod
 hrm_backend/          - Django project configuration
 hrm_backend/settings/ - Split settings (base / dev / prod)
 apps/
-  accounts/           - Custom User model, JWT auth, RBAC roles
-  leave/              - Leave management (LeaveType, LeavePolicy, LeaveRequest, LeaveBalance, PublicHoliday, LeaveApprovalLog)
+  accounts/           - Custom User model, JWT auth, RBAC roles, Departments
+  leave/              - Leave management, department calendar
 requirements/         - Pip requirement files split by environment
 ```
 
@@ -69,7 +69,7 @@ All auth endpoints are mounted at `/api/v1/auth/`.
 # Register
 curl -s -X POST http://localhost:8000/api/v1/auth/register/ \
   -H "Content-Type: application/json" \
-  -d '{"email":"alice@example.com","password":"str0ngPass!","password_confirm":"str0ngPass!","first_name":"Alice","last_name":"Smith"}'
+  -d '{"email":"alice@example.com","password":"str0ngPass!","password_confirm":"str0ngPass!","first_name":"Alice","last_name":"Smith","department":"<dept_uuid>"}'
 
 # Login — returns access + refresh tokens
 curl -s -X POST http://localhost:8000/api/v1/auth/login/ \
@@ -92,6 +92,7 @@ curl -s http://localhost:8000/api/v1/auth/me/ \
 | `first_name`  | CharField     |                                |
 | `last_name`   | CharField     |                                |
 | `phone`       | CharField     | Optional                       |
+| `department`  | FK → Department | Required on registration, nullable in DB |
 | `is_active`   | BooleanField  | Default `True`                 |
 | `is_staff`    | BooleanField  | Default `False`                |
 | `date_joined` | DateTimeField | Set on creation                |
@@ -157,6 +158,103 @@ curl -s -X POST http://localhost:8000/api/v1/users/<user_uuid>/roles/ \
 curl -s -X DELETE \
   http://localhost:8000/api/v1/users/<user_uuid>/roles/<role_uuid>/ \
   -H "Authorization: Bearer <access_token>"
+```
+
+---
+
+## Departments
+
+### Department model
+
+| Field         | Type          | Notes                          |
+|---------------|---------------|--------------------------------|
+| `id`          | UUID          | Primary key, auto-generated    |
+| `name`        | CharField     | Unique, max 150 chars          |
+| `description` | TextField     | Optional                       |
+| `created_at`  | DateTimeField | Auto-set on creation           |
+| `updated_at`  | DateTimeField | Auto-updated on save           |
+
+### Department endpoints
+
+| Method | Endpoint | Permission | Description |
+|--------|----------|-----------|-------------|
+| GET | `/api/v1/departments/` | Any authenticated | List all departments |
+| POST | `/api/v1/departments/` | HR or Admin | Create a department |
+| GET | `/api/v1/departments/:id/` | Any authenticated | Retrieve one |
+| PUT | `/api/v1/departments/:id/` | HR or Admin | Full update |
+| PATCH | `/api/v1/departments/:id/` | HR or Admin | Partial update |
+| DELETE | `/api/v1/departments/:id/` | HR or Admin | Delete a department |
+| PATCH | `/api/v1/users/:id/department/` | HR or Admin | Change a user's department |
+
+### Example — create a department and reassign a user
+
+```bash
+# Create department
+curl -s -X POST http://localhost:8000/api/v1/departments/ \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Engineering", "description": "Software engineering team"}'
+
+# Change a user's department
+curl -s -X PATCH http://localhost:8000/api/v1/users/<user_uuid>/department/ \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"department": "<dept_uuid>"}'
+```
+
+---
+
+## Department Leave Calendar
+
+Provides a consolidated view of approved leave within a department (or across all departments for privileged roles).
+
+### Endpoint
+
+```
+GET /api/v1/calendar/?year=<int>&month=<int>[&department=<uuid>]
+```
+
+### Scoping rules
+
+| Role | Scope |
+|------|-------|
+| Employee / Line Manager | Own department only |
+| HR / ED / MD / Admin | All departments (optionally filter by `?department=<uuid>`) |
+
+### Query parameters
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `year` | No | Current year | Filter by year |
+| `month` | No | — | Filter by month (1-12). If omitted, returns the full year |
+| `department` | No | — | Filter by department UUID (privileged roles only) |
+
+### Response
+
+Each entry contains:
+
+```json
+{
+  "id": "<leave_request_uuid>",
+  "employee": {
+    "id": "<uuid>",
+    "email": "alice@example.com",
+    "first_name": "Alice",
+    "last_name": "Smith",
+    "department_name": "Engineering"
+  },
+  "leave_type": {
+    "id": "<uuid>",
+    "name": "Annual",
+    "description": "",
+    "default_days": 21,
+    "created_at": "...",
+    "updated_at": "..."
+  },
+  "start_date": "2025-03-10",
+  "end_date": "2025-03-14",
+  "total_working_days": 5
+}
 ```
 
 ---
@@ -404,7 +502,7 @@ All leave endpoints require a valid JWT `Authorization: Bearer <token>` header.
 
 On final `APPROVED`:
 - `LeaveBalance.used_days` is incremented by `total_working_days` using an atomic `F()` expression.
-- Department calendar hook is reserved for when the Department model is added.
+- The approved leave automatically appears on the department calendar (`GET /api/v1/calendar/`).
 - A `LeaveApprovalLog` entry is created at every stage transition.
 
 #### `reject` payload

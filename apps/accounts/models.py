@@ -18,6 +18,26 @@ class RoleName(models.TextChoices):
 
 
 # ---------------------------------------------------------------------------
+# Department
+# ---------------------------------------------------------------------------
+
+class Department(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=150, unique=True)
+    description = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Department"
+        verbose_name_plural = "Departments"
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+# ---------------------------------------------------------------------------
 # Manager
 # ---------------------------------------------------------------------------
 
@@ -58,6 +78,13 @@ class User(AbstractBaseUser, PermissionsMixin):
     first_name = models.CharField(max_length=150, blank=True)
     last_name = models.CharField(max_length=150, blank=True)
     phone = models.CharField(max_length=20, blank=True)
+    department = models.ForeignKey(
+        Department,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=False,
+        related_name="members",
+    )
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
     date_joined = models.DateTimeField(default=timezone.now)

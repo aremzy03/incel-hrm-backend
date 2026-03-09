@@ -2,16 +2,41 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 
-from .models import Role, UserRole
+from .models import Department, Role, UserRole
 
 User = get_user_model()
 
+
+# ---------------------------------------------------------------------------
+# Department
+# ---------------------------------------------------------------------------
+
+class DepartmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Department
+        fields = ("id", "name", "description", "created_at", "updated_at")
+        read_only_fields = ("id", "created_at", "updated_at")
+
+
+class _DepartmentMinimalSerializer(serializers.ModelSerializer):
+    """Lightweight read-only department for nesting inside UserSerializer."""
+
+    class Meta:
+        model = Department
+        fields = ("id", "name")
+        read_only_fields = fields
+
+
+# ---------------------------------------------------------------------------
+# User
+# ---------------------------------------------------------------------------
 
 class UserSerializer(serializers.ModelSerializer):
     """Read-only serializer exposing all safe public fields."""
 
     full_name = serializers.SerializerMethodField()
     roles = serializers.SerializerMethodField()
+    department = _DepartmentMinimalSerializer(read_only=True)
 
     class Meta:
         model = User
@@ -22,6 +47,7 @@ class UserSerializer(serializers.ModelSerializer):
             "last_name",
             "full_name",
             "phone",
+            "department",
             "is_active",
             "roles",
             "date_joined",
@@ -41,10 +67,11 @@ class RegisterSerializer(serializers.ModelSerializer):
 
     password = serializers.CharField(write_only=True, validators=[validate_password])
     password_confirm = serializers.CharField(write_only=True)
+    department = serializers.PrimaryKeyRelatedField(queryset=Department.objects.all())
 
     class Meta:
         model = User
-        fields = ("email", "password", "password_confirm", "first_name", "last_name")
+        fields = ("email", "password", "password_confirm", "first_name", "last_name", "department")
 
     def validate(self, attrs):
         if attrs["password"] != attrs.pop("password_confirm"):
@@ -54,6 +81,16 @@ class RegisterSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         return User.objects.create_user(**validated_data)
 
+
+class UserDepartmentUpdateSerializer(serializers.Serializer):
+    """HR-only serializer for changing a user's department."""
+
+    department = serializers.PrimaryKeyRelatedField(queryset=Department.objects.all())
+
+
+# ---------------------------------------------------------------------------
+# Role
+# ---------------------------------------------------------------------------
 
 class RoleSerializer(serializers.ModelSerializer):
     class Meta:

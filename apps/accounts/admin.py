@@ -1,19 +1,19 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 
-from .models import Role, User, UserRole
+from .models import Department, Role, User, UserRole
 
 
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
-    list_display = ("email", "first_name", "last_name", "is_staff", "is_active", "date_joined")
-    list_filter = ("is_staff", "is_active", "is_superuser")
+    list_display = ("email", "first_name", "last_name", "department", "is_staff", "is_active", "date_joined")
+    list_filter = ("is_staff", "is_active", "is_superuser", "department")
     search_fields = ("email", "first_name", "last_name")
     ordering = ("-date_joined",)
 
     fieldsets = (
         (None, {"fields": ("email", "password")}),
-        ("Personal info", {"fields": ("first_name", "last_name", "phone")}),
+        ("Personal info", {"fields": ("first_name", "last_name", "phone", "department")}),
         (
             "Permissions",
             {
@@ -55,3 +55,10 @@ class UserRoleAdmin(admin.ModelAdmin):
     list_filter = ("role",)
     search_fields = ("user__email", "role__name")
     readonly_fields = ("id",)
+
+
+@admin.register(Department)
+class DepartmentAdmin(admin.ModelAdmin):
+    list_display = ("name", "description", "created_at")
+    search_fields = ("name",)
+    readonly_fields = ("id", "created_at", "updated_at")

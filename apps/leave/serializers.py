@@ -26,6 +26,17 @@ class _EmployeeMinimalSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class _EmployeeCalendarSerializer(serializers.ModelSerializer):
+    """Employee with department name for calendar entries."""
+
+    department_name = serializers.CharField(source="department.name", default=None, read_only=True)
+
+    class Meta:
+        model = User
+        fields = ("id", "email", "first_name", "last_name", "department_name")
+        read_only_fields = fields
+
+
 # ---------------------------------------------------------------------------
 # LeaveType
 # ---------------------------------------------------------------------------
@@ -178,5 +189,28 @@ class LeaveApprovalLogSerializer(serializers.ModelSerializer):
             "timestamp",
             "previous_status",
             "new_status",
+        )
+        read_only_fields = fields
+
+
+# ---------------------------------------------------------------------------
+# Calendar
+# ---------------------------------------------------------------------------
+
+class CalendarEntrySerializer(serializers.ModelSerializer):
+    """Read-only representation of an approved leave for the department calendar."""
+
+    employee = _EmployeeCalendarSerializer(read_only=True)
+    leave_type = LeaveTypeSerializer(read_only=True)
+
+    class Meta:
+        model = LeaveRequest
+        fields = (
+            "id",
+            "employee",
+            "leave_type",
+            "start_date",
+            "end_date",
+            "total_working_days",
         )
         read_only_fields = fields
