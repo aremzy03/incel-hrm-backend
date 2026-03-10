@@ -142,6 +142,13 @@ class LeaveRequest(TimeStampedModel):
     leave_type = models.ForeignKey(
         LeaveType, on_delete=models.PROTECT, related_name="requests"
     )
+    cover_person = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=False,
+        related_name="covering_leave_requests",
+    )
     start_date = models.DateField()
     end_date = models.DateField()
     total_working_days = models.PositiveIntegerField(default=0)

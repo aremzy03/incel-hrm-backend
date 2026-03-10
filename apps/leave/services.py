@@ -10,7 +10,18 @@ from typing import Optional
 
 from rest_framework.exceptions import ValidationError
 
-from .models import LeaveBalance, LeaveRequest, LeaveRequestStatus, PublicHoliday
+from .models import LeaveBalance, LeaveRequest, LeaveRequestStatus, LeaveType, PublicHoliday
+
+
+def get_eligible_leave_types(user):
+    """Return leave types the user can apply for, based on gender."""
+    qs = LeaveType.objects.all()
+    gender = getattr(user, "gender", None)
+    if gender == "FEMALE":
+        qs = qs.exclude(name="Paternity")
+    elif gender == "MALE":
+        qs = qs.exclude(name="Maternity")
+    return qs
 
 
 class WorkingDaysService:
@@ -152,4 +163,59 @@ class WorkingDaysService:
         if qs.exists():
             raise ValidationError(
                 {"leave_request": "You have an overlapping leave request."}
+            )
+
+    @staticmethod
+    def check_department_leave_overlap(
+        employee,
+        start_date: datetime.date,
+        end_date: datetime.date,
+        leave_type=None,
+        exclude_id: Optional[object] = None,
+    ) -> None:
+        """
+        Raise ``ValidationError`` if another employee in the same department
+        already has an active (non-rejected, non-cancelled) leave request
+        overlapping the given date range.
+
+        This rule applies only to Annual and Casual leave. For Sick, Maternity,
+        Paternity, and other types, multiple employees in the same department
+        may be on leave at the same time.
+        """
+        if not getattr(employee, "department_id", None):
+            return
+        if not start_date or not end_date:
+            return
+        # Only enforce "one per department" for Annual and Casual leave
+        if leave_type and leave_type.name not in ("Annual", "Casual"):
+            return
+
+        excluded_statuses = [
+            LeaveRequestStatus.REJECTED,
+            LeaveRequestStatus.CANCELLED,
+        ]
+
+        # Only check overlaps with other Annual/Casual requests
+        qs = LeaveRequest.objects.filter(
+            employee__department_id=employee.department_id,
+            leave_type__name__in=("Annual", "Casual"),
+            start_date__lte=end_date,
+            end_date__gte=start_date,
+        ).exclude(
+            employee=employee,
+        ).exclude(
+            status__in=excluded_statuses,
+        )
+
+        if exclude_id is not None:
+            qs = qs.exclude(pk=exclude_id)
+
+        if qs.exists():
+            raise ValidationError(
+                {
+                    "leave_request": (
+                        "Another employee in your department already has an Annual or "
+                        "Casual leave request that overlaps with the requested dates."
+                    )
+                }
             )

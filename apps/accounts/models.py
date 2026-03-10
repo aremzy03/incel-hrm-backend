@@ -9,6 +9,11 @@ from django.utils import timezone
 # Role constants
 # ---------------------------------------------------------------------------
 
+class Gender(models.TextChoices):
+    MALE = "MALE", "Male"
+    FEMALE = "FEMALE", "Female"
+
+
 class RoleName(models.TextChoices):
     EMPLOYEE = "EMPLOYEE", "Employee"
     LINE_MANAGER = "LINE_MANAGER", "Line Manager"
@@ -21,10 +26,20 @@ class RoleName(models.TextChoices):
 # Department
 # ---------------------------------------------------------------------------
 
+HR_DEPARTMENT_NAME = "Human Resources (HR)"
+
+
 class Department(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=150, unique=True)
     description = models.TextField(blank=True)
+    line_manager = models.OneToOneField(
+        "User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="managed_department",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -35,6 +50,15 @@ class Department(models.Model):
 
     def __str__(self):
         return self.name
+
+
+def get_or_create_hr_department():
+    """Return the HR department, creating it if it does not exist."""
+    department, _ = Department.objects.get_or_create(
+        name=HR_DEPARTMENT_NAME,
+        defaults={"description": "Default department for Human Resources staff."},
+    )
+    return department
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +102,8 @@ class User(AbstractBaseUser, PermissionsMixin):
     first_name = models.CharField(max_length=150, blank=True)
     last_name = models.CharField(max_length=150, blank=True)
     phone = models.CharField(max_length=20, blank=True)
+    gender = models.CharField(max_length=10, choices=Gender.choices, blank=True)
+    date_of_birth = models.DateField(null=True, blank=True)
     department = models.ForeignKey(
         Department,
         on_delete=models.SET_NULL,
@@ -110,6 +136,12 @@ class User(AbstractBaseUser, PermissionsMixin):
     def get_roles(self) -> list:
         """Return a list of role name strings assigned to this user."""
         return list(self.user_roles.values_list("role__name", flat=True))
+
+    def get_department_line_manager(self):
+        """Return the User who is line manager of this user's department, or None."""
+        if self.department_id:
+            return getattr(self.department, "line_manager", None)
+        return None
 
     def __str__(self):
         return self.email

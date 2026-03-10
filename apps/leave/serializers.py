@@ -12,6 +12,8 @@ from .services import WorkingDaysService
 
 User = get_user_model()
 
+_COVER_PERSON_QUERYSET = User.objects.filter(is_active=True)
+
 
 # ---------------------------------------------------------------------------
 # Nested helpers
@@ -45,7 +47,7 @@ class LeaveTypeSerializer(serializers.ModelSerializer):
     class Meta:
         model = LeaveType
         fields = ("id", "name", "description", "default_days", "created_at", "updated_at")
-        read_only_fields = fields
+        read_only_fields = ("id", "created_at", "updated_at")
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +82,9 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
     Validation pipeline:
       1. start_date < end_date
       2. WorkingDaysService.check_overlapping_leave()
-      3. WorkingDaysService.validate_leave_balance()
+      3. WorkingDaysService.check_department_leave_overlap() (Annual/Casual only)
+      4. WorkingDaysService.validate_leave_balance()
+      5. cover_person validations (not self, same department)
 
     On create():
       - total_working_days is computed via WorkingDaysService.calculate_working_days()
@@ -88,9 +92,11 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
       - employee is taken from request.user (passed via serializer context)
     """
 
+    cover_person = serializers.PrimaryKeyRelatedField(queryset=_COVER_PERSON_QUERYSET)
+
     class Meta:
         model = LeaveRequest
-        fields = ("leave_type", "start_date", "end_date", "reason", "is_emergency")
+        fields = ("leave_type", "start_date", "end_date", "reason", "is_emergency", "cover_person")
 
     def validate(self, attrs):
         start_date = attrs.get("start_date")
@@ -104,14 +110,45 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
 
         employee = self.context["request"].user
         leave_type = attrs.get("leave_type")
+        cover_person = attrs.get("cover_person")
 
-        # Determine exclude_id when updating an existing request.
+        if cover_person:
+            if cover_person == employee:
+                raise serializers.ValidationError(
+                    {"cover_person": "You cannot assign yourself as the cover person."}
+                )
+            if getattr(employee, "department_id", None) and cover_person.department_id != employee.department_id:
+                raise serializers.ValidationError(
+                    {"cover_person": "The cover person must be in the same department as you."}
+                )
+
+        if leave_type:
+            if leave_type.name == "Maternity" and getattr(employee, "gender", None) != "FEMALE":
+                raise serializers.ValidationError(
+                    {"leave_type": "Maternity leave is only available for female staff."}
+                )
+            if leave_type.name == "Paternity" and getattr(employee, "gender", None) != "MALE":
+                raise serializers.ValidationError(
+                    {"leave_type": "Paternity leave is only available for male staff."}
+                )
+
         exclude_id = self.instance.pk if self.instance else None
 
         WorkingDaysService.check_overlapping_leave(
             employee=employee,
             start_date=start_date,
             end_date=end_date,
+            exclude_id=exclude_id,
+        )
+
+        leave_type_for_overlap = leave_type or (self.instance.leave_type if self.instance else None)
+        start_for_overlap = start_date or (self.instance.start_date if self.instance else None)
+        end_for_overlap = end_date or (self.instance.end_date if self.instance else None)
+        WorkingDaysService.check_department_leave_overlap(
+            employee=employee,
+            start_date=start_for_overlap,
+            end_date=end_for_overlap,
+            leave_type=leave_type_for_overlap,
             exclude_id=exclude_id,
         )
 
@@ -148,6 +185,7 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
 class LeaveRequestReadSerializer(serializers.ModelSerializer):
     employee = _EmployeeMinimalSerializer(read_only=True)
     leave_type = LeaveTypeSerializer(read_only=True)
+    cover_person = _EmployeeMinimalSerializer(read_only=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
 
     class Meta:
@@ -156,6 +194,7 @@ class LeaveRequestReadSerializer(serializers.ModelSerializer):
             "id",
             "employee",
             "leave_type",
+            "cover_person",
             "start_date",
             "end_date",
             "total_working_days",

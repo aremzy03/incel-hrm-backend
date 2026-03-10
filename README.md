@@ -47,7 +47,7 @@ export DJANGO_SETTINGS_MODULE=hrm_backend.settings.prod
 hrm_backend/          - Django project configuration
 hrm_backend/settings/ - Split settings (base / dev / prod)
 apps/
-  accounts/           - Custom User model, JWT auth, RBAC roles, Departments
+  accounts/           - Custom User model, JWT auth, RBAC, Departments, user signals
   leave/              - Leave management, department calendar
 requirements/         - Pip requirement files split by environment
 ```
@@ -69,7 +69,7 @@ All auth endpoints are mounted at `/api/v1/auth/`.
 # Register
 curl -s -X POST http://localhost:8000/api/v1/auth/register/ \
   -H "Content-Type: application/json" \
-  -d '{"email":"alice@example.com","password":"str0ngPass!","password_confirm":"str0ngPass!","first_name":"Alice","last_name":"Smith","department":"<dept_uuid>"}'
+  -d '{"email":"alice@example.com","password":"str0ngPass!","password_confirm":"str0ngPass!","first_name":"Alice","last_name":"Smith","gender":"FEMALE","date_of_birth":"1990-05-15","department":"<dept_uuid>"}'
 
 # Login — returns access + refresh tokens
 curl -s -X POST http://localhost:8000/api/v1/auth/login/ \
@@ -89,10 +89,12 @@ curl -s http://localhost:8000/api/v1/auth/me/ \
 |---------------|---------------|--------------------------------|
 | `id`          | UUID          | Primary key, auto-generated    |
 | `email`       | EmailField    | Unique, used as login field    |
-| `first_name`  | CharField     |                                |
-| `last_name`   | CharField     |                                |
-| `phone`       | CharField     | Optional                       |
-| `department`  | FK → Department | Required on registration, nullable in DB |
+| `first_name`   | CharField     |                                |
+| `last_name`    | CharField     |                                |
+| `phone`        | CharField     | Optional                       |
+| `gender`       | CharField     | MALE/FEMALE. Required on registration |
+| `date_of_birth`| DateField     | Required on registration       |
+| `department`   | FK → Department | Required on registration, nullable in DB |
 | `is_active`   | BooleanField  | Default `True`                 |
 | `is_staff`    | BooleanField  | Default `False`                |
 | `date_joined` | DateTimeField | Set on creation                |
@@ -101,8 +103,9 @@ curl -s http://localhost:8000/api/v1/auth/me/ \
 ### Helpers
 
 ```python
-user.has_role("HR")        # → bool
-user.get_roles()           # → ["HR", "LINE_MANAGER"]
+user.has_role("HR")                     # → bool
+user.get_roles()                        # → ["HR", "LINE_MANAGER"]
+user.get_department_line_manager()      # → User or None
 ```
 
 ## Role-Based Access Control (RBAC)
@@ -113,11 +116,15 @@ The following roles are seeded automatically on first migrate:
 
 | Role                  | Description                                         |
 |-----------------------|-----------------------------------------------------|
-| `EMPLOYEE`            | Default role for all staff members                  |
-| `LINE_MANAGER`        | Manages a team and approves leave requests          |
+| `EMPLOYEE`            | Default role for all staff members; auto-assigned on registration |
+| `LINE_MANAGER`        | Head of one department; first approver in leave chain |
 | `HR`                  | Human Resources — manages employee records          |
 | `EXECUTIVE_DIRECTOR`  | Elevated approval rights                            |
 | `MANAGING_DIRECTOR`   | Highest-level access                                |
+
+### Default EMPLOYEE role
+
+Every newly created user (via registration, HR create, or admin) is automatically assigned the `EMPLOYEE` role by a `post_save` signal in `apps/accounts/signals.py`.
 
 ### RBAC endpoints
 
@@ -125,8 +132,14 @@ The following roles are seeded automatically on first migrate:
 |--------|----------------------------------------|---------------------|----------------------------------|
 | GET    | `/api/v1/roles/`                       | HR or Admin         | List all roles                   |
 | POST   | `/api/v1/roles/`                       | HR or Admin         | Create a new role                |
-| POST   | `/api/v1/users/<id>/roles/`            | HR or Admin         | Assign a role to a user          |
+| GET    | `/api/v1/roles/:id/`                   | HR or Admin         | Retrieve a role                  |
+| PUT    | `/api/v1/roles/:id/`                   | HR or Admin         | Full update                      |
+| PATCH  | `/api/v1/roles/:id/`                  | HR or Admin         | Partial update                   |
+| DELETE | `/api/v1/roles/:id/`                   | HR or Admin         | Delete a role                    |
+| POST   | `/api/v1/users/<id>/roles/`            | HR or Admin         | Set user's role (overwrites any existing role) |
 | DELETE | `/api/v1/users/<id>/roles/<role_id>/`  | HR or Admin         | Remove a role from a user        |
+
+**One role per user**: Each user holds at most one role at a time. Assigning a new role replaces any existing role.
 
 ### DRF permission classes
 
@@ -162,31 +175,89 @@ curl -s -X DELETE \
 
 ---
 
+## Users (HR CRUD)
+
+HR staff and admins can perform full CRUD on users via `/api/v1/users/`.
+
+| Method | Endpoint | Permission | Description |
+|--------|----------|-----------|-------------|
+| GET | `/api/v1/users/` | HR or Admin | List all users |
+| POST | `/api/v1/users/` | HR or Admin | Create a user |
+| GET | `/api/v1/users/:id/` | HR or Admin | Retrieve one |
+| PUT | `/api/v1/users/:id/` | HR or Admin | Full update |
+| PATCH | `/api/v1/users/:id/` | HR or Admin | Partial update |
+| DELETE | `/api/v1/users/:id/` | HR or Admin | Delete a user |
+
+**Create payload** (`POST /api/v1/users/`):
+
+```json
+{
+  "email": "jane@example.com",
+  "password": "str0ngPass!",
+  "first_name": "Jane",
+  "last_name": "Doe",
+  "phone": "+234...",
+  "gender": "FEMALE",
+  "date_of_birth": "1990-05-15",
+  "department": "<dept_uuid>"
+}
+```
+
+**Update payload** (`PATCH /api/v1/users/:id/`): `first_name`, `last_name`, `phone`, `gender`, `date_of_birth`, `department`, `is_active` (all optional).
+
+---
+
 ## Departments
 
 ### Department model
 
-| Field         | Type          | Notes                          |
-|---------------|---------------|--------------------------------|
-| `id`          | UUID          | Primary key, auto-generated    |
-| `name`        | CharField     | Unique, max 150 chars          |
-| `description` | TextField     | Optional                       |
-| `created_at`  | DateTimeField | Auto-set on creation           |
-| `updated_at`  | DateTimeField | Auto-updated on save           |
+| Field          | Type               | Notes                          |
+|----------------|--------------------|--------------------------------|
+| `id`           | UUID               | Primary key, auto-generated    |
+| `name`         | CharField          | Unique, max 150 chars          |
+| `description`  | TextField          | Optional                       |
+| `line_manager` | OneToOneField → User | Nullable. Each dept has at most one line manager; each user can manage at most one dept |
+| `created_at`   | DateTimeField      | Auto-set on creation           |
+| `updated_at`   | DateTimeField      | Auto-updated on save           |
 
 ### Department endpoints
 
 | Method | Endpoint | Permission | Description |
 |--------|----------|-----------|-------------|
-| GET | `/api/v1/departments/` | Any authenticated | List all departments |
+| GET | `/api/v1/departments/` | Anyone | List all departments |
 | POST | `/api/v1/departments/` | HR or Admin | Create a department |
-| GET | `/api/v1/departments/:id/` | Any authenticated | Retrieve one |
+| GET | `/api/v1/departments/:id/` | Anyone | Retrieve one |
 | PUT | `/api/v1/departments/:id/` | HR or Admin | Full update |
 | PATCH | `/api/v1/departments/:id/` | HR or Admin | Partial update |
 | DELETE | `/api/v1/departments/:id/` | HR or Admin | Delete a department |
 | PATCH | `/api/v1/users/:id/department/` | HR or Admin | Change a user's department |
+| GET | `/api/v1/departments/:id/members/` | Own dept or HR/ED/MD | List users in a department |
 
-### Example — create a department and reassign a user
+### Department members
+
+Any user can view other users in their own department. HR, ED, and MD can view members of any department.
+
+### Line Manager assignment
+
+Each department can have exactly one Line Manager. HR staff and the Executive Director can assign or revoke this role.
+
+| Method | Endpoint | Permission | Description |
+|--------|----------|-----------|-------------|
+| POST | `/api/v1/departments/:id/line-manager/` | HR / ED / Admin | Assign a line manager |
+| DELETE | `/api/v1/departments/:id/line-manager/` | HR / ED / Admin | Remove the line manager |
+
+**Assign payload:**
+
+```json
+{ "user_id": "<uuid of user in this department>" }
+```
+
+Validations:
+- The user must belong to the target department.
+- The user must not already be line manager of another department.
+- If the user does not already hold the `LINE_MANAGER` role, it is granted automatically.
+
+### Example — create a department, assign a line manager, and reassign a user
 
 ```bash
 # Create department
@@ -194,6 +265,16 @@ curl -s -X POST http://localhost:8000/api/v1/departments/ \
   -H "Authorization: Bearer <token>" \
   -H "Content-Type: application/json" \
   -d '{"name": "Engineering", "description": "Software engineering team"}'
+
+# Assign line manager
+curl -s -X POST http://localhost:8000/api/v1/departments/<dept_uuid>/line-manager/ \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id": "<user_uuid>"}'
+
+# Remove line manager
+curl -s -X DELETE http://localhost:8000/api/v1/departments/<dept_uuid>/line-manager/ \
+  -H "Authorization: Bearer <token>"
 
 # Change a user's department
 curl -s -X PATCH http://localhost:8000/api/v1/users/<user_uuid>/department/ \
@@ -266,9 +347,11 @@ Each entry contains:
 ```
 LeaveType ──< LeavePolicy
 LeaveType ──< LeaveBalance >── User
-LeaveType ──< LeaveRequest >── User
+LeaveType ──< LeaveRequest >── User (employee)
+               LeaveRequest ──> User (cover_person)
                LeaveRequest ──< LeaveApprovalLog >── User (actor)
 PublicHoliday  (standalone)
+Department ──> User (line_manager, OneToOne)
 ```
 
 ### Models
@@ -277,12 +360,13 @@ PublicHoliday  (standalone)
 
 Seeded automatically via data migration:
 
-| Name       | Default days |
-|------------|-------------|
-| Annual     | 21          |
-| Sick       | 14          |
-| Casual     | 5           |
-| Maternity  | 90          |
+| Name       | Default days | Eligibility        |
+|------------|--------------|--------------------|
+| Annual     | 21           | All                |
+| Sick       | 14           | All                |
+| Casual     | 5            | All                |
+| Maternity  | 90           | Female staff only  |
+| Paternity  | 14           | Male staff only    |
 
 #### `LeavePolicy`
 
@@ -305,6 +389,8 @@ Stores named public holidays. `is_recurring=True` means the holiday repeats on t
 
 Tracks per-employee, per-leave-type entitlement for a given year.
 
+**Auto-creation**: When a user is created (registration or HR create), a `post_save` signal creates `LeaveBalance` rows for the current year for each eligible leave type. `allocated_days` is set to `leave_type.default_days`. Maternity is omitted for male users; Paternity is omitted for female users.
+
 ```python
 balance.remaining_days  # property: allocated_days - used_days
 ```
@@ -315,6 +401,7 @@ Unique constraint: `(employee, leave_type, year)`.
 
 | Field               | Notes                                                       |
 |---------------------|-------------------------------------------------------------|
+| `cover_person`      | FK → User. Required. Must be in the same department, cannot be the applicant |
 | `total_working_days`| Computed automatically on `save()` (Mon–Fri only)          |
 | `is_emergency`      | Flag for urgent requests                                    |
 | `status`            | See workflow below                                          |
@@ -340,6 +427,24 @@ DRAFT → PENDING_MANAGER → PENDING_HR → PENDING_ED → APPROVED
 #### `LeaveApprovalLog`
 
 Immutable audit trail. One entry is appended per status transition. Fields include `actor`, `action` (`APPROVE / REJECT / CANCEL / MODIFY`), `previous_status`, `new_status`, `comment`, and `timestamp`.
+
+### Business rules
+
+1. **One Line Manager per department** -- Each department has at most one line manager (`Department.line_manager`). A user can manage at most one department (OneToOneField). HR and ED can assign/revoke via `POST/DELETE /api/v1/departments/:id/line-manager/`.
+
+2. **Cover person required** -- When creating a leave request, the employee must designate a `cover_person` (another active user in the same department) who will handle their responsibilities during the leave period. The cover person cannot be the requesting employee.
+
+3. **Maternity and Paternity by gender** -- Maternity leave is only available for female staff; Paternity leave is only available for male staff. Leave balances for these types are created only for eligible users.
+
+4. **Default leave balances** -- On user creation, `LeaveBalance` rows are auto-created for the current year for each eligible leave type, with `allocated_days` = `leave_type.default_days`.
+
+5. **Department leave exclusivity (Annual & Casual only)** -- For Annual and Casual leave only, at most one employee in a department may have an active leave request overlapping any given date range. Sick, Maternity, Paternity, and other leave types are excluded; multiple employees may be on those types simultaneously. If another colleague's Annual or Casual leave already covers the requested dates, the request is rejected at validation time.
+
+6. **Submit requires a line manager** -- An employee cannot submit a DRAFT request (`POST .../submit/`) unless their department has a line manager assigned. This ensures the approval chain is complete before a request enters the pipeline.
+
+7. **Approval chain** -- When a request is submitted, it flows through: department Line Manager → HR → Executive Director. Each approver can only act at their designated stage.
+
+8. **Line Manager scoped visibility** -- A Line Manager's `GET /api/v1/leave-requests/` queryset is now scoped to their own department (not all requests).
 
 ---
 
@@ -388,6 +493,12 @@ Overlap condition used in the DB query:
 existing.start_date <= new.end_date  AND  existing.end_date >= new.start_date
 ```
 
+#### `check_department_leave_overlap(employee, start_date, end_date, leave_type=None, exclude_id=None) -> None`
+
+Raises `ValidationError` if any **other** employee in the same department already has an active **Annual or Casual** leave request (status not in `REJECTED`, `CANCELLED`) whose date range overlaps with the requested period.
+
+This check runs only when the requested leave type is Annual or Casual. For Sick, Maternity, Paternity, and other types, the rule is skipped (multiple employees may be on leave simultaneously).
+
 ---
 
 ## Testing
@@ -412,7 +523,7 @@ All leave serializers live in `apps/leave/serializers.py`.
 
 ### `LeaveTypeSerializer`
 
-Read-only. Exposes `id`, `name`, `description`, `default_days`, `created_at`, `updated_at`.
+Read/write for `name`, `description`, `default_days`. `id`, `created_at`, `updated_at` are read-only. HR and admins can create, update, and delete leave types via the API.
 
 ### `LeaveBalanceSerializer`
 
@@ -422,13 +533,17 @@ Read-only. Includes a nested `LeaveTypeSerializer` and the computed `remaining_d
 
 Used for `POST` (create) and `PATCH` (update) requests.
 
-**Fields:** `leave_type`, `start_date`, `end_date`, `reason`, `is_emergency`
+**Fields:** `leave_type`, `start_date`, `end_date`, `reason`, `is_emergency`, `cover_person`
 
 **Validation pipeline (in `validate()`):**
 
 1. `end_date` must be strictly after `start_date`.
-2. `WorkingDaysService.check_overlapping_leave()` — rejects if the employee already has an active request in the same window. Passes `exclude_id` automatically on updates.
-3. `WorkingDaysService.validate_leave_balance()` — rejects if remaining balance for `(employee, leave_type, start_date.year)` is less than the computed working days.
+2. `cover_person` must not be the requesting employee.
+3. `cover_person` must be in the same department as the employee.
+4. Maternity leave: only available for female staff. Paternity leave: only available for male staff.
+5. `WorkingDaysService.check_overlapping_leave()` — rejects if the employee already has an active request in the same window. Passes `exclude_id` automatically on updates.
+6. `WorkingDaysService.check_department_leave_overlap()` — for Annual and Casual only: rejects if any other employee in the same department has an active Annual or Casual request overlapping the same dates. Skipped for Sick, Maternity, Paternity, and other types.
+7. `WorkingDaysService.validate_leave_balance()` — rejects if remaining balance for `(employee, leave_type, start_date.year)` is less than the computed working days.
 
 **`create()` behaviour:**
 
@@ -440,6 +555,7 @@ Used for `POST` (create) and `PATCH` (update) requests.
 
 Full read representation. Includes:
 - Nested `_EmployeeMinimalSerializer` for `employee` (`id`, `email`, `first_name`, `last_name`)
+- Nested `_EmployeeMinimalSerializer` for `cover_person`
 - Nested `LeaveTypeSerializer` for `leave_type`
 - `status` (raw value) + `status_display` (human-readable label)
 - `total_working_days`, `is_emergency`, `reason`, `created_at`, `updated_at`
@@ -461,7 +577,11 @@ All leave endpoints require a valid JWT `Authorization: Bearer <token>` header.
 | Method | Endpoint | Permission | Description |
 |--------|----------|-----------|-------------|
 | GET | `/api/v1/leave-types/` | Any authenticated | List all leave types |
+| POST | `/api/v1/leave-types/` | HR or Admin | Create a leave type |
 | GET | `/api/v1/leave-types/:id/` | Any authenticated | Retrieve one |
+| PUT | `/api/v1/leave-types/:id/` | HR or Admin | Full update |
+| PATCH | `/api/v1/leave-types/:id/` | HR or Admin | Partial update |
+| DELETE | `/api/v1/leave-types/:id/` | HR or Admin | Delete a leave type |
 
 ### Leave Balances
 
@@ -486,7 +606,7 @@ All leave endpoints require a valid JWT `Authorization: Bearer <token>` header.
 
 | Method | Endpoint | Permission | Description |
 |--------|----------|-----------|-------------|
-| POST | `/api/v1/leave-requests/:id/submit/` | Request owner | DRAFT → PENDING_MANAGER |
+| POST | `/api/v1/leave-requests/:id/submit/` | Request owner | DRAFT → PENDING_MANAGER (requires dept line manager) |
 | POST | `/api/v1/leave-requests/:id/approve/` | Role-matched approver | Stage transition (see table below) |
 | POST | `/api/v1/leave-requests/:id/reject/` | Role-matched approver | Any pending stage → REJECTED (comment required) |
 | POST | `/api/v1/leave-requests/:id/cancel/` | Owner (DRAFT/PENDING_MANAGER) or HR | → CANCELLED |

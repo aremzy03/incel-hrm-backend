@@ -3,7 +3,7 @@ Leave management API views.
 
 Viewset summary
 ---------------
-LeaveTypeViewSet           – ReadOnly, any authenticated user
+LeaveTypeViewSet           – Full CRUD for HR/Admin; list/retrieve for any authenticated
 LeaveBalanceViewSet        – ReadOnly, role-filtered queryset + ?employee=&year= filters
 LeaveRequestViewSet        – Full CRUD minus DELETE, role-filtered queryset
   custom actions:
@@ -89,12 +89,23 @@ def _deduct_leave_balance(leave_request) -> None:
 # LeaveType
 # ---------------------------------------------------------------------------
 
-class LeaveTypeViewSet(viewsets.ReadOnlyModelViewSet):
-    """GET /api/v1/leave-types/  — list & retrieve, any authenticated user."""
+class LeaveTypeViewSet(viewsets.ModelViewSet):
+    """
+    GET    /api/v1/leave-types/       — any authenticated user
+    POST   /api/v1/leave-types/       — HR or admin
+    GET    /api/v1/leave-types/:id/  — any authenticated user
+    PUT    /api/v1/leave-types/:id/  — HR or admin
+    PATCH  /api/v1/leave-types/:id/  — HR or admin
+    DELETE /api/v1/leave-types/:id/  — HR or admin
+    """
 
     queryset = LeaveType.objects.all()
     serializer_class = LeaveTypeSerializer
-    permission_classes = [permissions.IsAuthenticated]
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [permissions.IsAuthenticated()]
+        return [permissions.IsAuthenticated(), (IsHR | permissions.IsAdminUser)()]
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +181,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
     Queryset scoping by role:
       - Privileged (HR / ED / MD / staff): all requests
-      - Line Manager: all requests (team filter to be added when Dept model exists)
+      - Line Manager: own department's requests
       - Employee: own requests only
 
     Serializer selection:
@@ -196,10 +207,13 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        qs = LeaveRequest.objects.select_related("employee", "leave_type").all()
+        qs = LeaveRequest.objects.select_related("employee", "leave_type", "cover_person").all()
 
-        if _is_privileged(user) or user.has_role(RoleName.LINE_MANAGER):
+        if _is_privileged(user):
             return qs
+
+        if user.has_role(RoleName.LINE_MANAGER) and user.department_id:
+            return qs.filter(employee__department_id=user.department_id)
 
         return qs.filter(employee=user)
 
@@ -235,6 +249,12 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         if leave_request.status != LeaveRequestStatus.DRAFT:
             raise ValidationError(
                 {"status": f"Only DRAFT requests can be submitted. Current status: {leave_request.status}."}
+            )
+
+        lm = leave_request.employee.get_department_line_manager()
+        if lm is None:
+            raise ValidationError(
+                {"department": "Your department has no line manager assigned. Contact HR."}
             )
 
         prev_status = leave_request.status
