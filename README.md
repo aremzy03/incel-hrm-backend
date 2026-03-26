@@ -41,6 +41,72 @@ Switch the active settings module via the `DJANGO_SETTINGS_MODULE` environment v
 export DJANGO_SETTINGS_MODULE=hrm_backend.settings.prod
 ```
 
+## Background Jobs (Celery + Redis)
+
+This backend uses Celery for asynchronous work (email notifications, long-running tasks, etc.).
+
+### Redis configuration
+
+Celery reads both the broker and result backend from `REDIS_URL` (configured in `hrm_backend/settings/base.py`):
+
+```bash
+export REDIS_URL="redis://localhost:6379/0"
+```
+
+### Running a worker locally
+
+In one terminal (with your virtualenv activated), run:
+
+```bash
+celery -A hrm_backend worker -l info
+```
+
+### Email in development
+
+In development settings (`hrm_backend/settings/dev.py`), email is printed to the console via:
+
+- `EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"`
+
+### Leave workflow notifications
+
+Leave requests trigger Celery tasks in `apps/leave/tasks.py` on:
+
+- submit: notifies the next approver
+- approve: notifies the next approver, and notifies the requester when finally approved
+- reject: notifies the requester with the rejection comment
+
+## In-app Notifications (DB + SSE)
+
+The backend also supports **in-app notifications** for the web UI:
+
+- Notifications are **stored in the database** (`apps/notifications/models.py`).
+- Real-time updates are delivered over **Server-Sent Events (SSE)**, backed by **Redis Pub/Sub**.
+
+### REST endpoints
+
+All endpoints are under `/api/v1/notifications/`:
+
+- `GET /api/v1/notifications/` — list current user's notifications
+- `GET /api/v1/notifications/unread-count/` — returns `{ "count": <int> }`
+- `POST /api/v1/notifications/<id>/mark-read/` — mark one notification read
+- `POST /api/v1/notifications/mark-all-read/` — mark all read
+
+### SSE stream
+
+- `GET /api/v1/notifications/stream/`
+- The server emits events:
+  - `ready` (initial)
+  - `keepalive` (periodic)
+  - `notification` (payload JSON)
+
+### Redis configuration
+
+The SSE system uses `NOTIFICATIONS_REDIS_URL`, which defaults to `REDIS_URL` in `hrm_backend/settings/base.py`.
+
+### Leave notifications
+
+When leave requests are submitted/approved/rejected, the Celery tasks in `apps/leave/tasks.py` now:\n+
+- send email (as before)\n+- create an in-app `Notification` record\n+- publish an SSE event to any active sessions for the recipient\n+
 ## Project Layout
 
 ```
@@ -56,12 +122,14 @@ requirements/         - Pip requirement files split by environment
 
 All auth endpoints are mounted at `/api/v1/auth/`.
 
-| Method | Endpoint                    | Auth required | Description                        |
-|--------|-----------------------------|---------------|------------------------------------|
-| POST   | `/api/v1/auth/register/`    | No            | Create a new user account          |
-| POST   | `/api/v1/auth/login/`       | No            | Obtain JWT access + refresh tokens |
-| POST   | `/api/v1/auth/token/refresh/` | No          | Refresh an access token            |
-| GET    | `/api/v1/auth/me/`          | Yes (JWT)     | Return the current user's profile  |
+| Method | Endpoint                      | Auth required | Description                        |
+|--------|-------------------------------|---------------|------------------------------------|
+| POST   | `/api/v1/auth/register/`      | No            | Create a new user account          |
+| POST   | `/api/v1/auth/login/`         | No            | Obtain JWT access + refresh tokens |
+| POST   | `/api/v1/auth/token/refresh/` | No            | Refresh an access token            |
+| GET    | `/api/v1/auth/me/`            | Yes (JWT)     | Return the current user's profile (read-only) |
+| GET    | `/api/v1/auth/profile/`       | Yes (JWT)     | Get current user's profile (detailed) |
+| PATCH  | `/api/v1/auth/profile/`       | Yes (JWT)     | Update own basic profile fields    |
 
 ### Example — register then login
 
@@ -76,7 +144,7 @@ curl -s -X POST http://localhost:8000/api/v1/auth/login/ \
   -H "Content-Type: application/json" \
   -d '{"email":"alice@example.com","password":"str0ngPass!"}'
 
-# Fetch own profile
+# Fetch own profile (read-only summary)
 curl -s http://localhost:8000/api/v1/auth/me/ \
   -H "Authorization: Bearer <access_token>"
 ```
@@ -114,13 +182,14 @@ user.get_department_line_manager()      # → User or None
 
 The following roles are seeded automatically on first migrate:
 
-| Role                  | Description                                         |
-|-----------------------|-----------------------------------------------------|
+| Role                  | Description                                                      |
+|-----------------------|------------------------------------------------------------------|
 | `EMPLOYEE`            | Default role for all staff members; auto-assigned on registration |
-| `LINE_MANAGER`        | Head of one department; first approver in leave chain |
-| `HR`                  | Human Resources — manages employee records          |
-| `EXECUTIVE_DIRECTOR`  | Elevated approval rights                            |
-| `MANAGING_DIRECTOR`   | Highest-level access                                |
+| `LINE_MANAGER`        | Head of one department; first approver in the leave chain       |
+| `SUPERVISOR`          | Supervisor of a Unit within a department; first approver for unit members |
+| `HR`                  | Human Resources — manages employee records                      |
+| `EXECUTIVE_DIRECTOR`  | Elevated approval rights                                        |
+| `MANAGING_DIRECTOR`   | Highest-level access                                            |
 
 ### Default EMPLOYEE role
 
@@ -149,6 +218,7 @@ Import from `apps.accounts.permissions`:
 from apps.accounts.permissions import (
     IsEmployee,
     IsLineManager,
+    IsSupervisor,
     IsHR,
     IsExecutiveDirector,
     IsManagingDirector,
@@ -205,6 +275,20 @@ HR staff and admins can perform full CRUD on users via `/api/v1/users/`.
 
 **Update payload** (`PATCH /api/v1/users/:id/`): `first_name`, `last_name`, `phone`, `gender`, `date_of_birth`, `department`, `is_active` (all optional).
 
+### User profile (self-service)
+
+For employees to manage their own profile:
+
+| Method | Endpoint                 | Permission   | Description                                  |
+|--------|--------------------------|--------------|----------------------------------------------|
+| GET    | `/api/v1/auth/profile/` | Authenticated| Get current user's full profile              |
+| PATCH  | `/api/v1/auth/profile/` | Authenticated| Update own `first_name`, `last_name`, `phone`, `gender`, `date_of_birth` |
+
+Role, department, and unit assignment remain restricted to HR and Line Managers via:
+
+- `PATCH /api/v1/users/:id/` — change department/unit (HR/Line Manager UI).
+- `POST /api/v1/users/:id/roles/` — assign a new role (overwrites any existing role).
+
 ---
 
 ## Departments
@@ -220,6 +304,21 @@ HR staff and admins can perform full CRUD on users via `/api/v1/users/`.
 | `created_at`   | DateTimeField      | Auto-set on creation           |
 | `updated_at`   | DateTimeField      | Auto-updated on save           |
 
+### Unit model
+
+Units sit under departments and optionally have a dedicated supervisor.
+
+| Field        | Type                 | Notes                                          |
+|--------------|----------------------|-----------------------------------------------|
+| `id`         | UUID                 | Primary key, auto-generated                    |
+| `name`       | CharField            | Max 150 chars; unique per department           |
+| `department` | FK → Department      | The parent department                          |
+| `supervisor` | OneToOneField → User | Optional. Each Unit has at most one supervisor |
+| `created_at` | DateTimeField        | Auto-set on creation                           |
+| `updated_at` | DateTimeField        | Auto-updated on save                           |
+
+Each `User` can also optionally belong to a `Unit` (via `User.unit`), which must be in the same `department` as the user.
+
 ### Department endpoints
 
 | Method | Endpoint | Permission | Description |
@@ -232,6 +331,23 @@ HR staff and admins can perform full CRUD on users via `/api/v1/users/`.
 | DELETE | `/api/v1/departments/:id/` | HR or Admin | Delete a department |
 | PATCH | `/api/v1/users/:id/department/` | HR or Admin | Change a user's department |
 | GET | `/api/v1/departments/:id/members/` | Own dept or HR/ED/MD | List users in a department |
+| GET | `/api/v1/departments/:id/detail/` | Own dept or HR/ED/MD | Department + members + units + line manager |
+
+### Unit endpoints
+
+| Method | Endpoint                         | Permission                      | Description                              |
+|--------|----------------------------------|----------------------------------|------------------------------------------|
+| GET    | `/api/v1/units/?department=:id` | Dept member or HR/ED/MD         | List units in a department               |
+| POST   | `/api/v1/units/`                | LINE_MANAGER of that department | Create a unit                            |
+| GET    | `/api/v1/units/:id/`            | Dept member or HR/ED/MD         | Unit detail: name, supervisor, members   |
+| PATCH  | `/api/v1/units/:id/`            | LINE_MANAGER of unit's dept     | Update unit (e.g. name)                  |
+| DELETE | `/api/v1/units/:id/`            | LINE_MANAGER of unit's dept     | Delete unit (or restrict if it has members) |
+
+**Unit rules:**
+
+- Units belong to a single department.
+- Only the department’s Line Manager can create/update/delete units in that department.
+- A supervisor may be assigned to a unit (via `Unit.supervisor` and the `SUPERVISOR` role), and employees in that unit will route leave requests through the unit’s supervisor first.
 
 ### Department members
 
@@ -282,6 +398,31 @@ curl -s -X PATCH http://localhost:8000/api/v1/users/<user_uuid>/department/ \
   -H "Content-Type: application/json" \
   -d '{"department": "<dept_uuid>"}'
 ```
+
+### Frontend integration summary
+
+- **User Profile UI**
+  - Use `GET /api/v1/auth/me/` for a quick summary (e.g. header/avatar).
+  - Use `GET /api/v1/auth/profile/` to populate a full profile form.
+  - On save, send `PATCH /api/v1/auth/profile/` with any subset of: `first_name`, `last_name`, `phone`, `gender`, `date_of_birth`.
+  - For HR/Line Manager admin panels:
+    - Use `PATCH /api/v1/users/:id/` to change `department` and `unit`.
+    - Use `POST /api/v1/users/:id/roles/` to change a user's role.
+
+- **Department Detail UI**
+  - Use `GET /api/v1/departments/:id/detail/` to build a department page that shows:
+    - Department summary (`department` object — name, description, line manager).
+    - `members`: list of users in that department.
+    - `units`: list of units with their supervisors and members.
+  - EMPLOYEES can only view their own department; HR/ED/MD/staff can navigate to any.
+
+- **Unit Detail UI**
+  - Use `GET /api/v1/units/:id/` to render a unit detail page:
+    - Core info: `id`, `name`, `department`, `supervisor`.
+    - `members`: list of users in that unit.
+  - LINE_MANAGER/HR workflows can reuse:
+    - `GET /api/v1/units/?department=<dept_id>` to show all units in a department.
+    - `POST /api/v1/units/`, `PATCH/DELETE /api/v1/units/:id/` to manage units.
 
 ---
 
@@ -385,6 +526,14 @@ Per-leave-type configuration controlling entitlement rules:
 
 Stores named public holidays. `is_recurring=True` means the holiday repeats on the same calendar date every year.
 
+##### API (for UI highlighting)
+
+- `GET /api/v1/public-holidays/` — list public holidays (authenticated)
+  - Optional: `?year=2026` (includes recurring holidays + non-recurring holidays in that year)
+
+##### HR CSV upload
+
+- `POST /api/v1/public-holidays/upload/` — bulk upsert holidays by date (HR/admin only)\n\nCSV format:\n\n```csv\nname,date\nNew Year’s Day,2026-01-01\nWorkers’ Day,2026-05-01\n```\n\nExample:\n\n```bash\ncurl -X POST \"http://localhost:8000/api/v1/public-holidays/upload/\" \\\n  -H \"Authorization: Bearer <access_token>\" \\\n  -F \"file=@public-holidays-2026.csv\"\n```\n+
 #### `LeaveBalance`
 
 Tracks per-employee, per-leave-type entitlement for a given year.
@@ -402,27 +551,33 @@ Unique constraint: `(employee, leave_type, year)`.
 | Field               | Notes                                                       |
 |---------------------|-------------------------------------------------------------|
 | `cover_person`      | FK → User. Required. Must be in the same department, cannot be the applicant |
-| `total_working_days`| Computed automatically on `save()` (Mon–Fri only)          |
+| `total_working_days`| Computed automatically on `save()` (excludes weekends + public holidays) |
 | `is_emergency`      | Flag for urgent requests                                    |
 | `status`            | See workflow below                                          |
 
 #### Leave request workflow
 
 ```
-DRAFT → PENDING_MANAGER → PENDING_HR → PENDING_ED → APPROVED
-                                                   ↘ REJECTED
-          (any stage) ──────────────────────────→ CANCELLED
+DRAFT
+  → PENDING_SUPERVISOR (if employee is in a unit with a supervisor)
+  → PENDING_MANAGER
+  → PENDING_HR
+  → PENDING_ED
+  → APPROVED
+                         ↘ REJECTED
+         (any stage) ─────────────────────→ CANCELLED
 ```
 
-| Status             | Meaning                                     |
-|--------------------|---------------------------------------------|
-| `DRAFT`            | Saved but not yet submitted                 |
-| `PENDING_MANAGER`  | Awaiting line manager approval              |
-| `PENDING_HR`       | Awaiting HR approval                        |
-| `PENDING_ED`       | Awaiting Executive Director approval        |
-| `APPROVED`         | Fully approved                              |
-| `REJECTED`         | Declined at any stage                       |
-| `CANCELLED`        | Withdrawn by the employee                   |
+| Status               | Meaning                                                  |
+|----------------------|----------------------------------------------------------|
+| `DRAFT`              | Saved but not yet submitted                              |
+| `PENDING_SUPERVISOR` | Awaiting approval from the employee’s Unit supervisor    |
+| `PENDING_MANAGER`    | Awaiting Line Manager approval                           |
+| `PENDING_HR`         | Awaiting HR approval                                     |
+| `PENDING_ED`         | Awaiting Executive Director approval                     |
+| `APPROVED`           | Fully approved                                           |
+| `REJECTED`           | Declined at any stage                                    |
+| `CANCELLED`          | Withdrawn by the employee or cancelled by HR             |
 
 #### `LeaveApprovalLog`
 
@@ -509,6 +664,100 @@ Run the full test suite:
 python manage.py test
 ```
 
+---
+
+## Performance Testing with k6
+
+This project includes k6 scripts for load and stress testing the API.
+
+### Folder layout
+
+- `k6/config.js` – shared configuration (base URL, thresholds, stage presets, common helpers).
+- `k6/utils/auth.js` – helpers for obtaining JWTs for seeded users (employee, HR, manager, ED).
+- `k6/utils/data.js` – small data factories (emails, phones, DOBs, department/unit IDs from env).
+- `k6/scenarios/` – domain-specific flows:
+  - `auth_scenarios.js` – login, register-then-login, profile update.
+  - `accounts_scenarios.js` – HR user list/CRUD and role assignment flows.
+  - `departments_units_scenarios.js` – department browse/detail, unit listing, basic admin flows.
+  - `leave_scenarios.js` – leave browse, draft+submit, cancel, and full approval chain.
+  - `calendar_scenarios.js` – employee and HR calendar views.
+- `k6/tests/` – test entrypoints:
+  - `smoke.test.js` – fast sanity check across core flows.
+  - `load.test.js` – typical business-hours load.
+  - `stress.test.js` – push system towards upper capacity bounds.
+  - `spike.test.js` – sudden burst traffic behaviour.
+  - `soak.test.js` – optional long-running endurance test.
+- `k6/report.js` – `handleSummary` that emits `k6-summary.html` and `k6-summary.json`.
+
+### Required environment
+
+Before running k6 tests, export:
+
+```bash
+export K6_BASE_URL="http://localhost:8000"
+
+# Seeded users for role-based flows
+export K6_EMPLOYEE_EMAIL="employee@example.com"
+export K6_EMPLOYEE_PASSWORD="..."
+export K6_HR_EMAIL="hr@example.com"
+export K6_HR_PASSWORD="..."
+export K6_MANAGER_EMAIL="manager@example.com"
+export K6_MANAGER_PASSWORD="..."
+export K6_ED_EMAIL="ed@example.com"
+export K6_ED_PASSWORD="..."
+
+# Organisation and leave context used in some scenarios
+export K6_DEPT_ID="<department_uuid>"
+export K6_UNIT_ID="<unit_uuid_optional>"
+export K6_ROLE_TARGET_USER_ID="<user_uuid_optional>"
+export K6_ROLE_ID="<role_uuid_optional>"
+export K6_LEAVE_TYPE_ID="<leave_type_uuid>"
+export K6_COVER_PERSON_ID="<user_uuid_in_same_department>"
+export K6_LEAVE_START_DATE="2025-01-06"
+export K6_LEAVE_END_DATE="2025-01-10"
+```
+
+These should point to real objects in your database. For CI/staging, seed a small dataset and wire these values via secrets.
+
+### Running k6 tests
+
+From the project root:
+
+```bash
+# Smoke test (quick sanity check)
+k6 run k6/tests/smoke.test.js
+
+# Load test
+k6 run k6/tests/load.test.js
+
+# Stress test
+k6 run k6/tests/stress.test.js
+
+# Spike test
+k6 run k6/tests/spike.test.js
+
+# Soak test (long running; customise via env)
+K6_SOAK_VUS=15 K6_SOAK_DURATION=2h k6 run k6/tests/soak.test.js
+```
+
+All runs will also produce `k6-summary.html` and `k6-summary.json` in the working directory for quick inspection.
+
+### CI/CD integration (example)
+
+You can wire the smoke test into GitHub Actions using the official k6 action:
+
+```yaml
+- name: Run k6 smoke test
+  uses: grafana/k6-action@v0.3.1
+  with:
+    filename: k6/tests/smoke.test.js
+  env:
+    K6_BASE_URL: ${{ secrets.K6_BASE_URL }}
+    K6_EMPLOYEE_EMAIL: ${{ secrets.K6_EMPLOYEE_EMAIL }}
+    K6_EMPLOYEE_PASSWORD: ${{ secrets.K6_EMPLOYEE_PASSWORD }}
+    # ...other K6_* env vars...
+```
+
 Run only the service tests:
 
 ```bash
@@ -587,9 +836,8 @@ All leave endpoints require a valid JWT `Authorization: Bearer <token>` header.
 
 | Method | Endpoint | Permission | Description |
 |--------|----------|-----------|-------------|
-| GET | `/api/v1/leave-balances/` | Authenticated | HR/Manager/ED see all; employees see own |
-| GET | `/api/v1/leave-balances/:id/` | Authenticated | Retrieve one |
-| GET | `/api/v1/leave-balances/?employee=<uuid>&year=<int>` | Privileged | Filter by employee and/or year |
+| GET | `/api/v1/leave-balances/` | Authenticated | List balances for the authenticated user only |
+| GET | `/api/v1/leave-balances/:id/` | Authenticated | Retrieve a single balance (must belong to the authenticated user) |
 
 ### Leave Requests
 
@@ -607,6 +855,7 @@ All leave endpoints require a valid JWT `Authorization: Bearer <token>` header.
 | Method | Endpoint | Permission | Description |
 |--------|----------|-----------|-------------|
 | POST | `/api/v1/leave-requests/:id/submit/` | Request owner | DRAFT → PENDING_MANAGER (requires dept line manager) |
+| POST | `/api/v1/leave-requests/create-and-submit/` | Request owner | Create a new request and immediately submit it (DRAFT → PENDING_MANAGER) |
 | POST | `/api/v1/leave-requests/:id/approve/` | Role-matched approver | Stage transition (see table below) |
 | POST | `/api/v1/leave-requests/:id/reject/` | Role-matched approver | Any pending stage → REJECTED (comment required) |
 | POST | `/api/v1/leave-requests/:id/cancel/` | Owner (DRAFT/PENDING_MANAGER) or HR | → CANCELLED |

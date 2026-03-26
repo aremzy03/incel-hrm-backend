@@ -77,3 +77,5 @@ celerybeat.pid
 *.bak
 *.tmp
 *.orig
+
+k6/

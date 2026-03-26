@@ -6,16 +6,18 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
-from .models import Department, get_or_create_hr_department, Role, RoleName, UserRole
+from .models import Department, Unit, get_or_create_hr_department, Role, RoleName, UserRole
 from .permissions import IsExecutiveDirector, IsHR
 from .serializers import (
     DepartmentLineManagerSerializer,
     DepartmentSerializer,
     RegisterSerializer,
     RoleSerializer,
+    UnitSerializer,
     UserCreateSerializer,
     UserDepartmentUpdateSerializer,
     UserRoleSerializer,
+    UserSelfUpdateSerializer,
     UserSerializer,
     UserUpdateSerializer,
 )
@@ -27,6 +29,7 @@ __all__ = [
     "TokenRefreshView",
     "RegisterView",
     "MeView",
+    "UserProfileView",
     "UserViewSet",
     "RoleViewSet",
     "AssignRoleView",
@@ -35,6 +38,7 @@ __all__ = [
     "UserDepartmentUpdateView",
     "DepartmentLineManagerView",
     "DepartmentMembersView",
+    "UnitViewSet",
 ]
 
 
@@ -61,6 +65,28 @@ class MeView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
+        return Response(UserSerializer(request.user).data)
+
+
+class UserProfileView(APIView):
+    """
+    GET   /api/v1/profile/        — authenticated user profile
+    PATCH /api/v1/profile/        — update own basic profile fields
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        return Response(UserSerializer(request.user).data)
+
+    def patch(self, request):
+        serializer = UserSelfUpdateSerializer(
+            instance=request.user,
+            data=request.data,
+            partial=True,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
         return Response(UserSerializer(request.user).data)
 
 
@@ -185,6 +211,105 @@ class DepartmentMembersView(APIView):
         return Response(UserSerializer(members, many=True).data)
 
 
+class DepartmentDetailView(APIView):
+    """
+    GET /api/v1/departments/:id/detail/ — department + members + units + supervisors + line manager.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, pk):
+        department = get_object_or_404(Department, pk=pk)
+        user = request.user
+
+        can_access = (
+            user.is_staff
+            or user.has_role(RoleName.HR)
+            or user.has_role(RoleName.EXECUTIVE_DIRECTOR)
+            or user.has_role(RoleName.MANAGING_DIRECTOR)
+            or (user.department_id == department.pk)
+        )
+        if not can_access:
+            raise PermissionDenied("You do not have permission to view this department.")
+
+        dept_data = DepartmentSerializer(department).data
+        members = User.objects.filter(department=department).select_related("department")
+        units = Unit.objects.filter(department=department).select_related("supervisor", "department")
+
+        from .serializers import _UserMinimalSerializer  # local import to avoid circular
+
+        members_data = _UserMinimalSerializer(members, many=True).data
+        units_data = UnitSerializer(units, many=True).data
+
+        payload = {
+            "department": dept_data,
+            "members": members_data,
+            "units": units_data,
+        }
+        return Response(payload)
+
+
+# ---------------------------------------------------------------------------
+# Units
+# ---------------------------------------------------------------------------
+
+
+class UnitViewSet(viewsets.ModelViewSet):
+    """
+    Unit management within departments.
+
+    - List: department members and privileged roles can list units of a department via filter.
+    - Create: only the line manager of the department can create units for that department.
+    - Retrieve: department members or privileged roles.
+    - Update/Delete: only line manager of the unit's department.
+    """
+
+    queryset = Unit.objects.select_related("department", "supervisor").all()
+    serializer_class = UnitSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        department_id = self.request.query_params.get("department")
+        if department_id:
+            qs = qs.filter(department_id=department_id)
+        return qs
+
+    def _is_privileged(self, user):
+        return (
+            user.is_staff
+            or user.has_role(RoleName.HR)
+            or user.has_role(RoleName.EXECUTIVE_DIRECTOR)
+            or user.has_role(RoleName.MANAGING_DIRECTOR)
+        )
+
+    def _can_access_department(self, user, department):
+        return self._is_privileged(user) or user.department_id == department.pk
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        department = serializer.validated_data.get("department")
+        if department is None:
+            raise PermissionDenied("A department is required to create a unit.")
+        if department.line_manager_id != user.pk:
+            raise PermissionDenied("Only the line manager of this department can create units.")
+        serializer.save()
+
+    def get_object(self):
+        obj = super().get_object()
+        user = self.request.user
+        department = obj.department
+
+        if self.request.method in ("GET",):
+            if not self._can_access_department(user, department):
+                raise PermissionDenied("You do not have permission to view this unit.")
+        else:
+            if department.line_manager_id != user.pk and not self._is_privileged(user):
+                raise PermissionDenied("Only the line manager of this department can modify or delete units.")
+
+        return obj
+
+
 # ---------------------------------------------------------------------------
 # Roles
 # ---------------------------------------------------------------------------
@@ -228,6 +353,21 @@ class AssignRoleView(APIView):
         elif role.name in (RoleName.EXECUTIVE_DIRECTOR, RoleName.MANAGING_DIRECTOR):
             user.department = None
             user.save(update_fields=["department", "updated_at"])
+        elif role.name == RoleName.LINE_MANAGER:
+            # A Line Manager must belong to a department so we know which
+            # department's line_manager to update.
+            if user.department is None:
+                raise ValidationError(
+                    {
+                        "department": (
+                            "A Line Manager must belong to a department before "
+                            "assigning the LINE_MANAGER role."
+                        )
+                    }
+                )
+            department = user.department
+            department.line_manager = user
+            department.save(update_fields=["line_manager", "updated_at"])
 
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 

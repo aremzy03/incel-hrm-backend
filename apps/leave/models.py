@@ -4,6 +4,7 @@ from django.conf import settings
 from django.db import models
 from django.utils import timezone
 
+from .utils import calculate_working_days
 
 # ---------------------------------------------------------------------------
 # Mixins
@@ -124,6 +125,7 @@ class LeaveBalance(TimeStampedModel):
 
 class LeaveRequestStatus(models.TextChoices):
     DRAFT = "DRAFT", "Draft"
+    PENDING_SUPERVISOR = "PENDING_SUPERVISOR", "Pending Supervisor"
     PENDING_MANAGER = "PENDING_MANAGER", "Pending Manager"
     PENDING_HR = "PENDING_HR", "Pending HR"
     PENDING_ED = "PENDING_ED", "Pending Executive Director"
@@ -166,17 +168,10 @@ class LeaveRequest(TimeStampedModel):
         ordering = ["-created_at"]
 
     def _compute_working_days(self) -> int:
-        """Count weekdays between start_date and end_date (inclusive)."""
+        """Count working days (excludes weekends and PublicHoliday)."""
         if not (self.start_date and self.end_date):
             return 0
-        current = self.start_date
-        delta = timezone.timedelta(days=1)
-        count = 0
-        while current <= self.end_date:
-            if current.weekday() < 5:  # Mon–Fri
-                count += 1
-            current += delta
-        return count
+        return calculate_working_days(self.start_date, self.end_date)
 
     def save(self, *args, **kwargs):
         self.total_working_days = self._compute_working_days()

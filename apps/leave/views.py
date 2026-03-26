@@ -15,10 +15,13 @@ LeaveRequestViewSet        – Full CRUD minus DELETE, role-filtered queryset
 DepartmentCalendarView     – GET /api/v1/calendar/  dept-scoped approved leave
 """
 
+import csv
 import datetime
+import io
 
 from django.db import transaction
 from django.db.models import Q
+from django.utils import timezone
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -35,6 +38,7 @@ from .models import (
     LeaveRequest,
     LeaveRequestStatus,
     LeaveType,
+    PublicHoliday,
 )
 from .serializers import (
     CalendarEntrySerializer,
@@ -43,6 +47,12 @@ from .serializers import (
     LeaveRequestCreateSerializer,
     LeaveRequestReadSerializer,
     LeaveTypeSerializer,
+    PublicHolidaySerializer,
+)
+from .tasks import (
+    notify_approver_required,
+    notify_leave_decision,
+    notify_leave_submitted,
 )
 
 
@@ -115,9 +125,7 @@ class LeaveTypeViewSet(viewsets.ModelViewSet):
 class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
     """
     GET /api/v1/leave-balances/
-    Supports ?employee=<uuid>&year=<int> query params.
-    Privileged roles (HR, Line Manager, ED, MD, staff) see all records.
-    Regular employees see only their own.
+    Each authenticated user can only see their own balances.
     """
 
     serializer_class = LeaveBalanceSerializer
@@ -125,26 +133,84 @@ class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        qs = LeaveBalance.objects.select_related("employee", "leave_type").all()
+        qs = LeaveBalance.objects.select_related("employee", "leave_type")
+        return qs.filter(employee=user)
 
-        if not (
-            user.is_staff
-            or user.has_role(RoleName.HR)
-            or user.has_role(RoleName.LINE_MANAGER)
-            or user.has_role(RoleName.EXECUTIVE_DIRECTOR)
-            or user.has_role(RoleName.MANAGING_DIRECTOR)
-        ):
-            qs = qs.filter(employee=user)
 
-        employee_id = self.request.query_params.get("employee")
+# ---------------------------------------------------------------------------
+# PublicHoliday
+# ---------------------------------------------------------------------------
+
+class PublicHolidayViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [permissions.IsAuthenticated]
+    serializer_class = PublicHolidaySerializer
+
+    def get_queryset(self):
+        qs = PublicHoliday.objects.all().order_by("date")
         year = self.request.query_params.get("year")
-
-        if employee_id:
-            qs = qs.filter(employee_id=employee_id)
         if year:
-            qs = qs.filter(year=year)
-
+            try:
+                year_int = int(year)
+            except ValueError:
+                raise ValidationError({"year": "year must be an integer."})
+            qs = qs.filter(Q(is_recurring=True) | Q(date__year=year_int))
         return qs
+
+    @action(
+        detail=False,
+        methods=["post"],
+        url_path="upload",
+        permission_classes=[permissions.IsAuthenticated, IsHR | permissions.IsAdminUser],
+    )
+    def upload(self, request):
+        """
+        POST /api/v1/public-holidays/upload/
+        Multipart form-data with file field: `file`
+        CSV columns: name,date   (date format YYYY-MM-DD)
+        Upserts by `date`.
+        """
+        upload_file = request.FILES.get("file")
+        if not upload_file:
+            raise ValidationError({"file": "CSV file is required (multipart field 'file')."})
+
+        try:
+            text = upload_file.read().decode("utf-8-sig")
+        except Exception:
+            raise ValidationError({"file": "Unable to read file as UTF-8 text."})
+
+        reader = csv.DictReader(io.StringIO(text))
+        required = {"name", "date"}
+        if not reader.fieldnames or not required.issubset(set(h.strip() for h in reader.fieldnames)):
+            raise ValidationError({"file": "CSV header must include: name,date"})
+
+        created = 0
+        updated = 0
+        errors = []
+
+        for idx, row in enumerate(reader, start=2):  # header is line 1
+            name = (row.get("name") or "").strip()
+            date_str = (row.get("date") or "").strip()
+
+            if not name or not date_str:
+                errors.append({"line": idx, "error": "name and date are required"})
+                continue
+
+            try:
+                date = datetime.date.fromisoformat(date_str)
+            except ValueError:
+                errors.append({"line": idx, "error": "date must be YYYY-MM-DD"})
+                continue
+
+            obj, was_created = PublicHoliday.objects.update_or_create(
+                date=date,
+                defaults={"name": name, "is_recurring": False},
+            )
+            if was_created:
+                created += 1
+            else:
+                updated += 1
+
+        return Response({"created": created, "updated": updated, "errors": errors})
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +219,10 @@ class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
 
 # Approval stage machine: current_status → (next_status, required_role)
 _APPROVAL_TRANSITIONS = {
+    LeaveRequestStatus.PENDING_SUPERVISOR: (
+        LeaveRequestStatus.PENDING_MANAGER,
+        RoleName.SUPERVISOR,
+    ),
     LeaveRequestStatus.PENDING_MANAGER: (
         LeaveRequestStatus.PENDING_HR,
         RoleName.LINE_MANAGER,
@@ -169,6 +239,7 @@ _APPROVAL_TRANSITIONS = {
 
 # Rejection map: current_status → required_role
 _REJECTION_ROLES = {
+    LeaveRequestStatus.PENDING_SUPERVISOR: RoleName.SUPERVISOR,
     LeaveRequestStatus.PENDING_MANAGER: RoleName.LINE_MANAGER,
     LeaveRequestStatus.PENDING_HR: RoleName.HR,
     LeaveRequestStatus.PENDING_ED: RoleName.EXECUTIVE_DIRECTOR,
@@ -196,8 +267,8 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_permissions(self):
-        if self.action == "partial_update":
-            return [permissions.IsAuthenticated(), IsHR()]
+        # All leave request actions require authentication. Additional
+        # per-action checks are enforced inside the view methods.
         return [permissions.IsAuthenticated()]
 
     def get_serializer_class(self):
@@ -205,17 +276,74 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             return LeaveRequestCreateSerializer
         return LeaveRequestReadSerializer
 
+    def partial_update(self, request, *args, **kwargs):
+        """
+        PATCH /api/v1/leave-requests/{id}/
+
+        - Request owner: can edit their own request only while in DRAFT.
+        - HR: can edit any request, regardless of status.
+        """
+        leave_request = self.get_object()
+        user = request.user
+
+        is_hr = user.has_role(RoleName.HR)
+        is_owner = leave_request.employee == user
+
+        if not (is_hr or is_owner):
+            raise PermissionDenied("You do not have permission to modify this leave request.")
+
+        if is_owner and leave_request.status != LeaveRequestStatus.DRAFT:
+            raise ValidationError(
+                {
+                    "status": (
+                        "You can only edit your own leave requests while they are in DRAFT status. "
+                        f"Current status: {leave_request.status}."
+                    )
+                }
+            )
+
+        return super().partial_update(request, *args, **kwargs)
+
     def get_queryset(self):
         user = self.request.user
         qs = LeaveRequest.objects.select_related("employee", "leave_type", "cover_person").all()
 
+        # Draft visibility rule:
+        # - Only the request owner ever sees DRAFT requests.
+        # - All other users (including HR/ED/MD/Line Manager/cover_person) see
+        #   only non-draft requests for others.
+        from django.db.models import Q
+
+        owner_q = Q(employee=user)
+        non_draft_q = ~Q(status=LeaveRequestStatus.DRAFT)
+        cover_q = Q(cover_person=user)
+
         if _is_privileged(user):
-            return qs
+            # HR / ED / MD / staff:
+            # - See all non-draft requests for everyone.
+            # - Plus their own requests (including drafts).
+            return qs.filter(owner_q | non_draft_q)
+
+        # Supervisor: see unit members' non-draft requests and own requests
+        if user.has_role(RoleName.SUPERVISOR) and getattr(user, "supervised_unit_id", None):
+            unit_q = Q(employee__unit_id=user.supervised_unit_id)
+            visible_q = owner_q | (non_draft_q & (unit_q | cover_q))
+            return qs.filter(visible_q)
 
         if user.has_role(RoleName.LINE_MANAGER) and user.department_id:
-            return qs.filter(employee__department_id=user.department_id)
+            dept_q = Q(employee__department_id=user.department_id)
+            # Line Manager:
+            # - Own requests (any status, including drafts).
+            # - Non-draft requests for employees in their department.
+            # - Non-draft requests where they are cover_person.
+            visible_q = owner_q | (non_draft_q & (dept_q | cover_q))
+            return qs.filter(visible_q)
 
-        return qs.filter(employee=user)
+        # Regular employee:
+        # - Own requests (any status, including drafts).
+        # - Non-draft requests where they are cover_person.
+        visible_q = owner_q | (non_draft_q & cover_q)
+        return qs.filter(visible_q)
 
     # ------------------------------------------------------------------
     # Blocked HTTP methods
@@ -257,8 +385,17 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                 {"department": "Your department has no line manager assigned. Contact HR."}
             )
 
+        # Determine first approval stage based on employee role and unit
+        employee = leave_request.employee
+        if employee.has_role(RoleName.SUPERVISOR):
+            first_status = LeaveRequestStatus.PENDING_MANAGER
+        elif getattr(employee, "unit_id", None) and getattr(employee.unit, "supervisor_id", None):
+            first_status = LeaveRequestStatus.PENDING_SUPERVISOR
+        else:
+            first_status = LeaveRequestStatus.PENDING_MANAGER
+
         prev_status = leave_request.status
-        leave_request.status = LeaveRequestStatus.PENDING_MANAGER
+        leave_request.status = first_status
         leave_request.save(update_fields=["status", "updated_at"])
 
         _create_log(
@@ -266,11 +403,72 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             actor=request.user,
             action=ApprovalAction.MODIFY,
             previous_status=prev_status,
-            new_status=LeaveRequestStatus.PENDING_MANAGER,
-            comment="Submitted for manager approval.",
+            new_status=first_status,
+            comment="Submitted for approval.",
+        )
+
+        transaction.on_commit(
+            lambda: notify_leave_submitted.delay(str(leave_request.id))
+        )
+        transaction.on_commit(
+            lambda: notify_approver_required.delay(str(leave_request.id))
         )
 
         return Response(LeaveRequestReadSerializer(leave_request).data)
+
+    # ------------------------------------------------------------------
+    # create_and_submit — create DRAFT and immediately submit
+    # ------------------------------------------------------------------
+
+    @action(detail=False, methods=["post"], url_path="create-and-submit")
+    def create_and_submit(self, request):
+        """
+        POST /api/v1/leave-requests/create-and-submit/
+
+        Creates a new leave request as DRAFT for the authenticated user and
+        immediately submits it (DRAFT → PENDING_MANAGER), performing the same
+        validations as the regular create + submit flow.
+        """
+        serializer = LeaveRequestCreateSerializer(
+            data=request.data,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        leave_request = serializer.save()
+
+        # Determine first approval stage as in submit()
+        employee = leave_request.employee
+        if employee.has_role(RoleName.SUPERVISOR):
+            first_status = LeaveRequestStatus.PENDING_MANAGER
+        elif getattr(employee, "unit_id", None) and getattr(employee.unit, "supervisor_id", None):
+            first_status = LeaveRequestStatus.PENDING_SUPERVISOR
+        else:
+            first_status = LeaveRequestStatus.PENDING_MANAGER
+
+        prev_status = leave_request.status
+        leave_request.status = first_status
+        leave_request.save(update_fields=["status", "updated_at"])
+
+        _create_log(
+            leave_request=leave_request,
+            actor=request.user,
+            action=ApprovalAction.MODIFY,
+            previous_status=prev_status,
+            new_status=first_status,
+            comment="Created and submitted for approval.",
+        )
+
+        transaction.on_commit(
+            lambda: notify_leave_submitted.delay(str(leave_request.id))
+        )
+        transaction.on_commit(
+            lambda: notify_approver_required.delay(str(leave_request.id))
+        )
+
+        return Response(
+            LeaveRequestReadSerializer(leave_request).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     # ------------------------------------------------------------------
     # approve — Stage-based transitions with role enforcement
@@ -292,11 +490,22 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
         next_status, required_role = _APPROVAL_TRANSITIONS[leave_request.status]
 
-        if not request.user.has_role(required_role):
+        user = request.user
+
+        # Role check
+        if not user.has_role(required_role):
             raise PermissionDenied(
                 f"Only a user with role '{required_role}' can approve at this stage "
                 f"(current status: {leave_request.status})."
             )
+
+        # Additional identity check for supervisor stage: must be the supervisor of the employee's unit
+        if leave_request.status == LeaveRequestStatus.PENDING_SUPERVISOR:
+            unit = getattr(leave_request.employee, "unit", None)
+            if not unit or unit.supervisor_id != user.pk:
+                raise PermissionDenied(
+                    "Only the supervisor of the employee's unit can approve at this stage."
+                )
 
         prev_status = leave_request.status
 
@@ -314,6 +523,18 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                 previous_status=prev_status,
                 new_status=next_status,
                 comment=request.data.get("comment", ""),
+            )
+
+        transaction.on_commit(
+            lambda: notify_approver_required.delay(str(leave_request.id))
+        )
+        if next_status == LeaveRequestStatus.APPROVED:
+            transaction.on_commit(
+                lambda: notify_leave_decision.delay(
+                    str(leave_request.id),
+                    LeaveRequestStatus.APPROVED,
+                    request.data.get("comment", ""),
+                )
             )
 
         return Response(LeaveRequestReadSerializer(leave_request).data)
@@ -341,10 +562,18 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             )
 
         required_role = _REJECTION_ROLES[leave_request.status]
-        if not request.user.has_role(required_role):
+        user = request.user
+        if not user.has_role(required_role):
             raise PermissionDenied(
                 f"Only a user with role '{required_role}' can reject at this stage."
             )
+
+        if leave_request.status == LeaveRequestStatus.PENDING_SUPERVISOR:
+            unit = getattr(leave_request.employee, "unit", None)
+            if not unit or unit.supervisor_id != user.pk:
+                raise PermissionDenied(
+                    "Only the supervisor of the employee's unit can reject at this stage."
+                )
 
         prev_status = leave_request.status
 
@@ -360,6 +589,14 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                 new_status=LeaveRequestStatus.REJECTED,
                 comment=comment,
             )
+
+        transaction.on_commit(
+            lambda: notify_leave_decision.delay(
+                str(leave_request.id),
+                LeaveRequestStatus.REJECTED,
+                comment,
+            )
+        )
 
         return Response(LeaveRequestReadSerializer(leave_request).data)
 
@@ -385,7 +622,11 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         if is_hr:
             pass  # HR can cancel any non-terminal request
         elif is_owner:
-            allowed = {LeaveRequestStatus.DRAFT, LeaveRequestStatus.PENDING_MANAGER}
+            allowed = {
+                LeaveRequestStatus.DRAFT,
+                LeaveRequestStatus.PENDING_SUPERVISOR,
+                LeaveRequestStatus.PENDING_MANAGER,
+            }
             if leave_request.status not in allowed:
                 raise ValidationError(
                     {
@@ -423,14 +664,27 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
     def logs(self, request, pk=None):
         leave_request = self.get_object()
         user = request.user
+        is_owner = leave_request.employee == user
+        is_draft = leave_request.status == LeaveRequestStatus.DRAFT
 
-        can_view = (
-            _is_privileged(user)
-            or user.has_role(RoleName.LINE_MANAGER)
-            or leave_request.employee == user
-        )
-        if not can_view:
-            raise PermissionDenied("You do not have permission to view the approval log.")
+        # Only the owner can ever see logs for DRAFT requests.
+        if not is_owner:
+            if is_draft:
+                raise PermissionDenied("You do not have permission to view the approval log.")
+
+            can_view = _is_privileged(user) or leave_request.cover_person == user
+
+            # Line manager of the employee's department can view
+            if user.has_role(RoleName.LINE_MANAGER) and user.department_id:
+                if leave_request.employee.department_id == user.department_id:
+                    can_view = True
+
+            # Unit supervisor can view logs for their unit members
+            if user.has_role(RoleName.SUPERVISOR) and getattr(user, "supervised_unit_id", None):
+                if leave_request.employee.unit_id == user.supervised_unit_id:
+                    can_view = True
+            if not can_view:
+                raise PermissionDenied("You do not have permission to view the approval log.")
 
         logs_qs = leave_request.logs.select_related("actor").all()
         serializer = LeaveApprovalLogSerializer(logs_qs, many=True)

@@ -4,6 +4,7 @@ from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from .views import (
     AssignRoleView,
+    DepartmentDetailView,
     DepartmentLineManagerView,
     DepartmentMembersView,
     DepartmentViewSet,
@@ -11,8 +12,10 @@ from .views import (
     RegisterView,
     RemoveRoleView,
     RoleViewSet,
+    UnitViewSet,
     UserDepartmentUpdateView,
     UserViewSet,
+    UserProfileView,
 )
 
 auth_urlpatterns = [
@@ -20,11 +23,13 @@ auth_urlpatterns = [
     path("token/refresh/", TokenRefreshView.as_view(), name="token-refresh"),
     path("register/", RegisterView.as_view(), name="register"),
     path("me/", MeView.as_view(), name="me"),
+    path("profile/", UserProfileView.as_view(), name="profile"),
 ]
 
 role_router = DefaultRouter()
 role_router.register(r"users", UserViewSet, basename="user")
 role_router.register(r"roles", RoleViewSet, basename="role")
+role_router.register(r"units", UnitViewSet, basename="unit")
 
 role_urlpatterns = role_router.urls + [
     path("users/<uuid:user_id>/roles/", AssignRoleView.as_view(), name="user-role-assign"),
@@ -53,5 +58,10 @@ department_urlpatterns = department_router.urls + [
         "departments/<uuid:pk>/members/",
         DepartmentMembersView.as_view(),
         name="department-members",
+    ),
+    path(
+        "departments/<uuid:pk>/detail/",
+        DepartmentDetailView.as_view(),
+        name="department-detail",
     ),
 ]

@@ -212,7 +212,7 @@ class ValidateLeaveBalanceTests(TestCase):
         make_balance(self.employee, self.leave_type, year=2025, allocated=10, used=0)
         with self.assertRaises(ValidationError):
             WorkingDaysService.validate_leave_balance(
-                self.employee, self.leave_type, 2026, requested_days=1
+                self.employee, self.leave_type, 2100, requested_days=1
             )
 
 

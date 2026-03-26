@@ -2,7 +2,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from rest_framework import serializers
 
-from .models import Department, Role, RoleName, UserRole
+from .models import Department, Role, RoleName, Unit, UserRole
 
 User = get_user_model()
 
@@ -36,6 +36,17 @@ class _DepartmentMinimalSerializer(serializers.ModelSerializer):
         model = Department
         fields = ("id", "name")
         read_only_fields = fields
+
+
+class UnitSerializer(serializers.ModelSerializer):
+    department = _DepartmentMinimalSerializer(read_only=True)
+    supervisor = _UserMinimalSerializer(read_only=True)
+    members = _UserMinimalSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Unit
+        fields = ("id", "name", "department", "supervisor", "members", "created_at", "updated_at")
+        read_only_fields = ("id", "department", "supervisor", "members", "created_at", "updated_at")
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +91,11 @@ class RegisterSerializer(serializers.ModelSerializer):
 
     password = serializers.CharField(write_only=True, validators=[validate_password])
     password_confirm = serializers.CharField(write_only=True)
-    department = serializers.PrimaryKeyRelatedField(queryset=Department.objects.all())
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(),
+        required=False,
+        allow_null=True,
+    )
 
     class Meta:
         model = User
@@ -96,11 +111,27 @@ class RegisterSerializer(serializers.ModelSerializer):
         return User.objects.create_user(**validated_data)
 
 
+class UserSelfUpdateSerializer(serializers.ModelSerializer):
+    """
+    Serializer for employees updating their own profile.
+
+    Only allows editing non-privileged personal fields.
+    """
+
+    class Meta:
+        model = User
+        fields = ("first_name", "last_name", "phone", "gender", "date_of_birth")
+
+
 class UserCreateSerializer(serializers.ModelSerializer):
     """HR-only serializer for creating users."""
 
     password = serializers.CharField(write_only=True, validators=[validate_password])
-    department = serializers.PrimaryKeyRelatedField(queryset=Department.objects.all())
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(),
+        required=False,
+        allow_null=True,
+    )
 
     class Meta:
         model = User

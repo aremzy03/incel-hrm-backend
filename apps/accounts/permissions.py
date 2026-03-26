@@ -34,3 +34,7 @@ class IsExecutiveDirector(_HasRole):
 
 class IsManagingDirector(_HasRole):
     role_name = RoleName.MANAGING_DIRECTOR
+
+
+class IsSupervisor(_HasRole):
+    role_name = RoleName.SUPERVISOR

@@ -20,6 +20,7 @@ class RoleName(models.TextChoices):
     HR = "HR", "HR"
     EXECUTIVE_DIRECTOR = "EXECUTIVE_DIRECTOR", "Executive Director"
     MANAGING_DIRECTOR = "MANAGING_DIRECTOR", "Managing Director"
+    SUPERVISOR = "SUPERVISOR", "Supervisor"
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +51,34 @@ class Department(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class Unit(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=150)
+    department = models.ForeignKey(
+        Department,
+        on_delete=models.CASCADE,
+        related_name="units",
+    )
+    supervisor = models.OneToOneField(
+        "User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="supervised_unit",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Unit"
+        verbose_name_plural = "Units"
+        ordering = ["name"]
+        unique_together = ("department", "name")
+
+    def __str__(self):
+        return f"{self.name} ({self.department.name})"
 
 
 def get_or_create_hr_department():
@@ -109,6 +138,13 @@ class User(AbstractBaseUser, PermissionsMixin):
         on_delete=models.SET_NULL,
         null=True,
         blank=False,
+        related_name="members",
+    )
+    unit = models.ForeignKey(
+        Unit,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name="members",
     )
     is_active = models.BooleanField(default=True)

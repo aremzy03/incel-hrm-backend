@@ -1,9 +1,13 @@
 from datetime import timedelta
 from pathlib import Path
+import sys
 
 from decouple import Csv, config
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
+# Redis URL used for cache, celery, and notifications (when not overridden)
+REDIS_URL = config("REDIS_URL", default="redis://localhost:6379/0")
 
 SECRET_KEY = config("SECRET_KEY")
 
@@ -32,6 +36,7 @@ THIRD_PARTY_APPS = [
 LOCAL_APPS = [
     "apps.accounts",
     "apps.leave",
+    "apps.notifications",
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -87,6 +92,13 @@ DATABASES = {
         "PORT": config("DB_PORT", default="5432"),
     }
 }
+
+# Use SQLite for test runs so tests do not depend on Postgres permissions.
+if "test" in sys.argv:
+    DATABASES["default"] = {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": BASE_DIR / "test_db.sqlite3",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +180,9 @@ CORS_ALLOWED_ORIGINS = config("CORS_ALLOWED_ORIGINS", default="", cast=Csv())
 # Celery
 # ---------------------------------------------------------------------------
 
-CELERY_BROKER_URL = config("CELERY_BROKER_URL", default="redis://localhost:6379/0")
-CELERY_RESULT_BACKEND = config("CELERY_RESULT_BACKEND", default="redis://localhost:6379/0")
+CELERY_BROKER_URL = config("REDIS_URL", default="redis://localhost:6379/0")
+CELERY_RESULT_BACKEND = config("REDIS_URL", default="redis://localhost:6379/0")
+CELERY_TASK_ALWAYS_EAGER = False
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
@@ -189,3 +202,6 @@ CACHES = {
         },
     }
 }
+
+# Notifications (SSE + Redis Pub/Sub)
+NOTIFICATIONS_REDIS_URL = REDIS_URL

@@ -10,9 +10,27 @@ from .models import (
 )
 
 
+class LeaveApprovalLogInline(admin.TabularInline):
+    model = LeaveApprovalLog
+    extra = 0
+    can_delete = False
+    readonly_fields = (
+        "actor",
+        "action",
+        "comment",
+        "timestamp",
+        "previous_status",
+        "new_status",
+    )
+    fields = readonly_fields
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+
 @admin.register(LeaveType)
 class LeaveTypeAdmin(admin.ModelAdmin):
-    list_display = ("name", "default_days", "created_at")
+    list_display = ("name", "default_days")
     search_fields = ("name",)
     readonly_fields = ("id", "created_at", "updated_at")
 
@@ -24,9 +42,6 @@ class LeavePolicyAdmin(admin.ModelAdmin):
         "annual_entitlement",
         "carry_forward",
         "half_day_allowed",
-        "weekend_excluded",
-        "public_holiday_excluded",
-        "forfeited_on_resignation",
     )
     list_filter = ("leave_type",)
     readonly_fields = ("id", "created_at", "updated_at")
@@ -43,8 +58,8 @@ class PublicHolidayAdmin(admin.ModelAdmin):
 @admin.register(LeaveBalance)
 class LeaveBalanceAdmin(admin.ModelAdmin):
     list_display = ("employee", "leave_type", "year", "allocated_days", "used_days")
-    list_filter = ("year", "leave_type")
-    search_fields = ("employee__email",)
+    list_filter = ("leave_type", "year")
+    search_fields = ("employee__email", "employee__first_name")
     readonly_fields = ("id", "created_at", "updated_at")
 
 
@@ -57,12 +72,12 @@ class LeaveRequestAdmin(admin.ModelAdmin):
         "end_date",
         "total_working_days",
         "status",
-        "is_emergency",
         "created_at",
     )
-    list_filter = ("status", "leave_type", "is_emergency")
-    search_fields = ("employee__email",)
+    list_filter = ("status", "leave_type", "created_at")
+    search_fields = ("employee__email", "employee__first_name")
     readonly_fields = ("id", "total_working_days", "created_at", "updated_at")
+    inlines = (LeaveApprovalLogInline,)
 
 
 @admin.register(LeaveApprovalLog)

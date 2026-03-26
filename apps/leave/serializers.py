@@ -7,6 +7,7 @@ from .models import (
     LeaveRequest,
     LeaveRequestStatus,
     LeaveType,
+    PublicHoliday,
 )
 from .services import WorkingDaysService
 
@@ -50,6 +51,13 @@ class LeaveTypeSerializer(serializers.ModelSerializer):
         read_only_fields = ("id", "created_at", "updated_at")
 
 
+class PublicHolidaySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PublicHoliday
+        fields = ("id", "name", "date", "is_recurring")
+        read_only_fields = fields
+
+
 # ---------------------------------------------------------------------------
 # LeaveBalance
 # ---------------------------------------------------------------------------
@@ -62,6 +70,7 @@ class LeaveBalanceSerializer(serializers.ModelSerializer):
         model = LeaveBalance
         fields = (
             "id",
+            "employee",
             "leave_type",
             "year",
             "allocated_days",
