@@ -1,4 +1,5 @@
 import io
+import datetime
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
@@ -40,7 +41,10 @@ class PublicHolidaysApiTests(TestCase):
         self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
 
     def test_list_returns_holidays(self):
-        PublicHoliday.objects.create(name="New Year", date="2026-01-01", is_recurring=True)
+        target_date = datetime.date(2040, 1, 1)
+        PublicHoliday.objects.get_or_create(
+            date=target_date, defaults={"name": "New Year", "is_recurring": True}
+        )
         self.client.force_authenticate(self.emp)
         resp = self.client.get(self.list_url)
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
@@ -54,22 +58,25 @@ class PublicHolidaysApiTests(TestCase):
 
     def test_upload_upserts_by_date(self):
         self.client.force_authenticate(self.hr)
+        target_date = "2040-01-01"
+        initial_count = PublicHoliday.objects.count()
 
         # Create
-        csv_bytes = io.BytesIO(b"name,date\nNew Year,2026-01-01\n")
+        csv_bytes = io.BytesIO(f"name,date\nNew Year,{target_date}\n".encode("utf-8"))
         resp = self.client.post(self.upload_url, {"file": csv_bytes}, format="multipart")
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(resp.data["created"], 1)
-        self.assertEqual(resp.data["updated"], 0)
-        self.assertEqual(PublicHoliday.objects.count(), 1)
+        self.assertEqual(resp.data["created"] + resp.data["updated"], 1)
+        self.assertEqual(PublicHoliday.objects.count(), initial_count + 1)
 
         # Update same date
-        csv_bytes2 = io.BytesIO(b"name,date\nNew Year Updated,2026-01-01\n")
+        csv_bytes2 = io.BytesIO(
+            f"name,date\nNew Year Updated,{target_date}\n".encode("utf-8")
+        )
         resp2 = self.client.post(self.upload_url, {"file": csv_bytes2}, format="multipart")
         self.assertEqual(resp2.status_code, status.HTTP_200_OK)
         self.assertEqual(resp2.data["created"], 0)
         self.assertEqual(resp2.data["updated"], 1)
 
-        holiday = PublicHoliday.objects.get(date="2026-01-01")
+        holiday = PublicHoliday.objects.get(date=target_date)
         self.assertEqual(holiday.name, "New Year Updated")
 

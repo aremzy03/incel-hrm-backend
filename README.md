@@ -25,6 +25,88 @@ python manage.py createsuperuser
 python manage.py runserver
 ```
 
+## Docker
+
+You can also run the backend in a Docker container using the provided `Dockerfile`.
+
+### Build the image
+
+```bash
+docker build -t incel-hrm-backend .
+```
+
+### Run the web API
+
+The container expects configuration via environment variables (database, Redis, secret key, etc.). At minimum you should provide:
+
+- `DJANGO_SECRET_KEY`
+- Database settings (for example, `DATABASE_URL` or the individual `DB_*` envs you use in `base.py`)
+- `REDIS_URL` / `NOTIFICATIONS_REDIS_URL`
+- `ALLOWED_HOSTS` (for example, `ALLOWED_HOSTS=localhost,127.0.0.1`)
+
+Example with PostgreSQL and Redis running elsewhere:
+
+```bash
+docker run --rm -p 8000:8000 \
+  -e DJANGO_SECRET_KEY="change-me" \
+  -e DATABASE_URL="postgres://user:password@db-host:5432/incel_hrm" \
+  -e REDIS_URL="redis://redis-host:6379/0" \
+  -e NOTIFICATIONS_REDIS_URL="redis://redis-host:6379/0" \
+  -e ALLOWED_HOSTS="localhost,127.0.0.1" \
+  incel-hrm-backend
+```
+
+The image uses:
+
+- `DJANGO_SETTINGS_MODULE=hrm_backend.settings.prod` by default.
+- Gunicorn as the WSGI server, binding to `0.0.0.0:8000`.
+
+### Run a Celery worker with the same image
+
+You can reuse the same image to run a Celery worker by overriding the container command:
+
+```bash
+docker run --rm \
+  -e DJANGO_SECRET_KEY="change-me" \
+  -e DATABASE_URL="postgres://user:password@db-host:5432/incel_hrm" \
+  -e REDIS_URL="redis://redis-host:6379/0" \
+  -e NOTIFICATIONS_REDIS_URL="redis://redis-host:6379/0" \
+  -e ALLOWED_HOSTS="localhost,127.0.0.1" \
+  incel-hrm-backend \
+  celery -A hrm_backend worker -l info
+```
+
+You can similarly start a Celery beat process:
+
+```bash
+docker run --rm \
+  -e DJANGO_SECRET_KEY="change-me" \
+  -e DATABASE_URL="postgres://user:password@db-host:5432/incel_hrm" \
+  -e REDIS_URL="redis://redis-host:6379/0" \
+  -e NOTIFICATIONS_REDIS_URL="redis://redis-host:6379/0" \
+  -e ALLOWED_HOSTS="localhost,127.0.0.1" \
+  incel-hrm-backend \
+  celery -A hrm_backend beat -l info
+```
+
+## CI & GitHub Container Registry
+
+This repository is configured with a GitHub Actions workflow that automatically builds the Docker image from the root `Dockerfile` and publishes it to **GitHub Container Registry (GHCR)** on every push.
+
+- Image name: `ghcr.io/<OWNER>/incel-hrm-backend`
+- Tags:
+  - Branch name (for example, `main`, `feature-xyz`)
+  - Commit SHA
+  - `latest` on the default branch
+
+Example pull:
+
+```bash
+docker pull ghcr.io/<OWNER>/incel-hrm-backend:latest
+```
+
+Replace `<OWNER>` with your GitHub account or organization name.
+
 ## Settings
 
 The project uses a split-settings layout under `hrm_backend/settings/`:

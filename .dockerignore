@@ -1,0 +1,57 @@
+# VCS & editor config
+.git
+.gitignore
+.cursor
+.vscode
+.idea
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# Django runtime artifacts
+*.log
+db.sqlite3
+db.sqlite3-journal
+staticfiles/
+mediafiles/
+media/
+
+# Test & coverage artifacts
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+
+# Type checker & linter caches
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# k6 performance tests (not needed in runtime image)
+k6/
+
