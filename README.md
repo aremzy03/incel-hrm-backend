@@ -39,7 +39,7 @@ docker build -t incel-hrm-backend .
 
 The container expects configuration via environment variables (database, Redis, secret key, etc.). At minimum you should provide:
 
-- `DJANGO_SECRET_KEY`
+- `SECRET_KEY`
 - Database settings (for example, `DATABASE_URL` or the individual `DB_*` envs you use in `base.py`)
 - `REDIS_URL` / `NOTIFICATIONS_REDIS_URL`
 - `ALLOWED_HOSTS` (for example, `ALLOWED_HOSTS=localhost,127.0.0.1`)
@@ -48,7 +48,7 @@ Example with PostgreSQL and Redis running elsewhere:
 
 ```bash
 docker run --rm -p 8000:8000 \
-  -e DJANGO_SECRET_KEY="change-me" \
+  -e SECRET_KEY="change-me" \
   -e DATABASE_URL="postgres://user:password@db-host:5432/incel_hrm" \
   -e REDIS_URL="redis://redis-host:6379/0" \
   -e NOTIFICATIONS_REDIS_URL="redis://redis-host:6379/0" \
@@ -67,7 +67,7 @@ You can reuse the same image to run a Celery worker by overriding the container 
 
 ```bash
 docker run --rm \
-  -e DJANGO_SECRET_KEY="change-me" \
+  -e SECRET_KEY="change-me" \
   -e DATABASE_URL="postgres://user:password@db-host:5432/incel_hrm" \
   -e REDIS_URL="redis://redis-host:6379/0" \
   -e NOTIFICATIONS_REDIS_URL="redis://redis-host:6379/0" \
@@ -80,7 +80,7 @@ You can similarly start a Celery beat process:
 
 ```bash
 docker run --rm \
-  -e DJANGO_SECRET_KEY="change-me" \
+  -e SECRET_KEY="change-me" \
   -e DATABASE_URL="postgres://user:password@db-host:5432/incel_hrm" \
   -e REDIS_URL="redis://redis-host:6379/0" \
   -e NOTIFICATIONS_REDIS_URL="redis://redis-host:6379/0" \

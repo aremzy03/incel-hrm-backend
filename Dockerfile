@@ -21,6 +21,10 @@ COPY . .
 # Use production settings during build steps like collectstatic
 ENV DJANGO_SETTINGS_MODULE=hrm_backend.settings.prod
 
+# Build-time only: required for Django settings import (collectstatic).
+# This does NOT replace runtime configuration.
+ENV SECRET_KEY=build-time-only-not-for-production
+
 # Collect static files into /app/staticfiles
 RUN python manage.py collectstatic --noinput
 
