@@ -1,7 +1,7 @@
 from django.urls import path
 from rest_framework.routers import DefaultRouter
-from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
+from .throttled_auth_views import ThrottledTokenObtainPairView, ThrottledTokenRefreshView
 from .views import (
     AssignRoleView,
     DepartmentDetailView,
@@ -19,8 +19,8 @@ from .views import (
 )
 
 auth_urlpatterns = [
-    path("login/", TokenObtainPairView.as_view(), name="token-obtain-pair"),
-    path("token/refresh/", TokenRefreshView.as_view(), name="token-refresh"),
+    path("login/", ThrottledTokenObtainPairView.as_view(), name="token-obtain-pair"),
+    path("token/refresh/", ThrottledTokenRefreshView.as_view(), name="token-refresh"),
     path("register/", RegisterView.as_view(), name="register"),
     path("me/", MeView.as_view(), name="me"),
     path("profile/", UserProfileView.as_view(), name="profile"),

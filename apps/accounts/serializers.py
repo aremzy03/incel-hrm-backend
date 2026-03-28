@@ -1,5 +1,6 @@
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
+from django.db import transaction
 from rest_framework import serializers
 
 from .models import Department, Role, RoleName, Unit, UserRole
@@ -108,7 +109,14 @@ class RegisterSerializer(serializers.ModelSerializer):
         return attrs
 
     def create(self, validated_data):
-        return User.objects.create_user(**validated_data)
+        with transaction.atomic():
+            user = User.objects.create_user(**validated_data)
+            role, _ = Role.objects.get_or_create(
+                name=RoleName.EMPLOYEE,
+                defaults={"description": "Employee"},
+            )
+            UserRole.objects.get_or_create(user=user, role=role)
+        return user
 
 
 class UserSelfUpdateSerializer(serializers.ModelSerializer):

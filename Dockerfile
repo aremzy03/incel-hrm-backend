@@ -57,9 +57,8 @@ ENV DJANGO_SETTINGS_MODULE=hrm_backend.settings.prod
 
 EXPOSE 8000
 
-# Basic healthcheck – adjust command/endpoint as needed
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-  CMD python manage.py check --deploy || exit 1
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/')" || exit 1
 
 # Default command: run Django via Gunicorn
 CMD ["gunicorn", "hrm_backend.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3"]

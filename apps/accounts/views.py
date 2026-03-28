@@ -1,12 +1,13 @@
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.shortcuts import get_object_or_404
 from rest_framework import generics, permissions, status, viewsets
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from .models import Department, Unit, get_or_create_hr_department, Role, RoleName, UserRole
+from .throttles import RegisterThrottle
 from .permissions import IsExecutiveDirector, IsHR
 from .serializers import (
     DepartmentLineManagerSerializer,
@@ -25,8 +26,6 @@ from .serializers import (
 User = get_user_model()
 
 __all__ = [
-    "TokenObtainPairView",
-    "TokenRefreshView",
     "RegisterView",
     "MeView",
     "UserProfileView",
@@ -51,8 +50,14 @@ class RegisterView(generics.CreateAPIView):
 
     serializer_class = RegisterSerializer
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [RegisterThrottle]
 
     def create(self, request, *args, **kwargs):
+        if not settings.REGISTRATION_OPEN:
+            return Response(
+                {"detail": "Registration is disabled."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
@@ -121,9 +126,9 @@ class UserViewSet(viewsets.ModelViewSet):
 
 class DepartmentViewSet(viewsets.ModelViewSet):
     """
-    GET    /api/v1/departments/       — anyone (no auth required)
+    GET    /api/v1/departments/       — auth required unless PUBLIC_DEPARTMENT_ACCESS
     POST   /api/v1/departments/       — HR or admin
-    GET    /api/v1/departments/:id/   — anyone (no auth required)
+    GET    /api/v1/departments/:id/   — same as list
     PUT    /api/v1/departments/:id/   — HR or admin
     PATCH  /api/v1/departments/:id/   — HR or admin
     DELETE /api/v1/departments/:id/   — HR or admin
@@ -134,7 +139,9 @@ class DepartmentViewSet(viewsets.ModelViewSet):
 
     def get_permissions(self):
         if self.action in ("list", "retrieve"):
-            return [permissions.AllowAny()]
+            if settings.PUBLIC_DEPARTMENT_ACCESS:
+                return [permissions.AllowAny()]
+            return [permissions.IsAuthenticated()]
         return [permissions.IsAuthenticated(), (IsHR | permissions.IsAdminUser)()]
 
 

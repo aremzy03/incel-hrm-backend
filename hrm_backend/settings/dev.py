@@ -18,4 +18,7 @@ DATABASES = {
 
 CORS_ALLOW_ALL_ORIGINS = True
 
+REGISTRATION_OPEN = True
+PUBLIC_DEPARTMENT_ACCESS = True
+
 EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"

@@ -13,6 +13,12 @@ SECRET_KEY = config("SECRET_KEY")
 
 ALLOWED_HOSTS = config("ALLOWED_HOSTS", default="", cast=Csv())
 
+# Public self-service registration (disabled by default; enable in dev via dev.py)
+REGISTRATION_OPEN = config("REGISTRATION_OPEN", default=False, cast=bool)
+
+# Allow unauthenticated list/retrieve on departments (disabled by default in production)
+PUBLIC_DEPARTMENT_ACCESS = config("PUBLIC_DEPARTMENT_ACCESS", default=False, cast=bool)
+
 
 # ---------------------------------------------------------------------------
 # Application definition
@@ -29,6 +35,7 @@ DJANGO_APPS = [
 
 THIRD_PARTY_APPS = [
     "rest_framework",
+    "rest_framework_simplejwt.token_blacklist",
     "corsheaders",
     "django_filters",
 ]
@@ -156,6 +163,17 @@ REST_FRAMEWORK = {
     "DEFAULT_FILTER_BACKENDS": (
         "django_filters.rest_framework.DjangoFilterBackend",
     ),
+    "DEFAULT_THROTTLE_CLASSES": (
+        "rest_framework.throttling.AnonRateThrottle",
+        "rest_framework.throttling.UserRateThrottle",
+    ),
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": "100/hour",
+        "user": "2000/hour",
+        "login": "30/hour",
+        "register": "15/hour",
+        "refresh": "120/hour",
+    },
 }
 
 
@@ -165,7 +183,10 @@ REST_FRAMEWORK = {
 
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=60),
-    "REFRESH_TOKEN_LIFETIME": timedelta(hours=24),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+    "UPDATE_LAST_LOGIN": True,
 }
 
 
