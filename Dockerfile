@@ -62,7 +62,7 @@ ENV DJANGO_SETTINGS_MODULE=hrm_backend.settings.prod
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-  CMD python -c "import urllib.request; r=urllib.request.Request('http://127.0.0.1:8000/health/', headers={'X-Forwarded-Proto':'https'}); urllib.request.urlopen(r)" || exit 1
+  CMD python -c "import urllib.request; r=urllib.request.Request('http://127.0.0.1:8000/health/', headers={'Host':'localhost','X-Forwarded-Proto':'https'}); urllib.request.urlopen(r)" || exit 1
 
 # Default command: run Django via Gunicorn
 CMD ["gunicorn", "hrm_backend.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "3"]
