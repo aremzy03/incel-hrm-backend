@@ -180,8 +180,10 @@ class DepartmentLineManagerView(APIView):
         serializer.is_valid(raise_exception=True)
         user = serializer.validated_data["user"]
 
+        # One role per user: assigning a line manager replaces existing roles.
         lm_role = Role.objects.filter(name=RoleName.LINE_MANAGER).first()
         if lm_role:
+            UserRole.objects.filter(user=user).delete()
             UserRole.objects.get_or_create(user=user, role=lm_role)
 
         department.line_manager = user
@@ -302,6 +304,20 @@ class UnitViewSet(viewsets.ModelViewSet):
         if department.line_manager_id != user.pk and not self._is_privileged(user):
             raise PermissionDenied("Only the line manager of this department can create units.")
         serializer.save()
+
+    def perform_update(self, serializer):
+        # If a supervisor is assigned, enforce "one role per user" by replacing
+        # the user's role with SUPERVISOR.
+        instance = self.get_object()
+        previous_supervisor_id = instance.supervisor_id
+        updated_unit = serializer.save()
+
+        new_supervisor_id = updated_unit.supervisor_id
+        if new_supervisor_id and new_supervisor_id != previous_supervisor_id:
+            supervisor_role = Role.objects.filter(name=RoleName.SUPERVISOR).first()
+            if supervisor_role:
+                UserRole.objects.filter(user_id=new_supervisor_id).delete()
+                UserRole.objects.get_or_create(user_id=new_supervisor_id, role=supervisor_role)
 
     def get_object(self):
         obj = super().get_object()

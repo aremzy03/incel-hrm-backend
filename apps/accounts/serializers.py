@@ -96,6 +96,16 @@ class UnitSerializer(serializers.ModelSerializer):
                 )
         return attrs
 
+    def to_internal_value(self, data):
+        """
+        Backwards-compatible write alias.
+
+        Frontends may send `supervisor` as a UUID string; internally we accept `supervisor_id`.
+        """
+        if isinstance(data, dict) and "supervisor" in data and "supervisor_id" not in data:
+            data = {**data, "supervisor_id": data.get("supervisor")}
+        return super().to_internal_value(data)
+
 
 # ---------------------------------------------------------------------------
 # User
