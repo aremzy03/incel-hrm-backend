@@ -39,15 +39,62 @@ class _DepartmentMinimalSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class _UnitMinimalSerializer(serializers.ModelSerializer):
+    """Lightweight read-only unit for nesting inside UserSerializer."""
+
+    class Meta:
+        model = Unit
+        fields = ("id", "name")
+        read_only_fields = fields
+
+
 class UnitSerializer(serializers.ModelSerializer):
     department = _DepartmentMinimalSerializer(read_only=True)
+    department_id = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(),
+        source="department",
+        write_only=True,
+        required=True,
+    )
     supervisor = _UserMinimalSerializer(read_only=True)
+    supervisor_id = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.all(),
+        source="supervisor",
+        write_only=True,
+        required=False,
+        allow_null=True,
+    )
     members = _UserMinimalSerializer(many=True, read_only=True)
 
     class Meta:
         model = Unit
-        fields = ("id", "name", "department", "supervisor", "members", "created_at", "updated_at")
+        fields = (
+            "id",
+            "name",
+            "department",
+            "department_id",
+            "supervisor",
+            "supervisor_id",
+            "members",
+            "created_at",
+            "updated_at",
+        )
         read_only_fields = ("id", "department", "supervisor", "members", "created_at", "updated_at")
+
+    def validate(self, attrs):
+        # Department is set at creation time and must not be reassigned later.
+        if self.instance is not None and "department" in attrs:
+            raise serializers.ValidationError({"department_id": "Department cannot be changed once a unit is created."})
+
+        # Supervisor (if provided) must be in the same department as the unit.
+        unit_department = getattr(self.instance, "department", None) or attrs.get("department")
+        supervisor = attrs.get("supervisor")
+        if supervisor is not None and unit_department is not None:
+            if supervisor.department_id != unit_department.pk:
+                raise serializers.ValidationError(
+                    {"supervisor_id": "Supervisor must belong to the same department as the unit."}
+                )
+        return attrs
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +107,7 @@ class UserSerializer(serializers.ModelSerializer):
     full_name = serializers.SerializerMethodField()
     roles = serializers.SerializerMethodField()
     department = _DepartmentMinimalSerializer(read_only=True)
+    unit = _UnitMinimalSerializer(read_only=True)
 
     class Meta:
         model = User
@@ -73,6 +121,7 @@ class UserSerializer(serializers.ModelSerializer):
             "gender",
             "date_of_birth",
             "department",
+            "unit",
             "is_active",
             "roles",
             "date_joined",
@@ -157,10 +206,15 @@ class UserUpdateSerializer(serializers.ModelSerializer):
         queryset=Department.objects.all(),
         required=False,
     )
+    unit = serializers.PrimaryKeyRelatedField(
+        queryset=Unit.objects.select_related("department").all(),
+        required=False,
+        allow_null=True,
+    )
 
     class Meta:
         model = User
-        fields = ("first_name", "last_name", "phone", "gender", "date_of_birth", "department", "is_active")
+        fields = ("first_name", "last_name", "phone", "gender", "date_of_birth", "department", "unit", "is_active")
 
     def validate(self, attrs):
         instance = self.instance
@@ -169,6 +223,25 @@ class UserUpdateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     {"department": "Executive Director and Managing Director cannot belong to any department."}
                 )
+
+        # Unit membership must be consistent with department.
+        if instance is not None:
+            new_department = attrs.get("department", instance.department)
+            new_unit = attrs.get("unit", instance.unit)
+
+            if new_unit is not None and new_department is not None:
+                if new_unit.department_id != new_department.pk:
+                    raise serializers.ValidationError(
+                        {"unit": "User unit must belong to the same department as the user."}
+                    )
+
+            # If department changes while keeping an existing unit, enforce consistency.
+            if "department" in attrs and "unit" not in attrs and instance.unit_id is not None:
+                if new_department is not None and instance.unit.department_id != new_department.pk:
+                    raise serializers.ValidationError(
+                        {"department": "User cannot move departments without clearing or updating their unit."}
+                    )
+
         return attrs
 
     def update(self, instance, validated_data):

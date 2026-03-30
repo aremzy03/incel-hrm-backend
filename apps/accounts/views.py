@@ -297,8 +297,9 @@ class UnitViewSet(viewsets.ModelViewSet):
         user = self.request.user
         department = serializer.validated_data.get("department")
         if department is None:
-            raise PermissionDenied("A department is required to create a unit.")
-        if department.line_manager_id != user.pk:
+            raise ValidationError({"department_id": "A department is required to create a unit."})
+        # Allow privileged roles (HR/ED/MD/staff) to create units for any department.
+        if department.line_manager_id != user.pk and not self._is_privileged(user):
             raise PermissionDenied("Only the line manager of this department can create units.")
         serializer.save()
 
