@@ -632,7 +632,7 @@ Unique constraint: `(employee, leave_type, year)`.
 
 | Field               | Notes                                                       |
 |---------------------|-------------------------------------------------------------|
-| `cover_person`      | FK → User. Required. Must be in the same department, cannot be the applicant |
+| `cover_person`      | FK → User. Optional. If provided, must be in the same department and cannot be the applicant |
 | `total_working_days`| Computed automatically on `save()` (excludes weekends + public holidays) |
 | `is_emergency`      | Flag for urgent requests                                    |
 | `status`            | See workflow below                                          |
@@ -669,7 +669,7 @@ Immutable audit trail. One entry is appended per status transition. Fields inclu
 
 1. **One Line Manager per department** -- Each department has at most one line manager (`Department.line_manager`). A user can manage at most one department (OneToOneField). HR and ED can assign/revoke via `POST/DELETE /api/v1/departments/:id/line-manager/`.
 
-2. **Cover person required** -- When creating a leave request, the employee must designate a `cover_person` (another active user in the same department) who will handle their responsibilities during the leave period. The cover person cannot be the requesting employee.
+2. **Cover person optional** -- When creating a leave request, `cover_person` can be omitted (for example, when no suitable cover exists). If provided, the cover person must be another active user in the same department and cannot be the requesting employee.
 
 3. **Maternity and Paternity by gender** -- Maternity leave is only available for female staff; Paternity leave is only available for male staff. Leave balances for these types are created only for eligible users.
 
@@ -869,8 +869,8 @@ Used for `POST` (create) and `PATCH` (update) requests.
 **Validation pipeline (in `validate()`):**
 
 1. `end_date` must be strictly after `start_date`.
-2. `cover_person` must not be the requesting employee.
-3. `cover_person` must be in the same department as the employee.
+2. If provided, `cover_person` must not be the requesting employee.
+3. If provided, `cover_person` must be in the same department as the employee.
 4. Maternity leave: only available for female staff. Paternity leave: only available for male staff.
 5. `WorkingDaysService.check_overlapping_leave()` — rejects if the employee already has an active request in the same window. Passes `exclude_id` automatically on updates.
 6. `WorkingDaysService.check_department_leave_overlap()` — for Annual and Casual only: rejects if any other employee in the same department has an active Annual or Casual request overlapping the same dates. Skipped for Sick, Maternity, Paternity, and other types.

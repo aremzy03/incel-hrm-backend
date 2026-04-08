@@ -148,7 +148,7 @@ class LeaveRequest(TimeStampedModel):
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
         null=True,
-        blank=False,
+        blank=True,
         related_name="covering_leave_requests",
     )
     start_date = models.DateField()

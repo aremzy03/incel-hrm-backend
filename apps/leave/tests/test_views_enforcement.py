@@ -650,6 +650,19 @@ class LeaveRequestCreateTests(TestCase):
             ).exists()
         )
 
+    def test_create_annual_without_cover_person_success(self):
+        self._create_balance(self.female_emp, self.annual)
+        resp = self._post_create(self.female_emp, self.annual, cover_person=None)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        leave_request = LeaveRequest.objects.filter(
+            employee=self.female_emp,
+            leave_type=self.annual,
+            start_date=self.start,
+            end_date=self.end,
+        ).order_by("-created_at").first()
+        self.assertIsNotNone(leave_request)
+        self.assertIsNone(leave_request.cover_person)
+
     def test_annual_department_overlap_blocked_for_other_employee(self):
         # Existing active Annual request for another employee in same department
         make_request(

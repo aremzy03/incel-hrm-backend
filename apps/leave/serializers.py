@@ -101,7 +101,11 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
       - employee is taken from request.user (passed via serializer context)
     """
 
-    cover_person = serializers.PrimaryKeyRelatedField(queryset=_COVER_PERSON_QUERYSET)
+    cover_person = serializers.PrimaryKeyRelatedField(
+        queryset=_COVER_PERSON_QUERYSET,
+        required=False,
+        allow_null=True,
+    )
 
     class Meta:
         model = LeaveRequest
