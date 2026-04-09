@@ -21,6 +21,7 @@ class RoleName(models.TextChoices):
     EXECUTIVE_DIRECTOR = "EXECUTIVE_DIRECTOR", "Executive Director"
     MANAGING_DIRECTOR = "MANAGING_DIRECTOR", "Managing Director"
     SUPERVISOR = "SUPERVISOR", "Supervisor"
+    TEAM_LEAD = "TEAM_LEAD", "Team Lead"
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +80,34 @@ class Unit(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.department.name})"
+
+
+class Team(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=150)
+    unit = models.ForeignKey(
+        Unit,
+        on_delete=models.CASCADE,
+        related_name="teams",
+    )
+    team_lead = models.OneToOneField(
+        "User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="led_team",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Team"
+        verbose_name_plural = "Teams"
+        ordering = ["name"]
+        unique_together = ("unit", "name")
+
+    def __str__(self):
+        return f"{self.name} ({self.unit.name} / {self.unit.department.name})"
 
 
 def get_or_create_hr_department():
@@ -142,6 +171,13 @@ class User(AbstractBaseUser, PermissionsMixin):
     )
     unit = models.ForeignKey(
         Unit,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="members",
+    )
+    team = models.ForeignKey(
+        Team,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,

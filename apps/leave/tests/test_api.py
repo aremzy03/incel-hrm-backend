@@ -6,7 +6,7 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from apps.accounts.models import Department, Role, RoleName, Unit, UserRole
+from apps.accounts.models import Department, Role, RoleName, Team, Unit, UserRole
 from apps.leave.models import (
     LeaveBalance,
     LeaveRequest,
@@ -134,14 +134,15 @@ class LeaveApiTests(APITestCase):
             format="json",
         )
 
-    def _resolve_created_request_id(self, response, start_date=None, end_date=None):
+    def _resolve_created_request_id(self, response, start_date=None, end_date=None, employee=None):
         if "id" in response.data:
             return response.data["id"]
 
+        employee = employee or self.employee
         start_date = start_date or self.base_start
         end_date = end_date or self.base_end
         leave_request = LeaveRequest.objects.filter(
-            employee=self.employee,
+            employee=employee,
             leave_type=self.leave_type,
             start_date=start_date,
             end_date=end_date,
@@ -200,6 +201,77 @@ class LeaveApiTests(APITestCase):
         submit_resp = self._submit_request(self.employee, leave_request_id)
         self.assertEqual(submit_resp.status_code, status.HTTP_200_OK)
         self.assertEqual(submit_resp.data["status"], LeaveRequestStatus.PENDING_MANAGER)
+
+    def test_team_member_starts_at_team_lead(self):
+        # Create team + team lead under unit; assign employee into unit+team
+        team_lead = self._create_user_with_roles(
+            "teamlead@test.com", [RoleName.TEAM_LEAD], department=self.department
+        )
+        team_lead.unit = self.unit
+        team_lead.save(update_fields=["unit", "updated_at"])
+
+        team = Team.objects.create(name="API Team", unit=self.unit, team_lead=team_lead)
+        self.employee.unit = self.unit
+        self.employee.team = team
+        self.employee.save(update_fields=["unit", "team", "updated_at"])
+
+        create_resp = self._create_request(self.employee)
+        leave_request_id = self._resolve_created_request_id(create_resp)
+        submit_resp = self._submit_request(self.employee, leave_request_id)
+        self.assertEqual(submit_resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(submit_resp.data["status"], LeaveRequestStatus.PENDING_TEAM_LEAD)
+
+    def test_line_manager_request_skips_to_hr(self):
+        # LINE_MANAGER requester should start at HR stage
+        LeaveBalance.objects.update_or_create(
+            employee=self.line_manager,
+            leave_type=self.leave_type,
+            year=self.base_start.year,
+            defaults={"allocated_days": 21, "used_days": 0},
+        )
+        self.department.line_manager = self.line_manager
+        self.department.save(update_fields=["line_manager", "updated_at"])
+
+        create_resp = self._create_request(self.line_manager)
+        self.assertEqual(create_resp.status_code, status.HTTP_201_CREATED, msg=f"{create_resp.data}")
+        request_id = self._resolve_created_request_id(create_resp, employee=self.line_manager)
+        submit_resp = self._submit_request(self.line_manager, request_id)
+        self.assertEqual(submit_resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(submit_resp.data["status"], LeaveRequestStatus.PENDING_HR)
+
+    def test_hr_request_goes_to_manager_then_ed(self):
+        # HR requester: manager approval should jump directly to ED (skipping HR stage)
+        # Ensure HR department has a line manager
+        hr_line_manager = self._create_user_with_roles(
+            "hr.lm@test.com", [RoleName.LINE_MANAGER], department=self.hr_department
+        )
+        hr_cover = self._create_user_with_roles(
+            "hr.cover@test.com", [RoleName.EMPLOYEE], department=self.hr_department
+        )
+        self.hr_department.line_manager = hr_line_manager
+        self.hr_department.save(update_fields=["line_manager", "updated_at"])
+
+        LeaveBalance.objects.update_or_create(
+            employee=self.hr_user,
+            leave_type=self.leave_type,
+            year=self.base_start.year,
+            defaults={"allocated_days": 21, "used_days": 0},
+        )
+
+        self._auth(self.hr_user)
+        payload = self._create_payload()
+        payload["cover_person"] = str(hr_cover.id)
+        create_resp = self.client.post(self.list_url, payload, format="json")
+        self.assertEqual(create_resp.status_code, status.HTTP_201_CREATED, msg=f"{create_resp.data}")
+        request_id = self._resolve_created_request_id(create_resp, employee=self.hr_user)
+
+        submit_resp = self._submit_request(self.hr_user, request_id)
+        self.assertEqual(submit_resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(submit_resp.data["status"], LeaveRequestStatus.PENDING_MANAGER)
+
+        manager_approve = self._approve_request(hr_line_manager, request_id)
+        self.assertEqual(manager_approve.status_code, status.HTTP_200_OK)
+        self.assertEqual(manager_approve.data["status"], LeaveRequestStatus.PENDING_ED)
 
     def test_balance_validation_rejects_excess(self):
         self.balance.used_days = 20

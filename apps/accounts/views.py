@@ -2,11 +2,12 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.shortcuts import get_object_or_404
 from rest_framework import generics, permissions, status, viewsets
+from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Department, Unit, get_or_create_hr_department, Role, RoleName, UserRole
+from .models import Department, Team, Unit, get_or_create_hr_department, Role, RoleName, UserRole
 from .throttles import RegisterThrottle
 from .permissions import IsExecutiveDirector, IsHR
 from .serializers import (
@@ -14,6 +15,7 @@ from .serializers import (
     DepartmentSerializer,
     RegisterSerializer,
     RoleSerializer,
+    TeamSerializer,
     UnitSerializer,
     UserCreateSerializer,
     UserDepartmentUpdateSerializer,
@@ -38,6 +40,7 @@ __all__ = [
     "DepartmentLineManagerView",
     "DepartmentMembersView",
     "UnitViewSet",
+    "TeamViewSet",
 ]
 
 
@@ -333,6 +336,154 @@ class UnitViewSet(viewsets.ModelViewSet):
 
         return obj
 
+
+# ---------------------------------------------------------------------------
+# Teams
+# ---------------------------------------------------------------------------
+
+
+class TeamViewSet(viewsets.ModelViewSet):
+    """
+    Team management within units.
+
+    - List: unit/department members and privileged roles can list teams of a unit via filter.
+    - Create: HR or line manager of the unit's department can create teams.
+    - Retrieve: unit/department members or privileged roles.
+    - Update/Delete: HR or line manager of the unit's department.
+    """
+
+    queryset = Team.objects.select_related("unit", "unit__department", "team_lead").all()
+    serializer_class = TeamSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def _is_privileged(self, user):
+        return (
+            user.is_staff
+            or user.has_role(RoleName.HR)
+            or user.has_role(RoleName.EXECUTIVE_DIRECTOR)
+            or user.has_role(RoleName.MANAGING_DIRECTOR)
+        )
+
+    def _can_access_unit(self, user, unit: Unit) -> bool:
+        return self._is_privileged(user) or user.unit_id == unit.pk or user.department_id == unit.department_id
+
+    def _can_manage_unit(self, user, unit: Unit) -> bool:
+        if self._is_privileged(user):
+            return True
+        # Department line manager can manage teams for that department's units.
+        return unit.department.line_manager_id == user.pk
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        unit_id = self.request.query_params.get("unit")
+        if unit_id:
+            qs = qs.filter(unit_id=unit_id)
+        return qs
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        unit = serializer.validated_data.get("unit")
+        if unit is None:
+            raise ValidationError({"unit_id": "A unit is required to create a team."})
+        if not self._can_manage_unit(user, unit):
+            raise PermissionDenied("Only HR or the line manager of this unit's department can create teams.")
+        serializer.save()
+
+    def perform_update(self, serializer):
+        # If a team_lead is assigned, enforce one role per user by replacing the
+        # user's role with TEAM_LEAD.
+        instance = self.get_object()
+        previous_team_lead_id = instance.team_lead_id
+        updated_team = serializer.save()
+
+        new_team_lead_id = updated_team.team_lead_id
+        if new_team_lead_id and new_team_lead_id != previous_team_lead_id:
+            team_lead_role = Role.objects.filter(name=RoleName.TEAM_LEAD).first()
+            if team_lead_role:
+                UserRole.objects.filter(user_id=new_team_lead_id).delete()
+                UserRole.objects.get_or_create(user_id=new_team_lead_id, role=team_lead_role)
+
+    def get_object(self):
+        obj = super().get_object()
+        user = self.request.user
+        unit = obj.unit
+
+        if self.request.method in ("GET",):
+            if not self._can_access_unit(user, unit):
+                raise PermissionDenied("You do not have permission to view this team.")
+        else:
+            if not self._can_manage_unit(user, unit):
+                raise PermissionDenied("Only HR or the line manager of this unit's department can modify or delete teams.")
+
+        return obj
+
+    # ---------------------------
+    # Membership management
+    # ---------------------------
+
+    def _get_user_to_modify(self, request):
+        user_id = request.data.get("user_id")
+        if not user_id:
+            raise ValidationError({"user_id": "user_id is required."})
+        return get_object_or_404(User, pk=user_id)
+
+    @action(detail=True, methods=["post"], url_path="add-member")
+    def add_member(self, request, pk=None):
+        team = self.get_object()
+        if not self._can_manage_unit(request.user, team.unit):
+            raise PermissionDenied("You do not have permission to manage this team.")
+
+        member = self._get_user_to_modify(request)
+        if member.unit_id != team.unit_id:
+            raise ValidationError({"user_id": "User must belong to the same unit as the team."})
+
+        member.team = team
+        member.save(update_fields=["team", "updated_at"])
+        return Response(TeamSerializer(team).data)
+
+    @action(detail=True, methods=["post"], url_path="remove-member")
+    def remove_member(self, request, pk=None):
+        team = self.get_object()
+        if not self._can_manage_unit(request.user, team.unit):
+            raise PermissionDenied("You do not have permission to manage this team.")
+
+        member = self._get_user_to_modify(request)
+        if member.team_id != team.pk:
+            raise ValidationError({"user_id": "User is not a member of this team."})
+
+        member.team = None
+        member.save(update_fields=["team", "updated_at"])
+        return Response(TeamSerializer(team).data)
+
+    @action(detail=True, methods=["post"], url_path="set-lead")
+    def set_lead(self, request, pk=None):
+        team = self.get_object()
+        if not self._can_manage_unit(request.user, team.unit):
+            raise PermissionDenied("You do not have permission to manage this team.")
+
+        lead = self._get_user_to_modify(request)
+        if lead.unit_id != team.unit_id:
+            raise ValidationError({"user_id": "Team lead must belong to the same unit as the team."})
+
+        team.team_lead = lead
+        team.save(update_fields=["team_lead", "updated_at"])
+
+        team_lead_role = Role.objects.filter(name=RoleName.TEAM_LEAD).first()
+        if team_lead_role:
+            UserRole.objects.filter(user_id=lead.pk).delete()
+            UserRole.objects.get_or_create(user_id=lead.pk, role=team_lead_role)
+
+        return Response(TeamSerializer(team).data)
+
+    @action(detail=True, methods=["post"], url_path="clear-lead")
+    def clear_lead(self, request, pk=None):
+        team = self.get_object()
+        if not self._can_manage_unit(request.user, team.unit):
+            raise PermissionDenied("You do not have permission to manage this team.")
+
+        team.team_lead = None
+        team.save(update_fields=["team_lead", "updated_at"])
+        return Response(TeamSerializer(team).data)
 
 # ---------------------------------------------------------------------------
 # Roles

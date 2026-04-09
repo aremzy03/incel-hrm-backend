@@ -125,6 +125,7 @@ class LeaveBalance(TimeStampedModel):
 
 class LeaveRequestStatus(models.TextChoices):
     DRAFT = "DRAFT", "Draft"
+    PENDING_TEAM_LEAD = "PENDING_TEAM_LEAD", "Pending Team Lead"
     PENDING_SUPERVISOR = "PENDING_SUPERVISOR", "Pending Supervisor"
     PENDING_MANAGER = "PENDING_MANAGER", "Pending Manager"
     PENDING_HR = "PENDING_HR", "Pending HR"
@@ -160,6 +161,10 @@ class LeaveRequest(TimeStampedModel):
         max_length=20,
         choices=LeaveRequestStatus.choices,
         default=LeaveRequestStatus.DRAFT,
+    )
+    skip_hr_stage = models.BooleanField(
+        default=False,
+        help_text="If True, the manager stage transitions directly to ED (skipping HR).",
     )
 
     class Meta:

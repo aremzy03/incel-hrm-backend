@@ -12,6 +12,7 @@ from .views import (
     RegisterView,
     RemoveRoleView,
     RoleViewSet,
+    TeamViewSet,
     UnitViewSet,
     UserDepartmentUpdateView,
     UserViewSet,
@@ -30,6 +31,7 @@ role_router = DefaultRouter()
 role_router.register(r"users", UserViewSet, basename="user")
 role_router.register(r"roles", RoleViewSet, basename="role")
 role_router.register(r"units", UnitViewSet, basename="unit")
+role_router.register(r"teams", TeamViewSet, basename="team")
 
 role_urlpatterns = role_router.urls + [
     path("users/<uuid:user_id>/roles/", AssignRoleView.as_view(), name="user-role-assign"),

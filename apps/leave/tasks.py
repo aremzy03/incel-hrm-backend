@@ -144,7 +144,12 @@ def notify_approver_required(leave_request_id: str) -> bool:
         return False
 
     recipient_users: list[User] = []
-    if leave_request.status == LeaveRequestStatus.PENDING_SUPERVISOR:
+    if leave_request.status == LeaveRequestStatus.PENDING_TEAM_LEAD:
+        team = getattr(leave_request.employee, "team", None)
+        team_lead = getattr(team, "team_lead", None) if team else None
+        if team_lead:
+            recipient_users = [team_lead]
+    elif leave_request.status == LeaveRequestStatus.PENDING_SUPERVISOR:
         supervisor = getattr(leave_request.employee.unit, "supervisor", None)
         if supervisor:
             recipient_users = [supervisor]

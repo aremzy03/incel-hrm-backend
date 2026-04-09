@@ -507,6 +507,8 @@ class LeaveRequestCancelTests(TestCase):
     def test_hr_can_cancel_non_terminal(self):
         # HR can cancel for non-draft, non-terminal statuses they can see.
         for status_value in (
+            LeaveRequestStatus.PENDING_TEAM_LEAD,
+            LeaveRequestStatus.PENDING_SUPERVISOR,
             LeaveRequestStatus.PENDING_MANAGER,
             LeaveRequestStatus.PENDING_HR,
             LeaveRequestStatus.PENDING_ED,
@@ -526,6 +528,11 @@ class LeaveRequestCancelTests(TestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
 
         self.req.status = LeaveRequestStatus.PENDING_MANAGER
+        self.req.save(update_fields=["status", "updated_at"])
+        resp = self.client.post(self.cancel_url, {"comment": "change"}, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        self.req.status = LeaveRequestStatus.PENDING_TEAM_LEAD
         self.req.save(update_fields=["status", "updated_at"])
         resp = self.client.post(self.cancel_url, {"comment": "change"}, format="json")
         self.assertEqual(resp.status_code, status.HTTP_200_OK)

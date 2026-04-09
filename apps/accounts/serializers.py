@@ -3,7 +3,7 @@ from django.contrib.auth.password_validation import validate_password
 from django.db import transaction
 from rest_framework import serializers
 
-from .models import Department, Role, RoleName, Unit, UserRole
+from .models import Department, Role, RoleName, Team, Unit, UserRole
 
 User = get_user_model()
 
@@ -44,6 +44,15 @@ class _UnitMinimalSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Unit
+        fields = ("id", "name")
+        read_only_fields = fields
+
+
+class _TeamMinimalSerializer(serializers.ModelSerializer):
+    """Lightweight read-only team for nesting inside UserSerializer."""
+
+    class Meta:
+        model = Team
         fields = ("id", "name")
         read_only_fields = fields
 
@@ -107,6 +116,54 @@ class UnitSerializer(serializers.ModelSerializer):
         return super().to_internal_value(data)
 
 
+class TeamSerializer(serializers.ModelSerializer):
+    unit = _UnitMinimalSerializer(read_only=True)
+    unit_id = serializers.PrimaryKeyRelatedField(
+        queryset=Unit.objects.select_related("department").all(),
+        source="unit",
+        write_only=True,
+        required=True,
+    )
+    team_lead = _UserMinimalSerializer(read_only=True)
+    team_lead_id = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.select_related("department", "unit").all(),
+        source="team_lead",
+        write_only=True,
+        required=False,
+        allow_null=True,
+    )
+    members = _UserMinimalSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Team
+        fields = (
+            "id",
+            "name",
+            "unit",
+            "unit_id",
+            "team_lead",
+            "team_lead_id",
+            "members",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = ("id", "unit", "team_lead", "members", "created_at", "updated_at")
+
+    def validate(self, attrs):
+        # Unit is set at creation time and must not be reassigned later.
+        if self.instance is not None and "unit" in attrs:
+            raise serializers.ValidationError({"unit_id": "Unit cannot be changed once a team is created."})
+
+        team_unit = getattr(self.instance, "unit", None) or attrs.get("unit")
+        team_lead = attrs.get("team_lead")
+
+        if team_lead is not None and team_unit is not None:
+            if team_lead.unit_id != team_unit.pk:
+                raise serializers.ValidationError({"team_lead_id": "Team lead must belong to the same unit as the team."})
+
+        return attrs
+
+
 # ---------------------------------------------------------------------------
 # User
 # ---------------------------------------------------------------------------
@@ -118,6 +175,7 @@ class UserSerializer(serializers.ModelSerializer):
     roles = serializers.SerializerMethodField()
     department = _DepartmentMinimalSerializer(read_only=True)
     unit = _UnitMinimalSerializer(read_only=True)
+    team = _TeamMinimalSerializer(read_only=True)
 
     class Meta:
         model = User
@@ -132,6 +190,7 @@ class UserSerializer(serializers.ModelSerializer):
             "date_of_birth",
             "department",
             "unit",
+            "team",
             "is_active",
             "roles",
             "date_joined",
@@ -221,10 +280,15 @@ class UserUpdateSerializer(serializers.ModelSerializer):
         required=False,
         allow_null=True,
     )
+    team = serializers.PrimaryKeyRelatedField(
+        queryset=Team.objects.select_related("unit", "unit__department").all(),
+        required=False,
+        allow_null=True,
+    )
 
     class Meta:
         model = User
-        fields = ("first_name", "last_name", "phone", "gender", "date_of_birth", "department", "unit", "is_active")
+        fields = ("first_name", "last_name", "phone", "gender", "date_of_birth", "department", "unit", "team", "is_active")
 
     def validate(self, attrs):
         instance = self.instance
@@ -238,6 +302,7 @@ class UserUpdateSerializer(serializers.ModelSerializer):
         if instance is not None:
             new_department = attrs.get("department", instance.department)
             new_unit = attrs.get("unit", instance.unit)
+            new_team = attrs.get("team", instance.team)
 
             if new_unit is not None and new_department is not None:
                 if new_unit.department_id != new_department.pk:
@@ -245,12 +310,25 @@ class UserUpdateSerializer(serializers.ModelSerializer):
                         {"unit": "User unit must belong to the same department as the user."}
                     )
 
+            if new_team is not None:
+                if new_unit is None:
+                    raise serializers.ValidationError({"team": "User cannot be assigned to a team without being assigned to a unit."})
+                if new_team.unit_id != new_unit.pk:
+                    raise serializers.ValidationError({"team": "User team must belong to the same unit as the user."})
+
             # If department changes while keeping an existing unit, enforce consistency.
             if "department" in attrs and "unit" not in attrs and instance.unit_id is not None:
                 if new_department is not None and instance.unit.department_id != new_department.pk:
                     raise serializers.ValidationError(
                         {"department": "User cannot move departments without clearing or updating their unit."}
                     )
+
+            # If unit changes while keeping an existing team, enforce consistency.
+            if "unit" in attrs and "team" not in attrs and instance.team_id is not None:
+                if new_unit is None:
+                    raise serializers.ValidationError({"unit": "User cannot clear unit without also clearing team."})
+                if instance.team.unit_id != new_unit.pk:
+                    raise serializers.ValidationError({"unit": "User cannot change unit without clearing or updating their team."})
 
         return attrs
 

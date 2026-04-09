@@ -219,6 +219,10 @@ class PublicHolidayViewSet(viewsets.ReadOnlyModelViewSet):
 
 # Approval stage machine: current_status → (next_status, required_role)
 _APPROVAL_TRANSITIONS = {
+    LeaveRequestStatus.PENDING_TEAM_LEAD: (
+        LeaveRequestStatus.PENDING_SUPERVISOR,
+        RoleName.TEAM_LEAD,
+    ),
     LeaveRequestStatus.PENDING_SUPERVISOR: (
         LeaveRequestStatus.PENDING_MANAGER,
         RoleName.SUPERVISOR,
@@ -239,6 +243,7 @@ _APPROVAL_TRANSITIONS = {
 
 # Rejection map: current_status → required_role
 _REJECTION_ROLES = {
+    LeaveRequestStatus.PENDING_TEAM_LEAD: RoleName.TEAM_LEAD,
     LeaveRequestStatus.PENDING_SUPERVISOR: RoleName.SUPERVISOR,
     LeaveRequestStatus.PENDING_MANAGER: RoleName.LINE_MANAGER,
     LeaveRequestStatus.PENDING_HR: RoleName.HR,
@@ -306,7 +311,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        qs = LeaveRequest.objects.select_related("employee", "leave_type", "cover_person").all()
+        qs = LeaveRequest.objects.select_related("employee", "employee__team", "leave_type", "cover_person").all()
 
         # Draft visibility rule:
         # - Only the request owner ever sees DRAFT requests.
@@ -329,6 +334,14 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             unit_q = Q(employee__unit_id=user.supervised_unit_id)
             visible_q = owner_q | (non_draft_q & (unit_q | cover_q))
             return qs.filter(visible_q)
+
+        # Team lead: see team members' non-draft requests and own requests
+        if user.has_role(RoleName.TEAM_LEAD):
+            led_team = getattr(user, "led_team", None)
+            if led_team is not None:
+                team_q = Q(employee__team_id=led_team.pk)
+                visible_q = owner_q | (non_draft_q & (team_q | cover_q))
+                return qs.filter(visible_q)
 
         if user.has_role(RoleName.LINE_MANAGER) and user.department_id:
             dept_q = Q(employee__department_id=user.department_id)
@@ -379,24 +392,39 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                 {"status": f"Only DRAFT requests can be submitted. Current status: {leave_request.status}."}
             )
 
-        lm = leave_request.employee.get_department_line_manager()
-        if lm is None:
-            raise ValidationError(
-                {"department": "Your department has no line manager assigned. Contact HR."}
-            )
-
-        # Determine first approval stage based on employee role and unit
+        # Determine first approval stage based on employee org context + role-based skipping.
         employee = leave_request.employee
-        if employee.has_role(RoleName.SUPERVISOR):
+
+        skip_hr_stage = False
+        if employee.has_role(RoleName.MANAGING_DIRECTOR) or employee.has_role(RoleName.EXECUTIVE_DIRECTOR):
+            first_status = LeaveRequestStatus.APPROVED
+        elif employee.has_role(RoleName.HR):
+            # Special-case: HR requester -> Line Manager of HR department -> ED (skip HR stage)
             first_status = LeaveRequestStatus.PENDING_MANAGER
+            skip_hr_stage = True
+        elif employee.has_role(RoleName.LINE_MANAGER):
+            first_status = LeaveRequestStatus.PENDING_HR
+        elif employee.has_role(RoleName.SUPERVISOR) or employee.has_role(RoleName.TEAM_LEAD):
+            first_status = LeaveRequestStatus.PENDING_MANAGER
+        elif getattr(employee, "team_id", None) and getattr(employee.team, "team_lead_id", None):
+            first_status = LeaveRequestStatus.PENDING_TEAM_LEAD
         elif getattr(employee, "unit_id", None) and getattr(employee.unit, "supervisor_id", None):
             first_status = LeaveRequestStatus.PENDING_SUPERVISOR
         else:
             first_status = LeaveRequestStatus.PENDING_MANAGER
 
+        # For any non-auto-approved flow, we must have a department line manager assigned.
+        if first_status != LeaveRequestStatus.APPROVED:
+            lm = leave_request.employee.get_department_line_manager()
+            if lm is None:
+                raise ValidationError(
+                    {"department": "Your department has no line manager assigned. Contact HR."}
+                )
+
         prev_status = leave_request.status
         leave_request.status = first_status
-        leave_request.save(update_fields=["status", "updated_at"])
+        leave_request.skip_hr_stage = skip_hr_stage
+        leave_request.save(update_fields=["status", "skip_hr_stage", "updated_at"])
 
         _create_log(
             leave_request=leave_request,
@@ -407,12 +435,22 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             comment="Submitted for approval.",
         )
 
-        transaction.on_commit(
-            lambda: notify_leave_submitted.delay(str(leave_request.id))
-        )
-        transaction.on_commit(
-            lambda: notify_approver_required.delay(str(leave_request.id))
-        )
+        if first_status == LeaveRequestStatus.APPROVED:
+            _deduct_leave_balance(leave_request)
+            transaction.on_commit(
+                lambda: notify_leave_decision.delay(
+                    str(leave_request.id),
+                    LeaveRequestStatus.APPROVED,
+                    "Auto-approved based on requester role.",
+                )
+            )
+        else:
+            transaction.on_commit(
+                lambda: notify_leave_submitted.delay(str(leave_request.id))
+            )
+            transaction.on_commit(
+                lambda: notify_approver_required.delay(str(leave_request.id))
+            )
 
         return Response(LeaveRequestReadSerializer(leave_request).data)
 
@@ -438,16 +476,34 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
         # Determine first approval stage as in submit()
         employee = leave_request.employee
-        if employee.has_role(RoleName.SUPERVISOR):
+        skip_hr_stage = False
+        if employee.has_role(RoleName.MANAGING_DIRECTOR) or employee.has_role(RoleName.EXECUTIVE_DIRECTOR):
+            first_status = LeaveRequestStatus.APPROVED
+        elif employee.has_role(RoleName.HR):
             first_status = LeaveRequestStatus.PENDING_MANAGER
+            skip_hr_stage = True
+        elif employee.has_role(RoleName.LINE_MANAGER):
+            first_status = LeaveRequestStatus.PENDING_HR
+        elif employee.has_role(RoleName.SUPERVISOR) or employee.has_role(RoleName.TEAM_LEAD):
+            first_status = LeaveRequestStatus.PENDING_MANAGER
+        elif getattr(employee, "team_id", None) and getattr(employee.team, "team_lead_id", None):
+            first_status = LeaveRequestStatus.PENDING_TEAM_LEAD
         elif getattr(employee, "unit_id", None) and getattr(employee.unit, "supervisor_id", None):
             first_status = LeaveRequestStatus.PENDING_SUPERVISOR
         else:
             first_status = LeaveRequestStatus.PENDING_MANAGER
 
+        if first_status != LeaveRequestStatus.APPROVED:
+            lm = leave_request.employee.get_department_line_manager()
+            if lm is None:
+                raise ValidationError(
+                    {"department": "Your department has no line manager assigned. Contact HR."}
+                )
+
         prev_status = leave_request.status
         leave_request.status = first_status
-        leave_request.save(update_fields=["status", "updated_at"])
+        leave_request.skip_hr_stage = skip_hr_stage
+        leave_request.save(update_fields=["status", "skip_hr_stage", "updated_at"])
 
         _create_log(
             leave_request=leave_request,
@@ -458,12 +514,22 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             comment="Created and submitted for approval.",
         )
 
-        transaction.on_commit(
-            lambda: notify_leave_submitted.delay(str(leave_request.id))
-        )
-        transaction.on_commit(
-            lambda: notify_approver_required.delay(str(leave_request.id))
-        )
+        if first_status == LeaveRequestStatus.APPROVED:
+            _deduct_leave_balance(leave_request)
+            transaction.on_commit(
+                lambda: notify_leave_decision.delay(
+                    str(leave_request.id),
+                    LeaveRequestStatus.APPROVED,
+                    "Auto-approved based on requester role.",
+                )
+            )
+        else:
+            transaction.on_commit(
+                lambda: notify_leave_submitted.delay(str(leave_request.id))
+            )
+            transaction.on_commit(
+                lambda: notify_approver_required.delay(str(leave_request.id))
+            )
 
         return Response(
             LeaveRequestReadSerializer(leave_request).data,
@@ -500,6 +566,13 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             )
 
         # Additional identity check for supervisor stage: must be the supervisor of the employee's unit
+        if leave_request.status == LeaveRequestStatus.PENDING_TEAM_LEAD:
+            team = getattr(leave_request.employee, "team", None)
+            if not team or team.team_lead_id != user.pk:
+                raise PermissionDenied(
+                    "Only the team lead of the employee's team can approve at this stage."
+                )
+
         if leave_request.status == LeaveRequestStatus.PENDING_SUPERVISOR:
             unit = getattr(leave_request.employee, "unit", None)
             if not unit or unit.supervisor_id != user.pk:
@@ -510,6 +583,14 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         prev_status = leave_request.status
 
         with transaction.atomic():
+            # HR-requester special-case: manager stage should jump straight to ED.
+            if (
+                leave_request.skip_hr_stage
+                and leave_request.status == LeaveRequestStatus.PENDING_MANAGER
+                and next_status == LeaveRequestStatus.PENDING_HR
+            ):
+                next_status = LeaveRequestStatus.PENDING_ED
+
             leave_request.status = next_status
             leave_request.save(update_fields=["status", "updated_at"])
 
@@ -568,6 +649,13 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                 f"Only a user with role '{required_role}' can reject at this stage."
             )
 
+        if leave_request.status == LeaveRequestStatus.PENDING_TEAM_LEAD:
+            team = getattr(leave_request.employee, "team", None)
+            if not team or team.team_lead_id != user.pk:
+                raise PermissionDenied(
+                    "Only the team lead of the employee's team can reject at this stage."
+                )
+
         if leave_request.status == LeaveRequestStatus.PENDING_SUPERVISOR:
             unit = getattr(leave_request.employee, "unit", None)
             if not unit or unit.supervisor_id != user.pk:
@@ -624,6 +712,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         elif is_owner:
             allowed = {
                 LeaveRequestStatus.DRAFT,
+                LeaveRequestStatus.PENDING_TEAM_LEAD,
                 LeaveRequestStatus.PENDING_SUPERVISOR,
                 LeaveRequestStatus.PENDING_MANAGER,
             }
@@ -682,6 +771,12 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             # Unit supervisor can view logs for their unit members
             if user.has_role(RoleName.SUPERVISOR) and getattr(user, "supervised_unit_id", None):
                 if leave_request.employee.unit_id == user.supervised_unit_id:
+                    can_view = True
+
+            # Team lead can view logs for their team members
+            if user.has_role(RoleName.TEAM_LEAD):
+                led_team = getattr(user, "led_team", None)
+                if led_team is not None and leave_request.employee.team_id == led_team.pk:
                     can_view = True
             if not can_view:
                 raise PermissionDenied("You do not have permission to view the approval log.")

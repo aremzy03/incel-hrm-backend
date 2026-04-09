@@ -641,6 +641,7 @@ Unique constraint: `(employee, leave_type, year)`.
 
 ```
 DRAFT
+  → PENDING_TEAM_LEAD (if employee is in a team with a team lead)
   → PENDING_SUPERVISOR (if employee is in a unit with a supervisor)
   → PENDING_MANAGER
   → PENDING_HR
@@ -653,6 +654,7 @@ DRAFT
 | Status               | Meaning                                                  |
 |----------------------|----------------------------------------------------------|
 | `DRAFT`              | Saved but not yet submitted                              |
+| `PENDING_TEAM_LEAD`  | Awaiting approval from the employee’s Team Lead          |
 | `PENDING_SUPERVISOR` | Awaiting approval from the employee’s Unit supervisor    |
 | `PENDING_MANAGER`    | Awaiting Line Manager approval                           |
 | `PENDING_HR`         | Awaiting HR approval                                     |
@@ -679,7 +681,7 @@ Immutable audit trail. One entry is appended per status transition. Fields inclu
 
 6. **Submit requires a line manager** -- An employee cannot submit a DRAFT request (`POST .../submit/`) unless their department has a line manager assigned. This ensures the approval chain is complete before a request enters the pipeline.
 
-7. **Approval chain** -- When a request is submitted, it flows through: department Line Manager → HR → Executive Director. Each approver can only act at their designated stage.
+7. **Approval chain** -- When a request is submitted, it flows through: Team Lead (if applicable) → Unit Supervisor (if applicable) → department Line Manager → HR → Executive Director. Certain requester roles skip lower stages.
 
 8. **Line Manager scoped visibility** -- A Line Manager's `GET /api/v1/leave-requests/` queryset is now scoped to their own department (not all requests).
 
@@ -936,17 +938,18 @@ All leave endpoints require a valid JWT `Authorization: Bearer <token>` header.
 
 | Method | Endpoint | Permission | Description |
 |--------|----------|-----------|-------------|
-| POST | `/api/v1/leave-requests/:id/submit/` | Request owner | DRAFT → PENDING_MANAGER (requires dept line manager) |
-| POST | `/api/v1/leave-requests/create-and-submit/` | Request owner | Create a new request and immediately submit it (DRAFT → PENDING_MANAGER) |
+| POST | `/api/v1/leave-requests/:id/submit/` | Request owner | Submit a draft into the approval workflow (requires dept line manager) |
+| POST | `/api/v1/leave-requests/create-and-submit/` | Request owner | Create a new request and immediately submit it |
 | POST | `/api/v1/leave-requests/:id/approve/` | Role-matched approver | Stage transition (see table below) |
 | POST | `/api/v1/leave-requests/:id/reject/` | Role-matched approver | Any pending stage → REJECTED (comment required) |
-| POST | `/api/v1/leave-requests/:id/cancel/` | Owner (DRAFT/PENDING_MANAGER) or HR | → CANCELLED |
+| POST | `/api/v1/leave-requests/:id/cancel/` | Owner (DRAFT/early pending) or HR | → CANCELLED |
 | GET | `/api/v1/leave-requests/:id/logs/` | HR / Manager / ED / owner | Full approval audit trail |
 
 #### Approval stage transitions
 
 | Current status | Required role | Next status |
 |---|---|---|
+| `PENDING_TEAM_LEAD` | `TEAM_LEAD` | `PENDING_SUPERVISOR` |
 | `PENDING_MANAGER` | `LINE_MANAGER` | `PENDING_HR` |
 | `PENDING_HR` | `HR` | `PENDING_ED` |
 | `PENDING_ED` | `EXECUTIVE_DIRECTOR` | `APPROVED` |

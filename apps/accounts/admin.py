@@ -1,19 +1,19 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 
-from .models import Department, Role, Unit, User, UserRole
+from .models import Department, Role, Team, Unit, User, UserRole
 
 
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
-    list_display = ("email", "first_name", "last_name", "department", "unit", "is_staff", "is_active", "date_joined")
-    list_filter = ("is_staff", "is_active", "is_superuser", "department", "unit")
+    list_display = ("email", "first_name", "last_name", "department", "unit", "team", "is_staff", "is_active", "date_joined")
+    list_filter = ("is_staff", "is_active", "is_superuser", "department", "unit", "team")
     search_fields = ("email", "first_name", "last_name")
     ordering = ("-date_joined",)
 
     fieldsets = (
         (None, {"fields": ("email", "password")}),
-        ("Personal info", {"fields": ("first_name", "last_name", "phone", "department", "unit")}),
+        ("Personal info", {"fields": ("first_name", "last_name", "phone", "department", "unit", "team")}),
         (
             "Permissions",
             {
@@ -68,4 +68,11 @@ class DepartmentAdmin(admin.ModelAdmin):
 class UnitAdmin(admin.ModelAdmin):
     list_display = ("name", "department", "supervisor", "created_at")
     search_fields = ("name", "department__name")
+    readonly_fields = ("id", "created_at", "updated_at")
+
+
+@admin.register(Team)
+class TeamAdmin(admin.ModelAdmin):
+    list_display = ("name", "unit", "team_lead", "created_at")
+    search_fields = ("name", "unit__name", "unit__department__name", "team_lead__email")
     readonly_fields = ("id", "created_at", "updated_at")
