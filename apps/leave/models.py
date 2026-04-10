@@ -166,6 +166,10 @@ class LeaveRequest(TimeStampedModel):
         default=False,
         help_text="If True, the manager stage transitions directly to ED (skipping HR).",
     )
+    manager_approver_is_management = models.BooleanField(
+        default=False,
+        help_text="If True, the PENDING_MANAGER approver is Management department line manager.",
+    )
 
     class Meta:
         verbose_name = "Leave Request"

@@ -367,11 +367,6 @@ class DepartmentLineManagerSerializer(serializers.Serializer):
     def validate_user_id(self, user):
         department = self.context["department"]
 
-        if user.department_id != department.pk:
-            raise serializers.ValidationError(
-                "The user must belong to this department to be its line manager."
-            )
-
         if hasattr(user, "managed_department") and user.managed_department.pk != department.pk:
             raise serializers.ValidationError(
                 "This user is already the line manager of another department."

@@ -28,7 +28,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.accounts.models import RoleName
+from apps.accounts.models import RoleName, get_or_create_management_department
 from apps.accounts.permissions import IsEmployee, IsHR
 
 from .models import (
@@ -52,7 +52,6 @@ from .serializers import (
 from .tasks import (
     notify_approver_required,
     notify_leave_decision,
-    notify_leave_submitted,
 )
 
 
@@ -396,6 +395,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         employee = leave_request.employee
 
         skip_hr_stage = False
+        manager_approver_is_management = False
         if employee.has_role(RoleName.MANAGING_DIRECTOR) or employee.has_role(RoleName.EXECUTIVE_DIRECTOR):
             first_status = LeaveRequestStatus.APPROVED
         elif employee.has_role(RoleName.HR):
@@ -403,7 +403,9 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             first_status = LeaveRequestStatus.PENDING_MANAGER
             skip_hr_stage = True
         elif employee.has_role(RoleName.LINE_MANAGER):
-            first_status = LeaveRequestStatus.PENDING_HR
+            # LINE_MANAGER requester: route to Management department's line manager first.
+            first_status = LeaveRequestStatus.PENDING_MANAGER
+            manager_approver_is_management = True
         elif employee.has_role(RoleName.SUPERVISOR) or employee.has_role(RoleName.TEAM_LEAD):
             first_status = LeaveRequestStatus.PENDING_MANAGER
         elif getattr(employee, "team_id", None) and getattr(employee.team, "team_lead_id", None):
@@ -415,16 +417,22 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
         # For any non-auto-approved flow, we must have a department line manager assigned.
         if first_status != LeaveRequestStatus.APPROVED:
-            lm = leave_request.employee.get_department_line_manager()
-            if lm is None:
-                raise ValidationError(
-                    {"department": "Your department has no line manager assigned. Contact HR."}
-                )
+            if manager_approver_is_management:
+                mgmt = get_or_create_management_department()
+                if mgmt.line_manager_id is None:
+                    raise ValidationError({"department": "Management department has no line manager assigned. Contact HR."})
+            else:
+                lm = leave_request.employee.get_department_line_manager()
+                if lm is None:
+                    raise ValidationError(
+                        {"department": "Your department has no line manager assigned. Contact HR."}
+                    )
 
         prev_status = leave_request.status
         leave_request.status = first_status
         leave_request.skip_hr_stage = skip_hr_stage
-        leave_request.save(update_fields=["status", "skip_hr_stage", "updated_at"])
+        leave_request.manager_approver_is_management = manager_approver_is_management
+        leave_request.save(update_fields=["status", "skip_hr_stage", "manager_approver_is_management", "updated_at"])
 
         _create_log(
             leave_request=leave_request,
@@ -445,9 +453,6 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                 )
             )
         else:
-            transaction.on_commit(
-                lambda: notify_leave_submitted.delay(str(leave_request.id))
-            )
             transaction.on_commit(
                 lambda: notify_approver_required.delay(str(leave_request.id))
             )
@@ -477,13 +482,15 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         # Determine first approval stage as in submit()
         employee = leave_request.employee
         skip_hr_stage = False
+        manager_approver_is_management = False
         if employee.has_role(RoleName.MANAGING_DIRECTOR) or employee.has_role(RoleName.EXECUTIVE_DIRECTOR):
             first_status = LeaveRequestStatus.APPROVED
         elif employee.has_role(RoleName.HR):
             first_status = LeaveRequestStatus.PENDING_MANAGER
             skip_hr_stage = True
         elif employee.has_role(RoleName.LINE_MANAGER):
-            first_status = LeaveRequestStatus.PENDING_HR
+            first_status = LeaveRequestStatus.PENDING_MANAGER
+            manager_approver_is_management = True
         elif employee.has_role(RoleName.SUPERVISOR) or employee.has_role(RoleName.TEAM_LEAD):
             first_status = LeaveRequestStatus.PENDING_MANAGER
         elif getattr(employee, "team_id", None) and getattr(employee.team, "team_lead_id", None):
@@ -494,16 +501,22 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             first_status = LeaveRequestStatus.PENDING_MANAGER
 
         if first_status != LeaveRequestStatus.APPROVED:
-            lm = leave_request.employee.get_department_line_manager()
-            if lm is None:
-                raise ValidationError(
-                    {"department": "Your department has no line manager assigned. Contact HR."}
-                )
+            if manager_approver_is_management:
+                mgmt = get_or_create_management_department()
+                if mgmt.line_manager_id is None:
+                    raise ValidationError({"department": "Management department has no line manager assigned. Contact HR."})
+            else:
+                lm = leave_request.employee.get_department_line_manager()
+                if lm is None:
+                    raise ValidationError(
+                        {"department": "Your department has no line manager assigned. Contact HR."}
+                    )
 
         prev_status = leave_request.status
         leave_request.status = first_status
         leave_request.skip_hr_stage = skip_hr_stage
-        leave_request.save(update_fields=["status", "skip_hr_stage", "updated_at"])
+        leave_request.manager_approver_is_management = manager_approver_is_management
+        leave_request.save(update_fields=["status", "skip_hr_stage", "manager_approver_is_management", "updated_at"])
 
         _create_log(
             leave_request=leave_request,
@@ -524,9 +537,6 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                 )
             )
         else:
-            transaction.on_commit(
-                lambda: notify_leave_submitted.delay(str(leave_request.id))
-            )
             transaction.on_commit(
                 lambda: notify_approver_required.delay(str(leave_request.id))
             )
@@ -564,6 +574,13 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                 f"Only a user with role '{required_role}' can approve at this stage "
                 f"(current status: {leave_request.status})."
             )
+
+        if leave_request.status == LeaveRequestStatus.PENDING_MANAGER and leave_request.manager_approver_is_management:
+            mgmt = get_or_create_management_department()
+            if mgmt.line_manager_id != user.pk:
+                raise PermissionDenied(
+                    "Only the Management department line manager can approve at this stage for this request."
+                )
 
         # Additional identity check for supervisor stage: must be the supervisor of the employee's unit
         if leave_request.status == LeaveRequestStatus.PENDING_TEAM_LEAD:

@@ -8,4 +8,5 @@ django-redis
 celery
 redis
 python-decouple
+django-anymail
 gunicorn

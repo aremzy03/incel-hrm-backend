@@ -7,7 +7,17 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Department, Team, Unit, get_or_create_hr_department, Role, RoleName, UserRole
+from .models import (
+    Department,
+    DepartmentMembership,
+    Team,
+    Unit,
+    get_or_create_hr_department,
+    get_or_create_management_department,
+    Role,
+    RoleName,
+    UserRole,
+)
 from .throttles import RegisterThrottle
 from .permissions import IsExecutiveDirector, IsHR
 from .serializers import (
@@ -183,11 +193,19 @@ class DepartmentLineManagerView(APIView):
         serializer.is_valid(raise_exception=True)
         user = serializer.validated_data["user"]
 
-        # One role per user: assigning a line manager replaces existing roles.
+        # Multi-role: allow ED/MD/HR to also hold LINE_MANAGER.
         lm_role = Role.objects.filter(name=RoleName.LINE_MANAGER).first()
         if lm_role:
-            UserRole.objects.filter(user=user).delete()
+            if not (
+                user.has_role(RoleName.HR)
+                or user.has_role(RoleName.EXECUTIVE_DIRECTOR)
+                or user.has_role(RoleName.MANAGING_DIRECTOR)
+            ):
+                UserRole.objects.filter(user=user).delete()
             UserRole.objects.get_or_create(user=user, role=lm_role)
+
+        mgmt = get_or_create_management_department()
+        DepartmentMembership.objects.get_or_create(user=user, department=mgmt)
 
         department.line_manager = user
         department.save(update_fields=["line_manager", "updated_at"])
@@ -319,7 +337,12 @@ class UnitViewSet(viewsets.ModelViewSet):
         if new_supervisor_id and new_supervisor_id != previous_supervisor_id:
             supervisor_role = Role.objects.filter(name=RoleName.SUPERVISOR).first()
             if supervisor_role:
-                UserRole.objects.filter(user_id=new_supervisor_id).delete()
+                if not (
+                    User.objects.filter(pk=new_supervisor_id, user_roles__role__name=RoleName.HR).exists()
+                    or User.objects.filter(pk=new_supervisor_id, user_roles__role__name=RoleName.EXECUTIVE_DIRECTOR).exists()
+                    or User.objects.filter(pk=new_supervisor_id, user_roles__role__name=RoleName.MANAGING_DIRECTOR).exists()
+                ):
+                    UserRole.objects.filter(user_id=new_supervisor_id).delete()
                 UserRole.objects.get_or_create(user_id=new_supervisor_id, role=supervisor_role)
 
     def get_object(self):
@@ -400,7 +423,13 @@ class TeamViewSet(viewsets.ModelViewSet):
         if new_team_lead_id and new_team_lead_id != previous_team_lead_id:
             team_lead_role = Role.objects.filter(name=RoleName.TEAM_LEAD).first()
             if team_lead_role:
-                UserRole.objects.filter(user_id=new_team_lead_id).delete()
+                if not (
+                    User.objects.filter(pk=new_team_lead_id, user_roles__role__name=RoleName.HR).exists()
+                    or User.objects.filter(pk=new_team_lead_id, user_roles__role__name=RoleName.EXECUTIVE_DIRECTOR).exists()
+                    or User.objects.filter(pk=new_team_lead_id, user_roles__role__name=RoleName.MANAGING_DIRECTOR).exists()
+                    or User.objects.filter(pk=new_team_lead_id, user_roles__role__name=RoleName.LINE_MANAGER).exists()
+                ):
+                    UserRole.objects.filter(user_id=new_team_lead_id).delete()
                 UserRole.objects.get_or_create(user_id=new_team_lead_id, role=team_lead_role)
 
     def get_object(self):
@@ -470,7 +499,13 @@ class TeamViewSet(viewsets.ModelViewSet):
 
         team_lead_role = Role.objects.filter(name=RoleName.TEAM_LEAD).first()
         if team_lead_role:
-            UserRole.objects.filter(user_id=lead.pk).delete()
+            if not (
+                lead.has_role(RoleName.HR)
+                or lead.has_role(RoleName.EXECUTIVE_DIRECTOR)
+                or lead.has_role(RoleName.MANAGING_DIRECTOR)
+                or lead.has_role(RoleName.LINE_MANAGER)
+            ):
+                UserRole.objects.filter(user_id=lead.pk).delete()
             UserRole.objects.get_or_create(user_id=lead.pk, role=team_lead_role)
 
         return Response(TeamSerializer(team).data)
@@ -517,7 +552,21 @@ class AssignRoleView(APIView):
         user = get_object_or_404(User, pk=user_id)
         serializer = UserRoleSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        UserRole.objects.filter(user=user).delete()
+        role_obj = serializer.validated_data["role_id"]
+
+        # Multi-role support: HR/ED/MD users may ALSO hold LINE_MANAGER.
+        additive_line_manager = (
+            role_obj.name == RoleName.LINE_MANAGER
+            and (
+                user.has_role(RoleName.HR)
+                or user.has_role(RoleName.EXECUTIVE_DIRECTOR)
+                or user.has_role(RoleName.MANAGING_DIRECTOR)
+            )
+        )
+
+        if not additive_line_manager:
+            UserRole.objects.filter(user=user).delete()
+
         user_role = serializer.save(user=user)
         role = user_role.role
 
@@ -528,10 +577,22 @@ class AssignRoleView(APIView):
         elif role.name in (RoleName.EXECUTIVE_DIRECTOR, RoleName.MANAGING_DIRECTOR):
             user.department = None
             user.save(update_fields=["department", "updated_at"])
+            # ED is preferred as the Management Dept line manager.
+            if role.name == RoleName.EXECUTIVE_DIRECTOR:
+                mgmt = get_or_create_management_department()
+                mgmt.line_manager = user
+                mgmt.save(update_fields=["line_manager", "updated_at"])
         elif role.name == RoleName.LINE_MANAGER:
+            mgmt = get_or_create_management_department()
+            DepartmentMembership.objects.get_or_create(user=user, department=mgmt)
+
             # A Line Manager must belong to a department so we know which
-            # department's line_manager to update.
-            if user.department is None:
+            # department's line_manager to update (unless the user is HR/ED/MD).
+            if user.department is None and not (
+                user.has_role(RoleName.HR)
+                or user.has_role(RoleName.EXECUTIVE_DIRECTOR)
+                or user.has_role(RoleName.MANAGING_DIRECTOR)
+            ):
                 raise ValidationError(
                     {
                         "department": (
@@ -540,9 +601,10 @@ class AssignRoleView(APIView):
                         )
                     }
                 )
-            department = user.department
-            department.line_manager = user
-            department.save(update_fields=["line_manager", "updated_at"])
+            if user.department is not None:
+                department = user.department
+                department.line_manager = user
+                department.save(update_fields=["line_manager", "updated_at"])
 
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 

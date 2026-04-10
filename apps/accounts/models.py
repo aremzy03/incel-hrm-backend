@@ -29,6 +29,7 @@ class RoleName(models.TextChoices):
 # ---------------------------------------------------------------------------
 
 HR_DEPARTMENT_NAME = "Human Resources (HR)"
+MANAGEMENT_DEPARTMENT_NAME = "Management"
 
 
 class Department(models.Model):
@@ -52,6 +53,29 @@ class Department(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class DepartmentMembership(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        "User",
+        on_delete=models.CASCADE,
+        related_name="department_memberships",
+    )
+    department = models.ForeignKey(
+        Department,
+        on_delete=models.CASCADE,
+        related_name="memberships",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Department Membership"
+        verbose_name_plural = "Department Memberships"
+        unique_together = ("user", "department")
+
+    def __str__(self):
+        return f"{self.user.email} -> {self.department.name}"
 
 
 class Unit(models.Model):
@@ -115,6 +139,15 @@ def get_or_create_hr_department():
     department, _ = Department.objects.get_or_create(
         name=HR_DEPARTMENT_NAME,
         defaults={"description": "Default department for Human Resources staff."},
+    )
+    return department
+
+
+def get_or_create_management_department():
+    """Return the Management department, creating it if it does not exist."""
+    department, _ = Department.objects.get_or_create(
+        name=MANAGEMENT_DEPARTMENT_NAME,
+        defaults={"description": "Default department for management chain routing."},
     )
     return department
 

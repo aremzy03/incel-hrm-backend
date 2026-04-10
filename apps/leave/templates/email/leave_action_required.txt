@@ -1,0 +1,15 @@
+Leave request awaiting your approval
+
+Employee: {{ employee_name }}
+Leave type: {{ leave_type }}
+Dates: {{ start_date }} to {{ end_date }}
+Total days: {{ total_days }}
+Current stage: {{ status }}
+{% if reason %}
+Reason: {{ reason }}
+{% endif %}
+
+{% if action_url %}
+Review request: {{ action_url }}
+{% endif %}
+

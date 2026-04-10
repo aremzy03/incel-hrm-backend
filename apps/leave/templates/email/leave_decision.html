@@ -1,0 +1,31 @@
+{% extends "email/base.html" %}
+
+{% block content %}
+  <p class="title">Leave request decision</p>
+  <p class="muted">{{ decision_message }}</p>
+
+  <div class="divider"></div>
+
+  <table class="kv" role="presentation" cellpadding="0" cellspacing="0" width="100%">
+    <tr><td class="k">Employee</td><td class="v">{{ employee_name }}</td></tr>
+    <tr><td class="k">Leave type</td><td class="v">{{ leave_type }}</td></tr>
+    <tr><td class="k">Dates</td><td class="v">{{ start_date }} → {{ end_date }}</td></tr>
+    <tr><td class="k">Total days</td><td class="v">{{ total_days }}</td></tr>
+    <tr><td class="k">Status</td><td class="v">{{ status }}</td></tr>
+  </table>
+
+  {% if comment %}
+    <div class="divider"></div>
+    <p class="muted"><strong>Comment:</strong> {{ comment }}</p>
+  {% endif %}
+
+  {% if action_url %}
+    <div class="buttonWrap">
+      <a class="button" href="{{ action_url }}" target="_blank" rel="noopener noreferrer">View request</a>
+    </div>
+    <p class="muted" style="margin-top: 10px;">
+      If the button doesn’t work, copy and paste this URL: {{ action_url }}
+    </p>
+  {% endif %}
+{% endblock %}
+

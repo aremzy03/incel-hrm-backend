@@ -1,12 +1,22 @@
 import datetime
 
 from django.contrib.auth import get_user_model
+from django.core import mail
+from django.test import override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from apps.accounts.models import Department, Role, RoleName, Team, Unit, UserRole
+from apps.accounts.models import (
+    Department,
+    Role,
+    RoleName,
+    Team,
+    Unit,
+    UserRole,
+    get_or_create_management_department,
+)
 from apps.leave.models import (
     LeaveBalance,
     LeaveRequest,
@@ -44,7 +54,7 @@ class LeaveApiTests(APITestCase):
             "hr@test.com", [RoleName.HR], department=self.hr_department
         )
         self.executive_director = self._create_user_with_roles(
-            "ed@test.com", [RoleName.EXECUTIVE_DIRECTOR], department=self.hr_department
+            "ed@test.com", [RoleName.EXECUTIVE_DIRECTOR, RoleName.LINE_MANAGER], department=self.hr_department
         )
 
         self.unit = Unit.objects.create(
@@ -221,8 +231,8 @@ class LeaveApiTests(APITestCase):
         self.assertEqual(submit_resp.status_code, status.HTTP_200_OK)
         self.assertEqual(submit_resp.data["status"], LeaveRequestStatus.PENDING_TEAM_LEAD)
 
-    def test_line_manager_request_skips_to_hr(self):
-        # LINE_MANAGER requester should start at HR stage
+    def test_line_manager_request_routes_to_management_then_hr_then_ed(self):
+        # LINE_MANAGER requester should go to Management dept line manager (ED), then HR, then ED final.
         LeaveBalance.objects.update_or_create(
             employee=self.line_manager,
             leave_type=self.leave_type,
@@ -232,12 +242,31 @@ class LeaveApiTests(APITestCase):
         self.department.line_manager = self.line_manager
         self.department.save(update_fields=["line_manager", "updated_at"])
 
+        mgmt = get_or_create_management_department()
+        mgmt.line_manager = self.executive_director
+        mgmt.save(update_fields=["line_manager", "updated_at"])
+
         create_resp = self._create_request(self.line_manager)
         self.assertEqual(create_resp.status_code, status.HTTP_201_CREATED, msg=f"{create_resp.data}")
         request_id = self._resolve_created_request_id(create_resp, employee=self.line_manager)
         submit_resp = self._submit_request(self.line_manager, request_id)
         self.assertEqual(submit_resp.status_code, status.HTTP_200_OK)
-        self.assertEqual(submit_resp.data["status"], LeaveRequestStatus.PENDING_HR)
+        self.assertEqual(submit_resp.data["status"], LeaveRequestStatus.PENDING_MANAGER)
+
+        # ED approves as management dept line manager (LINE_MANAGER stage)
+        manager_approve = self._approve_request(self.executive_director, request_id)
+        self.assertEqual(manager_approve.status_code, status.HTTP_200_OK)
+        self.assertEqual(manager_approve.data["status"], LeaveRequestStatus.PENDING_HR)
+
+        # HR approves
+        hr_approve = self._approve_request(self.hr_user, request_id)
+        self.assertEqual(hr_approve.status_code, status.HTTP_200_OK)
+        self.assertEqual(hr_approve.data["status"], LeaveRequestStatus.PENDING_ED)
+
+        # ED final approves (2nd approval by ED)
+        ed_approve = self._approve_request(self.executive_director, request_id)
+        self.assertEqual(ed_approve.status_code, status.HTTP_200_OK)
+        self.assertEqual(ed_approve.data["status"], LeaveRequestStatus.APPROVED)
 
     def test_hr_request_goes_to_manager_then_ed(self):
         # HR requester: manager approval should jump directly to ED (skipping HR stage)
@@ -366,3 +395,113 @@ class LeaveApiTests(APITestCase):
         cancel_resp = self._cancel_request(self.hr_user, leave_request_id)
         self.assertEqual(cancel_resp.status_code, status.HTTP_200_OK)
         self.assertEqual(cancel_resp.data["status"], LeaveRequestStatus.CANCELLED)
+
+    @override_settings(
+        CELERY_TASK_ALWAYS_EAGER=True,
+        EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+        FRONTEND_BASE_URL="http://localhost:3000",
+    )
+    def test_submit_sends_email_only_to_current_stage_approver(self):
+        mail.outbox.clear()
+
+        create_resp = self._create_request(self.employee)
+        leave_request_id = self._resolve_created_request_id(create_resp)
+        with self.captureOnCommitCallbacks(execute=True):
+            submit_resp = self._submit_request(self.employee, leave_request_id)
+        self.assertEqual(submit_resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(submit_resp.data["status"], LeaveRequestStatus.PENDING_MANAGER)
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, [self.line_manager.email])
+        self.assertTrue(
+            getattr(mail.outbox[0], "alternatives", None),
+            msg="Expected multipart email with HTML alternative.",
+        )
+
+    @override_settings(
+        CELERY_TASK_ALWAYS_EAGER=True,
+        EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+        FRONTEND_BASE_URL="http://localhost:3000",
+    )
+    def test_team_lead_stage_emails_team_lead_not_manager(self):
+        mail.outbox.clear()
+
+        team_lead = self._create_user_with_roles(
+            "teamlead.notify@test.com", [RoleName.TEAM_LEAD], department=self.department
+        )
+        team_lead.unit = self.unit
+        team_lead.save(update_fields=["unit", "updated_at"])
+
+        team = Team.objects.create(name="Notify Team", unit=self.unit, team_lead=team_lead)
+        self.employee.unit = self.unit
+        self.employee.team = team
+        self.employee.save(update_fields=["unit", "team", "updated_at"])
+
+        create_resp = self._create_request(self.employee)
+        leave_request_id = self._resolve_created_request_id(create_resp)
+        with self.captureOnCommitCallbacks(execute=True):
+            submit_resp = self._submit_request(self.employee, leave_request_id)
+        self.assertEqual(submit_resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(submit_resp.data["status"], LeaveRequestStatus.PENDING_TEAM_LEAD)
+
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, [team_lead.email])
+
+    @override_settings(
+        CELERY_TASK_ALWAYS_EAGER=True,
+        EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+        FRONTEND_BASE_URL="http://localhost:3000",
+    )
+    def test_emails_sent_at_each_stage_and_final_decision(self):
+        mail.outbox.clear()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            leave_request_id = self._create_and_submit()
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, [self.line_manager.email])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            manager_approve = self._approve_request(self.line_manager, leave_request_id)
+        self.assertEqual(manager_approve.status_code, status.HTTP_200_OK)
+        self.assertEqual(manager_approve.data["status"], LeaveRequestStatus.PENDING_HR)
+        self.assertEqual(len(mail.outbox), 2)
+        self.assertEqual(mail.outbox[1].to, [self.hr_user.email])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            hr_approve = self._approve_request(self.hr_user, leave_request_id)
+        self.assertEqual(hr_approve.status_code, status.HTTP_200_OK)
+        self.assertEqual(hr_approve.data["status"], LeaveRequestStatus.PENDING_ED)
+        self.assertEqual(len(mail.outbox), 3)
+        self.assertEqual(mail.outbox[2].to, [self.executive_director.email])
+
+        with self.captureOnCommitCallbacks(execute=True):
+            ed_approve = self._approve_request(self.executive_director, leave_request_id)
+        self.assertEqual(ed_approve.status_code, status.HTTP_200_OK)
+        self.assertEqual(ed_approve.data["status"], LeaveRequestStatus.APPROVED)
+        self.assertEqual(len(mail.outbox), 4)
+        self.assertEqual(mail.outbox[3].to, [self.employee.email])
+
+    @override_settings(
+        CELERY_TASK_ALWAYS_EAGER=True,
+        EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+        FRONTEND_BASE_URL="http://localhost:3000",
+    )
+    def test_rejection_sends_decision_only_to_requester(self):
+        mail.outbox.clear()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            leave_request_id = self._create_and_submit()
+        self.assertEqual(len(mail.outbox), 1)  # manager action required
+
+        with self.captureOnCommitCallbacks(execute=True):
+            manager_approve = self._approve_request(self.line_manager, leave_request_id)
+        self.assertEqual(manager_approve.status_code, status.HTTP_200_OK)
+        self.assertEqual(manager_approve.data["status"], LeaveRequestStatus.PENDING_HR)
+        self.assertEqual(len(mail.outbox), 2)  # HR action required
+
+        with self.captureOnCommitCallbacks(execute=True):
+            hr_reject = self._reject_request(self.hr_user, leave_request_id, comment="No cover")
+        self.assertEqual(hr_reject.status_code, status.HTTP_200_OK)
+        self.assertEqual(hr_reject.data["status"], LeaveRequestStatus.REJECTED)
+        self.assertEqual(len(mail.outbox), 3)  # requester decision
+        self.assertEqual(mail.outbox[2].to, [self.employee.email])

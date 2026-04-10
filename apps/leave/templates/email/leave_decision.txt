@@ -1,0 +1,17 @@
+Leave request decision
+
+{{ decision_message }}
+
+Employee: {{ employee_name }}
+Leave type: {{ leave_type }}
+Dates: {{ start_date }} to {{ end_date }}
+Total days: {{ total_days }}
+Status: {{ status }}
+{% if comment %}
+Comment: {{ comment }}
+{% endif %}
+
+{% if action_url %}
+View request: {{ action_url }}
+{% endif %}
+

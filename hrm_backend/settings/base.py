@@ -38,6 +38,7 @@ THIRD_PARTY_APPS = [
     "rest_framework_simplejwt.token_blacklist",
     "corsheaders",
     "django_filters",
+    "anymail",
 ]
 
 LOCAL_APPS = [
@@ -195,6 +196,34 @@ SIMPLE_JWT = {
 # ---------------------------------------------------------------------------
 
 CORS_ALLOWED_ORIGINS = config("CORS_ALLOWED_ORIGINS", default="", cast=Csv())
+
+#
+# ---------------------------------------------------------------------------
+# Email (Google Workspace SMTP relay)
+# ---------------------------------------------------------------------------
+#
+# We default to SMTP relay settings, but keep everything env-driven so:
+# - dev can keep using console backend (see settings/dev.py), or override via env
+# - production can run either unauthenticated relay (IP allowlist) or SMTP auth
+#
+EMAIL_BACKEND = config(
+    "EMAIL_BACKEND",
+    default="django.core.mail.backends.smtp.EmailBackend",
+)
+
+EMAIL_HOST = config("EMAIL_HOST", default="smtp-relay.gmail.com")
+EMAIL_PORT = config("EMAIL_PORT", default=587, cast=int)
+EMAIL_USE_TLS = config("EMAIL_USE_TLS", default=True, cast=bool)
+EMAIL_USE_SSL = config("EMAIL_USE_SSL", default=False, cast=bool)
+
+# Leave empty for IP-allowlist relay policies; set for SMTP-auth relay policies.
+EMAIL_HOST_USER = config("EMAIL_HOST_USER", default="")
+EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD", default="")
+
+DEFAULT_FROM_EMAIL = config("DEFAULT_FROM_EMAIL", default="no-reply@incel-hrm.local")
+
+# Frontend deep links included in emails (e.g., /leave/requests/<id>)
+FRONTEND_BASE_URL = config("FRONTEND_BASE_URL", default="http://localhost:3000")
 
 
 # ---------------------------------------------------------------------------

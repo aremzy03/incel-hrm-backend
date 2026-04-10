@@ -149,6 +149,28 @@ In development settings (`hrm_backend/settings/dev.py`), email is printed to the
 
 - `EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"`
 
+### Email (Google Workspace SMTP relay)
+
+In production (and optionally in development), this backend can send email through **Google Workspace SMTP relay** using Django’s SMTP backend.
+
+Configure via environment variables (see `.env.example`):
+
+- `EMAIL_BACKEND` (default): `django.core.mail.backends.smtp.EmailBackend`
+- `EMAIL_HOST` (default): `smtp-relay.gmail.com`
+- `EMAIL_PORT` (default): `587`
+- `EMAIL_USE_TLS` (default): `True`
+- `EMAIL_USE_SSL` (default): `False`
+- `DEFAULT_FROM_EMAIL` (recommended): `no-reply@yourdomain.com`
+
+Relay authentication modes:
+
+- **IP allowlisting (no username/password)**: leave `EMAIL_HOST_USER` and `EMAIL_HOST_PASSWORD` empty.
+- **SMTP auth required**: set `EMAIL_HOST_USER` and `EMAIL_HOST_PASSWORD`.
+
+Email deep links:
+
+- Set `FRONTEND_BASE_URL` (e.g. `https://hrm.yourdomain.com`) so emails can link to request details like `/leave/requests/<id>`.
+
 ### Leave workflow notifications
 
 Leave requests trigger Celery tasks in `apps/leave/tasks.py` on:
@@ -187,8 +209,22 @@ The SSE system uses `NOTIFICATIONS_REDIS_URL`, which defaults to `REDIS_URL` in 
 
 ### Leave notifications
 
-When leave requests are submitted/approved/rejected, the Celery tasks in `apps/leave/tasks.py` now:\n+
-- send email (as before)\n+- create an in-app `Notification` record\n+- publish an SSE event to any active sessions for the recipient\n+
+When leave requests are submitted/approved/rejected, the Celery tasks in `apps/leave/tasks.py` now:
+
+- send email (as before)
+- create an in-app `Notification` record
+- publish an SSE event to any active sessions for the recipient
+
+## Running tests
+
+By default, running with `hrm_backend.settings.dev` will use Postgres and may require database permissions to create a test database.
+
+To run tests using the shared `base` settings (which switches to SQLite automatically for `manage.py test`), run:
+
+```bash
+DJANGO_SETTINGS_MODULE=hrm_backend.settings.base python manage.py test
+```
+
 ## Project Layout
 
 ```
@@ -681,7 +717,7 @@ Immutable audit trail. One entry is appended per status transition. Fields inclu
 
 6. **Submit requires a line manager** -- An employee cannot submit a DRAFT request (`POST .../submit/`) unless their department has a line manager assigned. This ensures the approval chain is complete before a request enters the pipeline.
 
-7. **Approval chain** -- When a request is submitted, it flows through: Team Lead (if applicable) → Unit Supervisor (if applicable) → department Line Manager → HR → Executive Director. Certain requester roles skip lower stages.
+7. **Approval chain** -- When a request is submitted, it flows through: Team Lead (if applicable) → Unit Supervisor (if applicable) → department Line Manager → HR → Executive Director. Certain requester roles may route through special chains.\n+\n+   - **LINE_MANAGER applicant**: Management Department Line Manager (ED) → HR → ED (final)\n+   - **HR applicant**: Department Line Manager → ED (skips HR stage)\n*** End Patch}"}]}Commentary to=functions.ApplyPatch  天天中彩票未form code with 279 more bytes to show code>
 
 8. **Line Manager scoped visibility** -- A Line Manager's `GET /api/v1/leave-requests/` queryset is now scoped to their own department (not all requests).
 
