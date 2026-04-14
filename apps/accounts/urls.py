@@ -5,6 +5,8 @@ from .throttled_auth_views import ThrottledTokenObtainPairView, ThrottledTokenRe
 from .views import (
     AssignRoleView,
     DepartmentDetailView,
+    DepartmentBulkAddMembersView,
+    DepartmentBulkRemoveMembersView,
     DepartmentLineManagerView,
     DepartmentMembersView,
     DepartmentViewSet,
@@ -65,5 +67,15 @@ department_urlpatterns = department_router.urls + [
         "departments/<uuid:pk>/detail/",
         DepartmentDetailView.as_view(),
         name="department-detail",
+    ),
+    path(
+        "departments/<uuid:pk>/bulk-add-members/",
+        DepartmentBulkAddMembersView.as_view(),
+        name="department-bulk-add-members",
+    ),
+    path(
+        "departments/<uuid:pk>/bulk-remove-members/",
+        DepartmentBulkRemoveMembersView.as_view(),
+        name="department-bulk-remove-members",
     ),
 ]

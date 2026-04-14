@@ -16,6 +16,13 @@ DATABASES = {
     }
 }
 
+# Use SQLite for test runs so tests do not depend on Postgres permissions.
+if "test" in sys.argv:  # noqa: F405  (sys imported in base.py)
+    DATABASES["default"] = {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": BASE_DIR / "test_db.sqlite3",  # noqa: F405 (BASE_DIR in base.py)
+    }
+
 CORS_ALLOW_ALL_ORIGINS = True
 
 REGISTRATION_OPEN = True

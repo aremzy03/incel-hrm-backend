@@ -450,6 +450,8 @@ Each `User` can also optionally belong to a `Unit` (via `User.unit`), which must
 | PATCH | `/api/v1/users/:id/department/` | HR or Admin | Change a user's department |
 | GET | `/api/v1/departments/:id/members/` | Own dept or HR/ED/MD | List users in a department |
 | GET | `/api/v1/departments/:id/detail/` | Own dept or HR/ED/MD | Department + members + units + line manager |
+| POST | `/api/v1/departments/:id/bulk-add-members/` | HR or Admin | Bulk-add users to a department (partial success) |
+| POST | `/api/v1/departments/:id/bulk-remove-members/` | HR or Admin | Bulk-remove users from a department (partial success) |
 
 ### Unit endpoints
 
@@ -460,6 +462,52 @@ Each `User` can also optionally belong to a `Unit` (via `User.unit`), which must
 | GET    | `/api/v1/units/:id/`            | Dept member or HR/ED/MD         | Unit detail: name, supervisor, members   |
 | PATCH  | `/api/v1/units/:id/`            | LINE_MANAGER of unit's dept     | Update unit (e.g. name)                  |
 | DELETE | `/api/v1/units/:id/`            | LINE_MANAGER of unit's dept     | Delete unit (or restrict if it has members) |
+| POST   | `/api/v1/units/:id/bulk-add-members/` | HR/ED/MD/Admin or LINE_MANAGER | Bulk-add users to a unit (partial success) |
+| POST   | `/api/v1/units/:id/bulk-remove-members/` | HR/ED/MD/Admin or LINE_MANAGER | Bulk-remove users from a unit (partial success) |
+
+### Team endpoints
+
+| Method | Endpoint | Permission | Description |
+|--------|----------|------------|-------------|
+| GET | `/api/v1/teams/?unit=:id` | Unit/Dept member or HR/ED/MD | List teams in a unit |
+| POST | `/api/v1/teams/` | HR/ED/MD/Admin or LINE_MANAGER | Create a team in a unit |
+| GET | `/api/v1/teams/:id/` | Unit/Dept member or HR/ED/MD | Team detail |
+| PATCH | `/api/v1/teams/:id/` | HR/ED/MD/Admin or LINE_MANAGER | Update a team |
+| DELETE | `/api/v1/teams/:id/` | HR/ED/MD/Admin or LINE_MANAGER | Delete a team |
+| POST | `/api/v1/teams/:id/bulk-add-members/` | HR/ED/MD/Admin or LINE_MANAGER | Bulk-add users to a team (partial success) |
+| POST | `/api/v1/teams/:id/bulk-remove-members/` | HR/ED/MD/Admin or LINE_MANAGER | Bulk-remove users from a team (partial success) |
+
+### Bulk add payload (Department / Unit / Team)
+
+All bulk-add endpoints accept the same request shape.
+
+```json
+{
+  "user_ids": ["<uuid>", "<uuid>"],
+  "dry_run": false,
+  "clear_conflicts": false
+}
+```
+
+Notes:
+- `dry_run=true` validates and returns which user IDs would succeed/fail without writing.
+- `clear_conflicts=true` is supported for Department and Unit bulk-add:
+  - Department bulk-add can clear conflicting `unit`/`team` when moving a user to the new department.
+  - Unit bulk-add can move a user into the unit’s department and clear a conflicting team.
+- Team bulk-add enforces that each user already belongs to the same unit as the team (no auto-move).
+
+### Bulk add response (partial success)
+
+```json
+{
+  "target": { "department_id": "<uuid>" },
+  "succeeded_user_ids": ["<uuid>"],
+  "failed": [
+    { "user_id": "<uuid>", "code": "not_found", "error": "User not found." }
+  ]
+}
+```
+
 
 **Unit rules:**
 

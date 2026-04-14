@@ -342,7 +342,11 @@ class UserUpdateSerializer(serializers.ModelSerializer):
 class UserDepartmentUpdateSerializer(serializers.Serializer):
     """HR-only serializer for changing a user's department."""
 
-    department = serializers.PrimaryKeyRelatedField(queryset=Department.objects.all())
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(),
+        required=False,
+        allow_null=True,
+    )
 
     def validate(self, attrs):
         user = self.context.get("user")
@@ -353,6 +357,14 @@ class UserDepartmentUpdateSerializer(serializers.Serializer):
             raise serializers.ValidationError(
                 "Executive Director and Managing Director cannot belong to any department."
             )
+
+        # Support {"department": null} to clear department.
+        # If department is cleared, unit/team must also be cleared (to avoid dangling org membership).
+        if "department" in attrs and attrs.get("department") is None:
+            if getattr(user, "unit_id", None) is not None or getattr(user, "team_id", None) is not None:
+                raise serializers.ValidationError(
+                    {"department": "Cannot clear department while user still has a unit or team. Clear unit/team first."}
+                )
         return attrs
 
 
@@ -406,3 +418,32 @@ class UserRoleSerializer(serializers.ModelSerializer):
         user = validated_data["user"]
         user_role, _ = UserRole.objects.get_or_create(user=user, role=role)
         return user_role
+
+
+# ---------------------------------------------------------------------------
+# Bulk membership operations
+# ---------------------------------------------------------------------------
+
+class BulkUserIdsSerializer(serializers.Serializer):
+    """
+    Shared request serializer for bulk user assignment endpoints.
+
+    Endpoints implement partial success; this serializer only validates shape.
+    """
+
+    user_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        allow_empty=False,
+    )
+    dry_run = serializers.BooleanField(required=False, default=False)
+    clear_conflicts = serializers.BooleanField(required=False, default=False)
+
+    def validate_user_ids(self, value):
+        # Preserve order while removing duplicates.
+        seen = set()
+        unique_ids = []
+        for v in value:
+            if v not in seen:
+                seen.add(v)
+                unique_ids.append(v)
+        return unique_ids

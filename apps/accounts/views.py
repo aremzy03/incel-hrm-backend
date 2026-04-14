@@ -1,5 +1,6 @@
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from django.shortcuts import get_object_or_404
 from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
@@ -21,6 +22,7 @@ from .models import (
 from .throttles import RegisterThrottle
 from .permissions import IsExecutiveDirector, IsHR
 from .serializers import (
+    BulkUserIdsSerializer,
     DepartmentLineManagerSerializer,
     DepartmentSerializer,
     RegisterSerializer,
@@ -49,6 +51,8 @@ __all__ = [
     "UserDepartmentUpdateView",
     "DepartmentLineManagerView",
     "DepartmentMembersView",
+    "DepartmentBulkAddMembersView",
+    "DepartmentBulkRemoveMembersView",
     "UnitViewSet",
     "TeamViewSet",
 ]
@@ -167,6 +171,10 @@ class UserDepartmentUpdateView(APIView):
         user = get_object_or_404(User, pk=user_id)
         serializer = UserDepartmentUpdateSerializer(data=request.data, context={"user": user})
         serializer.is_valid(raise_exception=True)
+        # allow {"department": null} to clear the department
+        if "department" not in serializer.validated_data:
+            raise ValidationError({"department": "This field is required."})
+
         user.department = serializer.validated_data["department"]
         user.save(update_fields=["department", "updated_at"])
         return Response(UserSerializer(user).data)
@@ -279,6 +287,199 @@ class DepartmentDetailView(APIView):
         return Response(payload)
 
 
+class DepartmentBulkAddMembersView(APIView):
+    """
+    POST /api/v1/departments/:id/bulk-add-members/
+
+    Bulk-assign users to a department with partial success semantics.
+
+    Semantics:
+    - Sets User.department = department
+    - Creates DepartmentMembership(user, department)
+
+    Optional flags:
+    - dry_run: validate only, no writes
+    - clear_conflicts: if true, clears conflicting unit/team assignments as needed
+    """
+
+    permission_classes = [permissions.IsAuthenticated, IsHR | permissions.IsAdminUser]
+
+    def post(self, request, pk):
+        department = get_object_or_404(Department, pk=pk)
+
+        serializer = BulkUserIdsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user_ids = serializer.validated_data["user_ids"]
+        dry_run = serializer.validated_data["dry_run"]
+        clear_conflicts = serializer.validated_data["clear_conflicts"]
+
+        users = (
+            User.objects.filter(pk__in=user_ids)
+            .select_related(
+                "department",
+                "unit",
+                "unit__department",
+                "team",
+                "team__unit",
+                "team__unit__department",
+            )
+            .all()
+        )
+        users_by_id = {u.pk: u for u in users}
+
+        succeeded_user_ids = []
+        failed = []
+
+        for user_id in user_ids:
+            user = users_by_id.get(user_id)
+            if user is None:
+                failed.append(
+                    {
+                        "user_id": str(user_id),
+                        "code": "not_found",
+                        "error": "User not found.",
+                    }
+                )
+                continue
+
+            # Validate department consistency with existing unit/team.
+            # If clear_conflicts is true, we will clear conflicting unit/team instead.
+            if user.team_id is not None:
+                team_dept_id = user.team.unit.department_id
+                if team_dept_id != department.pk:
+                    if not clear_conflicts:
+                        failed.append(
+                            {
+                                "user_id": str(user.pk),
+                                "code": "department_conflict",
+                                "error": "User belongs to a team in a different department.",
+                            }
+                        )
+                        continue
+
+            if user.unit_id is not None:
+                unit_dept_id = user.unit.department_id
+                if unit_dept_id != department.pk:
+                    if not clear_conflicts:
+                        failed.append(
+                            {
+                                "user_id": str(user.pk),
+                                "code": "department_conflict",
+                                "error": "User belongs to a unit in a different department.",
+                            }
+                        )
+                        continue
+
+            if dry_run:
+                succeeded_user_ids.append(str(user.pk))
+                continue
+
+            with transaction.atomic():
+                update_fields = ["department", "updated_at"]
+
+                if clear_conflicts:
+                    # If user is moving departments, they cannot keep unit/team that are outside the department.
+                    if user.team_id is not None and user.team.unit.department_id != department.pk:
+                        user.team = None
+                        update_fields.extend(["team"])
+                    if user.unit_id is not None and user.unit.department_id != department.pk:
+                        user.unit = None
+                        update_fields.extend(["unit"])
+
+                user.department = department
+                user.save(update_fields=list(dict.fromkeys(update_fields)))
+
+                DepartmentMembership.objects.get_or_create(
+                    user=user,
+                    department=department,
+                )
+
+            succeeded_user_ids.append(str(user.pk))
+
+        return Response(
+            {
+                "target": {"department_id": str(department.pk)},
+                "succeeded_user_ids": succeeded_user_ids,
+                "failed": failed,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class DepartmentBulkRemoveMembersView(APIView):
+    """
+    POST /api/v1/departments/:id/bulk-remove-members/
+
+    Bulk-remove users from a department with partial success semantics.
+
+    Semantics:
+    - If user's primary department matches, clears: department, unit, team
+    - Removes DepartmentMembership(user, department) if present
+
+    Optional flags:
+    - dry_run: validate only, no writes
+    """
+
+    permission_classes = [permissions.IsAuthenticated, IsHR | permissions.IsAdminUser]
+
+    def post(self, request, pk):
+        department = get_object_or_404(Department, pk=pk)
+
+        serializer = BulkUserIdsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user_ids = serializer.validated_data["user_ids"]
+        dry_run = serializer.validated_data["dry_run"]
+
+        users = (
+            User.objects.filter(pk__in=user_ids)
+            .select_related("department", "unit", "team")
+            .all()
+        )
+        users_by_id = {u.pk: u for u in users}
+
+        succeeded_user_ids = []
+        failed = []
+
+        for user_id in user_ids:
+            user = users_by_id.get(user_id)
+            if user is None:
+                failed.append({"user_id": str(user_id), "code": "not_found", "error": "User not found."})
+                continue
+
+            if user.department_id != department.pk:
+                failed.append(
+                    {
+                        "user_id": str(user.pk),
+                        "code": "not_in_department",
+                        "error": "User is not a member of this department.",
+                    }
+                )
+                continue
+
+            if dry_run:
+                succeeded_user_ids.append(str(user.pk))
+                continue
+
+            with transaction.atomic():
+                user.department = None
+                user.unit = None
+                user.team = None
+                user.save(update_fields=["department", "unit", "team", "updated_at"])
+
+                DepartmentMembership.objects.filter(user=user, department=department).delete()
+
+            succeeded_user_ids.append(str(user.pk))
+
+        return Response(
+            {
+                "target": {"department_id": str(department.pk)},
+                "succeeded_user_ids": succeeded_user_ids,
+                "failed": failed,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Units
 # ---------------------------------------------------------------------------
@@ -358,6 +559,171 @@ class UnitViewSet(viewsets.ModelViewSet):
                 raise PermissionDenied("Only the line manager of this department can modify or delete units.")
 
         return obj
+
+    @action(detail=True, methods=["post"], url_path="bulk-add-members")
+    def bulk_add_members(self, request, pk=None):
+        """
+        POST /api/v1/units/:id/bulk-add-members/
+
+        Bulk-assign users to a unit with partial success semantics.
+
+        Semantics:
+        - Sets User.unit = unit
+        - Ensures User.department matches unit.department:
+          - if department is None, it is set
+          - if department differs, fails unless clear_conflicts=true (then moves + clears team as needed)
+        - If user has a team not in this unit, fails unless clear_conflicts=true (then clears team)
+        """
+
+        unit = self.get_object()  # enforces manage permissions for POST via get_object()
+
+        serializer = BulkUserIdsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user_ids = serializer.validated_data["user_ids"]
+        dry_run = serializer.validated_data["dry_run"]
+        clear_conflicts = serializer.validated_data["clear_conflicts"]
+
+        users = (
+            User.objects.filter(pk__in=user_ids)
+            .select_related(
+                "department",
+                "unit",
+                "team",
+                "team__unit",
+                "team__unit__department",
+            )
+            .all()
+        )
+        users_by_id = {u.pk: u for u in users}
+
+        succeeded_user_ids = []
+        failed = []
+
+        for user_id in user_ids:
+            user = users_by_id.get(user_id)
+            if user is None:
+                failed.append({"user_id": str(user_id), "code": "not_found", "error": "User not found."})
+                continue
+
+            # Validate/resolve department consistency.
+            if user.department_id is not None and user.department_id != unit.department_id and not clear_conflicts:
+                failed.append(
+                    {
+                        "user_id": str(user.pk),
+                        "code": "department_conflict",
+                        "error": "User belongs to a different department than the unit.",
+                    }
+                )
+                continue
+
+            # Team must be inside the unit, or be cleared if allowed.
+            if user.team_id is not None and user.team.unit_id != unit.pk and not clear_conflicts:
+                failed.append(
+                    {
+                        "user_id": str(user.pk),
+                        "code": "team_conflict",
+                        "error": "User belongs to a team in a different unit.",
+                    }
+                )
+                continue
+
+            if dry_run:
+                succeeded_user_ids.append(str(user.pk))
+                continue
+
+            with transaction.atomic():
+                update_fields = ["unit", "updated_at"]
+
+                if clear_conflicts and user.team_id is not None and user.team.unit_id != unit.pk:
+                    user.team = None
+                    update_fields.append("team")
+
+                # Move/set department as needed.
+                if user.department_id is None:
+                    user.department = unit.department
+                    update_fields.append("department")
+                elif clear_conflicts and user.department_id != unit.department_id:
+                    # Moving departments implies clearing team (and any prior unit will be replaced below).
+                    if user.team_id is not None:
+                        user.team = None
+                        update_fields.append("team")
+                    user.department = unit.department
+                    update_fields.append("department")
+
+                user.unit = unit
+                user.save(update_fields=list(dict.fromkeys(update_fields)))
+
+            succeeded_user_ids.append(str(user.pk))
+
+        return Response(
+            {
+                "target": {"unit_id": str(unit.pk)},
+                "succeeded_user_ids": succeeded_user_ids,
+                "failed": failed,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["post"], url_path="bulk-remove-members")
+    def bulk_remove_members(self, request, pk=None):
+        """
+        POST /api/v1/units/:id/bulk-remove-members/
+
+        Bulk-remove users from a unit with partial success semantics.
+
+        Semantics:
+        - If user's unit matches, clears: unit, team
+        - Department is not changed.
+        """
+
+        unit = self.get_object()  # enforces manage permissions for POST via get_object()
+
+        serializer = BulkUserIdsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user_ids = serializer.validated_data["user_ids"]
+        dry_run = serializer.validated_data["dry_run"]
+
+        users = User.objects.filter(pk__in=user_ids).select_related("unit", "team").all()
+        users_by_id = {u.pk: u for u in users}
+
+        succeeded_user_ids = []
+        failed = []
+
+        for user_id in user_ids:
+            user = users_by_id.get(user_id)
+            if user is None:
+                failed.append({"user_id": str(user_id), "code": "not_found", "error": "User not found."})
+                continue
+
+            if user.unit_id != unit.pk:
+                failed.append(
+                    {
+                        "user_id": str(user.pk),
+                        "code": "not_in_unit",
+                        "error": "User is not a member of this unit.",
+                    }
+                )
+                continue
+
+            if dry_run:
+                succeeded_user_ids.append(str(user.pk))
+                continue
+
+            with transaction.atomic():
+                user.unit = None
+                user.team = None
+                user.save(update_fields=["unit", "team", "updated_at"])
+
+            succeeded_user_ids.append(str(user.pk))
+
+        return Response(
+            {
+                "target": {"unit_id": str(unit.pk)},
+                "succeeded_user_ids": succeeded_user_ids,
+                "failed": failed,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +835,128 @@ class TeamViewSet(viewsets.ModelViewSet):
         member.team = team
         member.save(update_fields=["team", "updated_at"])
         return Response(TeamSerializer(team).data)
+
+    @action(detail=True, methods=["post"], url_path="bulk-add-members")
+    def bulk_add_members(self, request, pk=None):
+        """
+        POST /api/v1/teams/:id/bulk-add-members/
+
+        Bulk-assign users to a team with partial success semantics.
+
+        Constraints:
+        - User must already belong to the same unit as the team (matches add_member behavior).
+        """
+
+        team = self.get_object()  # enforces manage permissions for POST via get_object()
+        if not self._can_manage_unit(request.user, team.unit):
+            raise PermissionDenied("You do not have permission to manage this team.")
+
+        serializer = BulkUserIdsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user_ids = serializer.validated_data["user_ids"]
+        dry_run = serializer.validated_data["dry_run"]
+
+        users = User.objects.filter(pk__in=user_ids).select_related("unit", "team").all()
+        users_by_id = {u.pk: u for u in users}
+
+        succeeded_user_ids = []
+        failed = []
+
+        for user_id in user_ids:
+            user = users_by_id.get(user_id)
+            if user is None:
+                failed.append({"user_id": str(user_id), "code": "not_found", "error": "User not found."})
+                continue
+
+            if user.unit_id != team.unit_id:
+                failed.append(
+                    {
+                        "user_id": str(user.pk),
+                        "code": "unit_mismatch",
+                        "error": "User must belong to the same unit as the team.",
+                    }
+                )
+                continue
+
+            if dry_run:
+                succeeded_user_ids.append(str(user.pk))
+                continue
+
+            with transaction.atomic():
+                user.team = team
+                user.save(update_fields=["team", "updated_at"])
+
+            succeeded_user_ids.append(str(user.pk))
+
+        return Response(
+            {
+                "target": {"team_id": str(team.pk)},
+                "succeeded_user_ids": succeeded_user_ids,
+                "failed": failed,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["post"], url_path="bulk-remove-members")
+    def bulk_remove_members(self, request, pk=None):
+        """
+        POST /api/v1/teams/:id/bulk-remove-members/
+
+        Bulk-remove users from a team with partial success semantics.
+
+        Semantics:
+        - If user's team matches, clears: team
+        """
+
+        team = self.get_object()  # enforces manage permissions for POST via get_object()
+        if not self._can_manage_unit(request.user, team.unit):
+            raise PermissionDenied("You do not have permission to manage this team.")
+
+        serializer = BulkUserIdsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user_ids = serializer.validated_data["user_ids"]
+        dry_run = serializer.validated_data["dry_run"]
+
+        users = User.objects.filter(pk__in=user_ids).select_related("team").all()
+        users_by_id = {u.pk: u for u in users}
+
+        succeeded_user_ids = []
+        failed = []
+
+        for user_id in user_ids:
+            user = users_by_id.get(user_id)
+            if user is None:
+                failed.append({"user_id": str(user_id), "code": "not_found", "error": "User not found."})
+                continue
+
+            if user.team_id != team.pk:
+                failed.append(
+                    {
+                        "user_id": str(user.pk),
+                        "code": "not_in_team",
+                        "error": "User is not a member of this team.",
+                    }
+                )
+                continue
+
+            if dry_run:
+                succeeded_user_ids.append(str(user.pk))
+                continue
+
+            with transaction.atomic():
+                user.team = None
+                user.save(update_fields=["team", "updated_at"])
+
+            succeeded_user_ids.append(str(user.pk))
+
+        return Response(
+            {
+                "target": {"team_id": str(team.pk)},
+                "succeeded_user_ids": succeeded_user_ids,
+                "failed": failed,
+            },
+            status=status.HTTP_200_OK,
+        )
 
     @action(detail=True, methods=["post"], url_path="remove-member")
     def remove_member(self, request, pk=None):
