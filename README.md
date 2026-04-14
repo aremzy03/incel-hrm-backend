@@ -713,7 +713,13 @@ Immutable audit trail. One entry is appended per status transition. Fields inclu
 
 4. **Default leave balances** -- On user creation, `LeaveBalance` rows are auto-created for the current year for each eligible leave type, with `allocated_days` = `leave_type.default_days`.
 
-5. **Department leave exclusivity (Annual & Casual only)** -- For Annual and Casual leave only, at most one employee in a department may have an active leave request overlapping any given date range. Sick, Maternity, Paternity, and other leave types are excluded; multiple employees may be on those types simultaneously. If another colleague's Annual or Casual leave already covers the requested dates, the request is rejected at validation time.
+5. **Org-scoped leave exclusivity (Annual & Casual only)** -- For Annual and Casual leave only, at most one employee in the *lowest available org scope* may have an active leave request overlapping any given date range:
+
+   - If the department has **teams**, exclusivity is enforced at the **team** level.
+   - Else if the department has **units**, exclusivity is enforced at the **unit** level.
+   - Else exclusivity is enforced at the **department** level.
+
+   Sick, Maternity, Paternity, and other leave types are excluded; multiple employees may be on those types simultaneously. If another colleague's Annual or Casual leave already covers the requested dates within the applicable scope, the request is rejected at validation time.
 
 6. **Submit requires a line manager** -- An employee cannot submit a DRAFT request (`POST .../submit/`) unless their department has a line manager assigned. This ensures the approval chain is complete before a request enters the pipeline.
 

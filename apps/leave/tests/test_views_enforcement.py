@@ -16,7 +16,7 @@ from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APIClient
 
-from apps.accounts.models import Department, Role, RoleName, UserRole
+from apps.accounts.models import Department, Role, RoleName, Team, Unit, UserRole
 from apps.leave.models import (
     LeaveApprovalLog,
     LeaveBalance,
@@ -671,7 +671,38 @@ class LeaveRequestCreateTests(TestCase):
         self.assertIsNone(leave_request.cover_person)
 
     def test_annual_department_overlap_blocked_for_other_employee(self):
-        # Existing active Annual request for another employee in same department
+        # No units in department -> overlap enforced at department level
+        make_request(
+            self.other_emp,
+            self.annual,
+            status=LeaveRequestStatus.PENDING_MANAGER,
+            start=self.start,
+            end=self.end,
+        )
+        self._create_balance(self.female_emp, self.annual)
+        resp = self._post_create(
+            self.female_emp,
+            self.annual,
+            cover_person=self.cover_same_dept,
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("leave_request", resp.data)
+
+    def test_annual_overlap_scoped_to_unit_when_department_has_units_but_no_teams(self):
+        # Create two units in same department, but no teams.
+        unit_a = Unit.objects.create(name="Unit A", department=self.dept)
+        unit_b = Unit.objects.create(name="Unit B", department=self.dept)
+
+        # Assign employees to different units.
+        self.female_emp.unit = unit_a
+        self.female_emp.team = None
+        self.female_emp.save(update_fields=["unit", "team", "updated_at"])
+
+        self.other_emp.unit = unit_b
+        self.other_emp.team = None
+        self.other_emp.save(update_fields=["unit", "team", "updated_at"])
+
+        # Existing Annual leave in Unit B should NOT block Unit A.
         make_request(
             self.other_emp,
             self.annual,
@@ -681,8 +712,77 @@ class LeaveRequestCreateTests(TestCase):
         )
         self._create_balance(self.female_emp, self.annual)
         resp = self._post_create(self.female_emp, self.annual, cover_person=self.cover_same_dept)
-        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("leave_request", resp.data)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+        # But an existing Annual leave in Unit A SHOULD block Unit A.
+        another_in_unit_a = get_user_model().objects.create_user(
+            email="unit_a_other@test.com",
+            password="testpass123",
+            gender="FEMALE",
+            department=self.dept,
+            unit=unit_a,
+            date_of_birth=datetime.date(1990, 1, 1),
+        )
+        self._create_balance(another_in_unit_a, self.annual)
+        make_request(
+            another_in_unit_a,
+            self.annual,
+            status=LeaveRequestStatus.PENDING_MANAGER,
+            start=self.start,
+            end=self.end,
+        )
+        resp2 = self._post_create(self.female_emp, self.annual, cover_person=self.cover_same_dept)
+        self.assertEqual(resp2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("leave_request", resp2.data)
+
+    def test_annual_overlap_scoped_to_team_when_department_has_teams(self):
+        # Create one unit and two teams under it.
+        unit = Unit.objects.create(name="Unit X", department=self.dept)
+        team_1 = Team.objects.create(name="Team 1", unit=unit)
+        team_2 = Team.objects.create(name="Team 2", unit=unit)
+
+        # Assign employees to different teams.
+        self.female_emp.unit = unit
+        self.female_emp.team = team_1
+        self.female_emp.save(update_fields=["unit", "team", "updated_at"])
+
+        self.other_emp.unit = unit
+        self.other_emp.team = team_2
+        self.other_emp.save(update_fields=["unit", "team", "updated_at"])
+
+        # Existing Annual leave in Team 2 should NOT block Team 1.
+        make_request(
+            self.other_emp,
+            self.annual,
+            status=LeaveRequestStatus.PENDING_MANAGER,
+            start=self.start,
+            end=self.end,
+        )
+        self._create_balance(self.female_emp, self.annual)
+        resp = self._post_create(self.female_emp, self.annual, cover_person=self.cover_same_dept)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+        # But an existing Annual leave in Team 1 SHOULD block Team 1.
+        another_in_team_1 = get_user_model().objects.create_user(
+            email="team_1_other@test.com",
+            password="testpass123",
+            gender="FEMALE",
+            department=self.dept,
+            unit=unit,
+            team=team_1,
+            date_of_birth=datetime.date(1990, 1, 1),
+        )
+        self._create_balance(another_in_team_1, self.annual)
+        make_request(
+            another_in_team_1,
+            self.annual,
+            status=LeaveRequestStatus.PENDING_MANAGER,
+            start=self.start,
+            end=self.end,
+        )
+        resp2 = self._post_create(self.female_emp, self.annual, cover_person=self.cover_same_dept)
+        self.assertEqual(resp2.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("leave_request", resp2.data)
 
     def test_sick_overlap_allowed_for_same_department(self):
         # Existing Sick request for another employee in same department

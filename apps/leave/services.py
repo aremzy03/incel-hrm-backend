@@ -10,6 +10,8 @@ from typing import Optional
 
 from rest_framework.exceptions import ValidationError
 
+from apps.accounts.models import Team, Unit
+
 from .models import LeaveBalance, LeaveRequest, LeaveRequestStatus, LeaveType, PublicHoliday
 from .utils import calculate_working_days
 
@@ -148,16 +150,31 @@ class WorkingDaysService:
             LeaveRequestStatus.CANCELLED,
         ]
 
-        # Only check overlaps with other Annual/Casual requests
-        qs = LeaveRequest.objects.filter(
-            employee__department_id=employee.department_id,
-            leave_type__name__in=("Annual", "Casual"),
-            start_date__lte=end_date,
-            end_date__gte=start_date,
-        ).exclude(
-            employee=employee,
-        ).exclude(
-            status__in=excluded_statuses,
+        dept_id = employee.department_id
+
+        department_has_units = Unit.objects.filter(department_id=dept_id).exists()
+        department_has_teams = Team.objects.filter(unit__department_id=dept_id).exists()
+
+        # Scope overlap rule to the lowest org level that exists:
+        # - Team (if department has teams and employee is assigned to a team)
+        # - Unit (if department has units and employee is assigned to a unit)
+        # - Department (fallback)
+        scope_filters = {"employee__department_id": dept_id}
+        if department_has_teams and getattr(employee, "team_id", None):
+            scope_filters = {"employee__team_id": employee.team_id}
+        elif department_has_units and getattr(employee, "unit_id", None):
+            scope_filters = {"employee__unit_id": employee.unit_id}
+
+        # Only check overlaps with other Annual/Casual requests (active statuses)
+        qs = (
+            LeaveRequest.objects.filter(
+                **scope_filters,
+                leave_type__name__in=("Annual", "Casual"),
+                start_date__lte=end_date,
+                end_date__gte=start_date,
+            )
+            .exclude(employee=employee)
+            .exclude(status__in=excluded_statuses)
         )
 
         if exclude_id is not None:
