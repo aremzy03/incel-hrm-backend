@@ -246,3 +246,117 @@ class BulkMembershipEndpointsTests(APITestCase):
         self.user_in_a.refresh_from_db()
         self.assertIsNone(self.user_in_a.team_id)
 
+    def test_line_manager_role_grant_adds_user_to_management_department(self):
+        user = make_user(
+            "lm.membership@test.com",
+            password=self.password,
+            roles=[],
+            department=self.dept_a,
+        )
+        lm_role = ensure_role(RoleName.LINE_MANAGER)
+        UserRole.objects.create(user=user, role=lm_role)
+
+        from apps.accounts.models import get_or_create_management_department
+
+        mgmt_dept = get_or_create_management_department()
+        self.assertTrue(
+            DepartmentMembership.objects.filter(user=user, department=mgmt_dept).exists()
+        )
+
+    def test_department_line_manager_delete_reverts_role_and_removes_management_membership(self):
+        from apps.accounts.models import get_or_create_management_department
+
+        # Assign line manager
+        self._auth(self.hr)
+        url = reverse("department-line-manager", args=[self.dept_a.id])
+        resp = self.client.post(url, {"user_id": str(self.user_in_a.id)}, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        self.assertTrue(self.user_in_a.has_role(RoleName.LINE_MANAGER))
+        mgmt = get_or_create_management_department()
+        self.assertTrue(DepartmentMembership.objects.filter(user=self.user_in_a, department=mgmt).exists())
+
+        # Remove line manager
+        resp2 = self.client.delete(url)
+        self.assertEqual(resp2.status_code, status.HTTP_204_NO_CONTENT)
+
+        self.user_in_a.refresh_from_db()
+        self.assertFalse(self.user_in_a.has_role(RoleName.LINE_MANAGER))
+        # Multi-role behavior: revocation removes only LINE_MANAGER; it does not force EMPLOYEE.
+        # (This user started as EMPLOYEE in setup, so they still have it.)
+        self.assertTrue(self.user_in_a.has_role(RoleName.EMPLOYEE))
+        self.assertFalse(DepartmentMembership.objects.filter(user=self.user_in_a, department=mgmt).exists())
+
+    def test_unit_supervisor_assign_and_revoke_updates_role(self):
+        self._auth(self.line_manager_a)
+
+        supervisor = make_user(
+            "unit.supervisor@test.com",
+            password=self.password,
+            roles=[],
+            department=self.dept_a,
+        )
+
+        url = reverse("unit-supervisor", args=[self.unit_a1.id])
+        resp = self.client.post(url, {"user_id": str(supervisor.id)}, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, msg=f"{resp.data}")
+
+        supervisor.refresh_from_db()
+        self.assertTrue(supervisor.has_role(RoleName.SUPERVISOR))
+
+        resp2 = self.client.delete(url)
+        self.assertEqual(resp2.status_code, status.HTTP_200_OK, msg=f"{resp2.data}")
+
+        supervisor.refresh_from_db()
+        self.assertFalse(supervisor.has_role(RoleName.SUPERVISOR))
+
+    def test_team_lead_assign_and_revoke_updates_role(self):
+        self._auth(self.hr)
+
+        lead = make_user(
+            "team.lead@test.com",
+            password=self.password,
+            roles=[],
+            department=self.dept_a,
+        )
+        lead.unit = self.unit_a1
+        lead.save(update_fields=["unit", "updated_at"])
+
+        url = reverse("team-team-lead", args=[self.team_a1.id])
+        resp = self.client.post(url, {"user_id": str(lead.id)}, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, msg=f"{resp.data}")
+
+        lead.refresh_from_db()
+        self.assertTrue(lead.has_role(RoleName.TEAM_LEAD))
+
+        resp2 = self.client.delete(url)
+        self.assertEqual(resp2.status_code, status.HTTP_200_OK, msg=f"{resp2.data}")
+
+        lead.refresh_from_db()
+        self.assertFalse(lead.has_role(RoleName.TEAM_LEAD))
+
+    def test_multi_role_hr_can_be_unit_supervisor_and_retains_hr_on_revoke(self):
+        self._auth(self.line_manager_a)
+
+        hr_supervisor = make_user(
+            "hr.supervisor@test.com",
+            password=self.password,
+            roles=[RoleName.HR],
+            department=self.dept_a,
+        )
+
+        url = reverse("unit-supervisor", args=[self.unit_a1.id])
+        resp = self.client.post(url, {"user_id": str(hr_supervisor.id)}, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, msg=f"{resp.data}")
+
+        hr_supervisor.refresh_from_db()
+        self.assertTrue(hr_supervisor.has_role(RoleName.HR))
+        self.assertTrue(hr_supervisor.has_role(RoleName.SUPERVISOR))
+
+        resp2 = self.client.delete(url)
+        self.assertEqual(resp2.status_code, status.HTTP_200_OK, msg=f"{resp2.data}")
+
+        hr_supervisor.refresh_from_db()
+        self.assertTrue(hr_supervisor.has_role(RoleName.HR))
+        self.assertFalse(hr_supervisor.has_role(RoleName.SUPERVISOR))
+

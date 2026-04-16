@@ -231,7 +231,7 @@ class CheckOverlappingLeaveTests(TestCase):
     def _make_active(self, start, end):
         return make_request(
             self.employee, self.leave_type, start, end,
-            status=LeaveRequestStatus.PENDING_MANAGER,
+            status=LeaveRequestStatus.APPROVED,
         )
 
     # --- passing cases ---

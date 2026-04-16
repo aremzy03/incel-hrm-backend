@@ -180,8 +180,35 @@ class LeaveRequestVisibilityTests(TestCase):
         ids = self._ids(resp)
         self.assertNotIn(str(self.draft_a.id), ids)
         self.assertNotIn(str(self.draft_b.id), ids)
-        self.assertIn(str(self.pending_manager_a.id), ids)
+        # Pending requests are only visible to creator + cumulative approvers (+ cover person)
+        # HR should not see pending_manager stage unless it is their turn.
+        self.assertNotIn(str(self.pending_manager_a.id), ids)
         self.assertIn(str(self.approved_a.id), ids)
+
+    def test_line_manager_request_is_immediately_visible_to_hr_and_ed(self):
+        lm_pending = make_request(
+            self.lm_a,
+            self.annual,
+            status=LeaveRequestStatus.PENDING_MANAGER,
+        )
+
+        detail_url = reverse("leave-request-detail", args=[lm_pending.id])
+
+        self.client.force_authenticate(self.hr)
+        resp = self.client.get(self.list_url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        ids = self._ids(resp)
+        self.assertIn(str(lm_pending.id), ids)
+        resp = self.client.get(detail_url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        self.client.force_authenticate(self.ed)
+        resp = self.client.get(self.list_url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        ids = self._ids(resp)
+        self.assertIn(str(lm_pending.id), ids)
+        resp = self.client.get(detail_url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
 
     def test_line_manager_does_not_see_others_drafts(self):
         self.client.force_authenticate(self.lm_a)
@@ -214,6 +241,149 @@ class LeaveRequestVisibilityTests(TestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         ids = self._ids(resp)
         self.assertEqual(ids, set())
+
+
+class LeaveRequestDetailAccessTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+
+        self.dept = make_department("Dept Access")
+        self.leave_type = make_leave_type("Annual", 21)
+
+        self.supervisor = make_user(
+            "supervisor.access@test.com",
+            roles=[RoleName.SUPERVISOR],
+            department=self.dept,
+        )
+        self.team_lead = make_user(
+            "teamlead.access@test.com",
+            roles=[RoleName.TEAM_LEAD],
+            department=self.dept,
+        )
+
+        self.unit = Unit.objects.create(name="Unit Access", department=self.dept, supervisor=self.supervisor)
+        self.team = Team.objects.create(name="Team Access", unit=self.unit, team_lead=self.team_lead)
+
+        self.employee = make_user(
+            "employee.access@test.com",
+            roles=[RoleName.EMPLOYEE],
+            department=self.dept,
+        )
+        self.employee.unit = self.unit
+        self.employee.team = self.team
+        self.employee.save(update_fields=["unit", "team", "updated_at"])
+
+        self.req_non_draft = make_request(
+            self.employee,
+            self.leave_type,
+            status=LeaveRequestStatus.PENDING_SUPERVISOR,
+        )
+        self.req_draft = make_request(
+            self.employee,
+            self.leave_type,
+            status=LeaveRequestStatus.DRAFT,
+        )
+
+        self.detail_url = reverse("leave-request-detail", args=[self.req_non_draft.id])
+        self.draft_detail_url = reverse("leave-request-detail", args=[self.req_draft.id])
+
+    def test_supervisor_can_retrieve_non_draft_for_their_unit(self):
+        self.client.force_authenticate(self.supervisor)
+        resp = self.client.get(self.detail_url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_team_lead_can_retrieve_non_draft_for_their_team(self):
+        self.client.force_authenticate(self.team_lead)
+        resp = self.client.get(self.detail_url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_supervisor_and_team_lead_cannot_retrieve_draft(self):
+        for user in (self.supervisor, self.team_lead):
+            self.client.force_authenticate(user)
+            resp = self.client.get(self.draft_detail_url)
+            self.assertIn(resp.status_code, (status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND))
+
+
+class LeaveRequestApproverListAndApproveTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.dept = make_department("Dept Approver")
+        self.leave_type = make_leave_type("Annual", 21)
+
+        # Create a unit/team where supervisor/team lead are NOT configured on the Unit/Team,
+        # but the approver users belong to the same unit/team.
+        self.unit = Unit.objects.create(name="Unit Approver", department=self.dept, supervisor=None)
+        self.team = Team.objects.create(name="Team Approver", unit=self.unit, team_lead=None)
+
+        self.supervisor = make_user(
+            "supervisor.list@test.com",
+            roles=[RoleName.SUPERVISOR],
+            department=self.dept,
+        )
+        self.supervisor.unit = self.unit
+        self.supervisor.save(update_fields=["unit", "updated_at"])
+
+        self.team_lead = make_user(
+            "teamlead.list@test.com",
+            roles=[RoleName.TEAM_LEAD],
+            department=self.dept,
+        )
+        self.team_lead.unit = self.unit
+        self.team_lead.team = self.team
+        self.team_lead.save(update_fields=["unit", "team", "updated_at"])
+
+        self.employee = make_user(
+            "employee.list@test.com",
+            roles=[RoleName.EMPLOYEE],
+            department=self.dept,
+        )
+        self.employee.unit = self.unit
+        self.employee.team = self.team
+        self.employee.save(update_fields=["unit", "team", "updated_at"])
+
+        self.pending_team_lead = make_request(
+            self.employee,
+            self.leave_type,
+            status=LeaveRequestStatus.PENDING_TEAM_LEAD,
+        )
+        self.pending_supervisor = make_request(
+            self.employee,
+            self.leave_type,
+            status=LeaveRequestStatus.PENDING_SUPERVISOR,
+        )
+
+        self.list_url = reverse("leave-request-list")
+        self.approve_url_team = reverse("leave-request-approve", args=[self.pending_team_lead.id])
+        self.approve_url_supervisor = reverse("leave-request-approve", args=[self.pending_supervisor.id])
+
+    def test_team_lead_sees_pending_requests_in_list(self):
+        self.client.force_authenticate(self.team_lead)
+        resp = self.client.get(self.list_url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = resp.data["results"] if isinstance(resp.data, dict) and "results" in resp.data else resp.data
+        ids = {str(item["id"]) for item in data}
+        self.assertIn(str(self.pending_team_lead.id), ids)
+        self.assertIn(str(self.pending_supervisor.id), ids)
+
+    def test_supervisor_sees_pending_requests_in_list(self):
+        self.client.force_authenticate(self.supervisor)
+        resp = self.client.get(self.list_url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = resp.data["results"] if isinstance(resp.data, dict) and "results" in resp.data else resp.data
+        ids = {str(item["id"]) for item in data}
+        # Cumulative visibility: supervisor is added at PENDING_SUPERVISOR (not at PENDING_TEAM_LEAD).
+        self.assertNotIn(str(self.pending_team_lead.id), ids)
+        self.assertIn(str(self.pending_supervisor.id), ids)
+
+    def test_team_lead_can_approve_pending_team_lead_when_same_team_member(self):
+        self.client.force_authenticate(self.team_lead)
+        resp = self.client.post(self.approve_url_team, {"comment": "ok"}, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+    def test_supervisor_can_approve_pending_supervisor_when_same_unit_member(self):
+        self.client.force_authenticate(self.supervisor)
+        resp = self.client.post(self.approve_url_supervisor, {"comment": "ok"}, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
 
 
 class LeaveRequestLogsVisibilityTests(TestCase):
@@ -675,7 +845,7 @@ class LeaveRequestCreateTests(TestCase):
         make_request(
             self.other_emp,
             self.annual,
-            status=LeaveRequestStatus.PENDING_MANAGER,
+            status=LeaveRequestStatus.APPROVED,
             start=self.start,
             end=self.end,
         )
@@ -706,7 +876,7 @@ class LeaveRequestCreateTests(TestCase):
         make_request(
             self.other_emp,
             self.annual,
-            status=LeaveRequestStatus.PENDING_MANAGER,
+            status=LeaveRequestStatus.APPROVED,
             start=self.start,
             end=self.end,
         )
@@ -727,7 +897,7 @@ class LeaveRequestCreateTests(TestCase):
         make_request(
             another_in_unit_a,
             self.annual,
-            status=LeaveRequestStatus.PENDING_MANAGER,
+            status=LeaveRequestStatus.APPROVED,
             start=self.start,
             end=self.end,
         )
@@ -754,7 +924,7 @@ class LeaveRequestCreateTests(TestCase):
         make_request(
             self.other_emp,
             self.annual,
-            status=LeaveRequestStatus.PENDING_MANAGER,
+            status=LeaveRequestStatus.APPROVED,
             start=self.start,
             end=self.end,
         )
@@ -776,7 +946,7 @@ class LeaveRequestCreateTests(TestCase):
         make_request(
             another_in_team_1,
             self.annual,
-            status=LeaveRequestStatus.PENDING_MANAGER,
+            status=LeaveRequestStatus.APPROVED,
             start=self.start,
             end=self.end,
         )

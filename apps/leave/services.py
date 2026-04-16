@@ -100,17 +100,13 @@ class WorkingDaysService:
         ValidationError
             When an overlapping active leave request is found.
         """
-        excluded_statuses = [
-            LeaveRequestStatus.REJECTED,
-            LeaveRequestStatus.CANCELLED,
-        ]
-
         qs = LeaveRequest.objects.filter(
             employee=employee,
             # Overlap condition: existing.start <= new.end AND existing.end >= new.start
             start_date__lte=end_date,
             end_date__gte=start_date,
-        ).exclude(status__in=excluded_statuses)
+            status=LeaveRequestStatus.APPROVED,
+        )
 
         if exclude_id is not None:
             qs = qs.exclude(pk=exclude_id)
@@ -145,11 +141,6 @@ class WorkingDaysService:
         if leave_type and leave_type.name not in ("Annual", "Casual"):
             return
 
-        excluded_statuses = [
-            LeaveRequestStatus.REJECTED,
-            LeaveRequestStatus.CANCELLED,
-        ]
-
         dept_id = employee.department_id
 
         department_has_units = Unit.objects.filter(department_id=dept_id).exists()
@@ -172,9 +163,9 @@ class WorkingDaysService:
                 leave_type__name__in=("Annual", "Casual"),
                 start_date__lte=end_date,
                 end_date__gte=start_date,
+                status=LeaveRequestStatus.APPROVED,
             )
             .exclude(employee=employee)
-            .exclude(status__in=excluded_statuses)
         )
 
         if exclude_id is not None:

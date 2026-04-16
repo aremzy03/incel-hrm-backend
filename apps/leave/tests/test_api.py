@@ -362,7 +362,11 @@ class LeaveApiTests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_overlapping_leave_blocked(self):
-        self._create_request(self.employee)
+        # Create and submit, then fully approve so it's APPROVED (only approved blocks overlaps now).
+        leave_request_id = self._create_and_submit()
+        self._approve_request(self.line_manager, leave_request_id)
+        self._approve_request(self.hr_user, leave_request_id)
+        self._approve_request(self.executive_director, leave_request_id)
 
         overlapping_start = self.base_start + datetime.timedelta(days=1)
         overlapping_end = self.base_end + datetime.timedelta(days=1)

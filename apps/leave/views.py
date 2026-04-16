@@ -28,7 +28,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.accounts.models import RoleName, get_or_create_management_department
+from apps.accounts.models import RoleName, Team, Unit, get_or_create_management_department
 from apps.accounts.permissions import IsEmployee, IsHR
 
 from .models import (
@@ -287,7 +287,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         - Request owner: can edit their own request only while in DRAFT.
         - HR: can edit any request, regardless of status.
         """
-        leave_request = self.get_object()
+        leave_request = LeaveRequest.objects.select_related("employee").get(pk=kwargs.get("pk"))
         user = request.user
 
         is_hr = user.has_role(RoleName.HR)
@@ -310,52 +310,92 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        qs = LeaveRequest.objects.select_related("employee", "employee__team", "leave_type", "cover_person").all()
+        qs = LeaveRequest.objects.select_related(
+            "employee",
+            "employee__department",
+            "employee__unit",
+            "employee__team",
+            "leave_type",
+            "cover_person",
+        ).all()
 
-        # Draft visibility rule:
-        # - Only the request owner ever sees DRAFT requests.
-        # - All other users (including HR/ED/MD/Line Manager/cover_person) see
-        #   only non-draft requests for others.
         from django.db.models import Q
 
         owner_q = Q(employee=user)
-        non_draft_q = ~Q(status=LeaveRequestStatus.DRAFT)
         cover_q = Q(cover_person=user)
+        priv = _is_privileged(user)
+        non_draft_q = ~Q(status=LeaveRequestStatus.DRAFT)
+        cover_non_draft_q = cover_q & non_draft_q
 
-        if _is_privileged(user):
-            # HR / ED / MD / staff:
-            # - See all non-draft requests for everyone.
-            # - Plus their own requests (including drafts).
-            return qs.filter(owner_q | non_draft_q)
+        # Org-level visibility for APPROVED only.
+        approved_org_q = Q(pk__isnull=True)  # default false
+        if getattr(user, "department_id", None):
+            dept_id = user.department_id
+            department_has_units = Unit.objects.filter(department_id=dept_id).exists()
+            department_has_teams = Team.objects.filter(unit__department_id=dept_id).exists()
+            if department_has_teams and getattr(user, "team_id", None):
+                approved_org_q = Q(employee__team_id=user.team_id)
+            elif department_has_units and getattr(user, "unit_id", None):
+                approved_org_q = Q(employee__unit_id=user.unit_id)
+            else:
+                approved_org_q = Q(employee__department_id=dept_id)
 
-        # Supervisor: see unit members' non-draft requests and own requests
-        if user.has_role(RoleName.SUPERVISOR) and getattr(user, "supervised_unit_id", None):
-            unit_q = Q(employee__unit_id=user.supervised_unit_id)
-            visible_q = owner_q | (non_draft_q & (unit_q | cover_q))
-            return qs.filter(visible_q)
+        approved_visible_q = Q(status=LeaveRequestStatus.APPROVED) & (
+            Q(pk__isnull=False) if priv else approved_org_q
+        )
 
-        # Team lead: see team members' non-draft requests and own requests
-        if user.has_role(RoleName.TEAM_LEAD):
-            led_team = getattr(user, "led_team", None)
-            if led_team is not None:
-                team_q = Q(employee__team_id=led_team.pk)
-                visible_q = owner_q | (non_draft_q & (team_q | cover_q))
-                return qs.filter(visible_q)
+        # Cumulative approver visibility for pending statuses.
+        team_lead_pred = Q(employee__team__team_lead_id=user.pk)
+        if getattr(user, "team_id", None) and user.has_role(RoleName.TEAM_LEAD):
+            team_lead_pred = team_lead_pred | Q(employee__team_id=user.team_id)
 
-        if user.has_role(RoleName.LINE_MANAGER) and user.department_id:
-            dept_q = Q(employee__department_id=user.department_id)
-            # Line Manager:
-            # - Own requests (any status, including drafts).
-            # - Non-draft requests for employees in their department.
-            # - Non-draft requests where they are cover_person.
-            visible_q = owner_q | (non_draft_q & (dept_q | cover_q))
-            return qs.filter(visible_q)
+        supervisor_pred = Q(employee__unit__supervisor_id=user.pk)
+        if getattr(user, "unit_id", None) and user.has_role(RoleName.SUPERVISOR):
+            supervisor_pred = supervisor_pred | Q(employee__unit_id=user.unit_id)
 
-        # Regular employee:
-        # - Own requests (any status, including drafts).
-        # - Non-draft requests where they are cover_person.
-        visible_q = owner_q | (non_draft_q & cover_q)
-        return qs.filter(visible_q)
+        manager_pred = Q(pk__isnull=True)  # false by default
+        if user.has_role(RoleName.LINE_MANAGER):
+            # Line manager visibility: line manager role within their department.
+            # (Do not require Department.line_manager to be set.)
+            if getattr(user, "department_id", None):
+                manager_pred = Q(employee__department_id=user.department_id)
+            mgmt = get_or_create_management_department()
+            if mgmt.line_manager_id == user.pk:
+                manager_pred = manager_pred | Q(manager_approver_is_management=True)
+
+        hr_pred = Q(pk__isnull=False) if user.has_role(RoleName.HR) else Q(pk__isnull=True)
+        ed_pred = Q(pk__isnull=False) if user.has_role(RoleName.EXECUTIVE_DIRECTOR) else Q(pk__isnull=True)
+
+        pending_team_lead_q = Q(status=LeaveRequestStatus.PENDING_TEAM_LEAD) & team_lead_pred
+        pending_supervisor_q = Q(status=LeaveRequestStatus.PENDING_SUPERVISOR) & (team_lead_pred | supervisor_pred)
+        pending_manager_q = Q(status=LeaveRequestStatus.PENDING_MANAGER) & (team_lead_pred | supervisor_pred | manager_pred)
+        pending_hr_q = Q(status=LeaveRequestStatus.PENDING_HR) & (team_lead_pred | supervisor_pred | manager_pred | hr_pred)
+        pending_ed_q = Q(status=LeaveRequestStatus.PENDING_ED) & (team_lead_pred | supervisor_pred | manager_pred | hr_pred | ed_pred)
+        pending_visible_q = pending_team_lead_q | pending_supervisor_q | pending_manager_q | pending_hr_q | pending_ed_q
+
+        # Exception: if the requester is a LINE_MANAGER, make their pending requests
+        # immediately visible to HR and ED (even before the HR/ED stages).
+        pending_statuses = (
+            LeaveRequestStatus.PENDING_TEAM_LEAD,
+            LeaveRequestStatus.PENDING_SUPERVISOR,
+            LeaveRequestStatus.PENDING_MANAGER,
+            LeaveRequestStatus.PENDING_HR,
+            LeaveRequestStatus.PENDING_ED,
+        )
+        requester_is_line_manager = Q(employee__user_roles__role__name=RoleName.LINE_MANAGER)
+        hr_or_ed_viewing = hr_pred | ed_pred
+        pending_visible_q = pending_visible_q | (Q(status__in=pending_statuses) & requester_is_line_manager & hr_or_ed_viewing)
+
+        # Draft requests: creator only. cover_person only sees non-draft.
+        base_visible = owner_q | cover_non_draft_q
+
+        # Terminal (REJECTED/CANCELLED): creator and cover_person only for non-privileged users
+        terminal_visible_q = Q(status__in=(LeaveRequestStatus.REJECTED, LeaveRequestStatus.CANCELLED)) & (
+            Q(pk__isnull=False) if priv else base_visible
+        )
+
+        visible_q = base_visible | approved_visible_q | pending_visible_q | terminal_visible_q
+        return qs.filter(visible_q).distinct()
 
     # ------------------------------------------------------------------
     # Blocked HTTP methods
@@ -381,7 +421,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="submit")
     def submit(self, request, pk=None):
-        leave_request = self.get_object()
+        leave_request = LeaveRequest.objects.select_related("employee", "employee__department", "employee__unit", "employee__team").get(pk=pk)
 
         if leave_request.employee != request.user:
             raise PermissionDenied("You can only submit your own leave requests.")
@@ -552,7 +592,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="approve")
     def approve(self, request, pk=None):
-        leave_request = self.get_object()
+        leave_request = LeaveRequest.objects.select_related("employee", "employee__department", "employee__unit", "employee__team").get(pk=pk)
 
         if leave_request.status not in _APPROVAL_TRANSITIONS:
             raise ValidationError(
@@ -582,17 +622,28 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                     "Only the Management department line manager can approve at this stage for this request."
                 )
 
-        # Additional identity check for supervisor stage: must be the supervisor of the employee's unit
+        # Additional identity check for team lead stage: must be team lead of the employee's team
+        # (configured lead) OR a TEAM_LEAD who belongs to the same team.
         if leave_request.status == LeaveRequestStatus.PENDING_TEAM_LEAD:
             team = getattr(leave_request.employee, "team", None)
-            if not team or team.team_lead_id != user.pk:
+            if not team:
+                raise PermissionDenied("Only the team lead of the employee's team can approve at this stage.")
+            same_team_member = getattr(user, "team_id", None) == team.pk
+            is_configured_lead = team.team_lead_id == user.pk
+            if not (is_configured_lead or same_team_member):
                 raise PermissionDenied(
                     "Only the team lead of the employee's team can approve at this stage."
                 )
 
+        # Additional identity check for supervisor stage: must be supervisor of the employee's unit
+        # (configured supervisor) OR a SUPERVISOR who belongs to the same unit.
         if leave_request.status == LeaveRequestStatus.PENDING_SUPERVISOR:
             unit = getattr(leave_request.employee, "unit", None)
-            if not unit or unit.supervisor_id != user.pk:
+            if not unit:
+                raise PermissionDenied("Only the supervisor of the employee's unit can approve at this stage.")
+            same_unit_member = getattr(user, "unit_id", None) == unit.pk
+            is_configured_supervisor = unit.supervisor_id == user.pk
+            if not (is_configured_supervisor or same_unit_member):
                 raise PermissionDenied(
                     "Only the supervisor of the employee's unit can approve at this stage."
                 )
@@ -643,7 +694,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="reject")
     def reject(self, request, pk=None):
-        leave_request = self.get_object()
+        leave_request = LeaveRequest.objects.select_related("employee", "employee__department", "employee__unit", "employee__team").get(pk=pk)
 
         comment = request.data.get("comment", "").strip()
         if not comment:
@@ -668,14 +719,22 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
         if leave_request.status == LeaveRequestStatus.PENDING_TEAM_LEAD:
             team = getattr(leave_request.employee, "team", None)
-            if not team or team.team_lead_id != user.pk:
+            if not team:
+                raise PermissionDenied("Only the team lead of the employee's team can reject at this stage.")
+            same_team_member = getattr(user, "team_id", None) == team.pk
+            is_configured_lead = team.team_lead_id == user.pk
+            if not (is_configured_lead or same_team_member):
                 raise PermissionDenied(
                     "Only the team lead of the employee's team can reject at this stage."
                 )
 
         if leave_request.status == LeaveRequestStatus.PENDING_SUPERVISOR:
             unit = getattr(leave_request.employee, "unit", None)
-            if not unit or unit.supervisor_id != user.pk:
+            if not unit:
+                raise PermissionDenied("Only the supervisor of the employee's unit can reject at this stage.")
+            same_unit_member = getattr(user, "unit_id", None) == unit.pk
+            is_configured_supervisor = unit.supervisor_id == user.pk
+            if not (is_configured_supervisor or same_unit_member):
                 raise PermissionDenied(
                     "Only the supervisor of the employee's unit can reject at this stage."
                 )
@@ -711,7 +770,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["post"], url_path="cancel")
     def cancel(self, request, pk=None):
-        leave_request = self.get_object()
+        leave_request = LeaveRequest.objects.select_related("employee").get(pk=pk)
         user = request.user
 
         is_hr = user.is_staff or user.has_role(RoleName.HR)
@@ -768,7 +827,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"], url_path="logs")
     def logs(self, request, pk=None):
-        leave_request = self.get_object()
+        leave_request = LeaveRequest.objects.select_related("employee", "employee__department", "employee__unit", "employee__team", "cover_person").get(pk=pk)
         user = request.user
         is_owner = leave_request.employee == user
         is_draft = leave_request.status == LeaveRequestStatus.DRAFT
@@ -786,15 +845,20 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                     can_view = True
 
             # Unit supervisor can view logs for their unit members
-            if user.has_role(RoleName.SUPERVISOR) and getattr(user, "supervised_unit_id", None):
-                if leave_request.employee.unit_id == user.supervised_unit_id:
-                    can_view = True
+            if user.has_role(RoleName.SUPERVISOR):
+                if leave_request.employee.unit_id:
+                    configured = getattr(leave_request.employee.unit, "supervisor_id", None) == user.pk
+                    same_unit = getattr(user, "unit_id", None) == leave_request.employee.unit_id
+                    if configured or same_unit:
+                        can_view = True
 
             # Team lead can view logs for their team members
             if user.has_role(RoleName.TEAM_LEAD):
-                led_team = getattr(user, "led_team", None)
-                if led_team is not None and leave_request.employee.team_id == led_team.pk:
-                    can_view = True
+                if leave_request.employee.team_id:
+                    configured = getattr(leave_request.employee.team, "team_lead_id", None) == user.pk
+                    same_team = getattr(user, "team_id", None) == leave_request.employee.team_id
+                    if configured or same_team:
+                        can_view = True
             if not can_view:
                 raise PermissionDenied("You do not have permission to view the approval log.")
 

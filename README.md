@@ -462,6 +462,8 @@ Each `User` can also optionally belong to a `Unit` (via `User.unit`), which must
 | GET    | `/api/v1/units/:id/`            | Dept member or HR/ED/MD         | Unit detail: name, supervisor, members   |
 | PATCH  | `/api/v1/units/:id/`            | LINE_MANAGER of unit's dept     | Update unit (e.g. name)                  |
 | DELETE | `/api/v1/units/:id/`            | LINE_MANAGER of unit's dept     | Delete unit (or restrict if it has members) |
+| POST   | `/api/v1/units/:id/supervisor/` | HR/ED/MD/Admin or LINE_MANAGER | Assign a unit supervisor                 |
+| DELETE | `/api/v1/units/:id/supervisor/` | HR/ED/MD/Admin or LINE_MANAGER | Revoke the unit supervisor               |
 | POST   | `/api/v1/units/:id/bulk-add-members/` | HR/ED/MD/Admin or LINE_MANAGER | Bulk-add users to a unit (partial success) |
 | POST   | `/api/v1/units/:id/bulk-remove-members/` | HR/ED/MD/Admin or LINE_MANAGER | Bulk-remove users from a unit (partial success) |
 
@@ -474,6 +476,8 @@ Each `User` can also optionally belong to a `Unit` (via `User.unit`), which must
 | GET | `/api/v1/teams/:id/` | Unit/Dept member or HR/ED/MD | Team detail |
 | PATCH | `/api/v1/teams/:id/` | HR/ED/MD/Admin or LINE_MANAGER | Update a team |
 | DELETE | `/api/v1/teams/:id/` | HR/ED/MD/Admin or LINE_MANAGER | Delete a team |
+| POST | `/api/v1/teams/:id/team-lead/` | HR/ED/MD/Admin or LINE_MANAGER | Assign a team lead |
+| DELETE | `/api/v1/teams/:id/team-lead/` | HR/ED/MD/Admin or LINE_MANAGER | Revoke the team lead |
 | POST | `/api/v1/teams/:id/bulk-add-members/` | HR/ED/MD/Admin or LINE_MANAGER | Bulk-add users to a team (partial success) |
 | POST | `/api/v1/teams/:id/bulk-remove-members/` | HR/ED/MD/Admin or LINE_MANAGER | Bulk-remove users from a team (partial success) |
 
@@ -514,6 +518,34 @@ Notes:
 - Units belong to a single department.
 - Only the department’s Line Manager can create/update/delete units in that department.
 - A supervisor may be assigned to a unit (via `Unit.supervisor` and the `SUPERVISOR` role), and employees in that unit will route leave requests through the unit’s supervisor first.
+
+**Assign/Revoke Unit Supervisor**
+
+- **POST** `/api/v1/units/:id/supervisor/`
+
+```json
+{ "user_id": "<uuid of user in the unit's department>" }
+```
+
+- **DELETE** `/api/v1/units/:id/supervisor/` (no body)
+
+Behavior:
+- On assign, the user is set as `Unit.supervisor` and granted the `SUPERVISOR` role.
+- On revoke, `Unit.supervisor` is cleared and the user is reverted to `EMPLOYEE` (unless they are HR/ED/MD/LINE_MANAGER, in which case only the `SUPERVISOR` role is removed).
+
+**Assign/Revoke Team Lead**
+
+- **POST** `/api/v1/teams/:id/team-lead/`
+
+```json
+{ "user_id": "<uuid of user in the team's unit>" }
+```
+
+- **DELETE** `/api/v1/teams/:id/team-lead/` (no body)
+
+Behavior:
+- On assign, the user is set as `Team.team_lead` and granted the `TEAM_LEAD` role.
+- On revoke, `Team.team_lead` is cleared and the user is reverted to `EMPLOYEE` (unless they are HR/ED/MD/LINE_MANAGER, in which case only the `TEAM_LEAD` role is removed).
 
 ### Department members
 
