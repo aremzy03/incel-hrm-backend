@@ -136,11 +136,11 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
                 )
 
         if leave_type:
-            if leave_type.name == "Maternity" and getattr(employee, "gender", None) != "FEMALE":
+            if leave_type.name in ("Maternity", "Maternity Leave") and getattr(employee, "gender", None) != "FEMALE":
                 raise serializers.ValidationError(
                     {"leave_type": "Maternity leave is only available for female staff."}
                 )
-            if leave_type.name == "Paternity" and getattr(employee, "gender", None) != "MALE":
+            if leave_type.name in ("Paternity", "Paternity Leave") and getattr(employee, "gender", None) != "MALE":
                 raise serializers.ValidationError(
                     {"leave_type": "Paternity leave is only available for male staff."}
                 )

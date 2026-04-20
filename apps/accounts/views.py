@@ -252,13 +252,24 @@ class DepartmentMembersView(APIView):
         if not can_access:
             raise PermissionDenied("You can only view members of your own department.")
 
-        members = User.objects.filter(department=department).select_related("department")
+        mgmt = get_or_create_management_department()
+        if department.pk == mgmt.pk:
+            member_ids = DepartmentMembership.objects.filter(
+                department=department
+            ).values_list("user_id", flat=True)
+            members = User.objects.filter(pk__in=member_ids).select_related("department")
+        else:
+            members = User.objects.filter(department=department).select_related("department")
         return Response(UserSerializer(members, many=True).data)
 
 
 class DepartmentDetailView(APIView):
     """
     GET /api/v1/departments/:id/detail/ — department + members + units + supervisors + line manager.
+
+    For the Management department, members are resolved via DepartmentMembership (not
+    User.department) because line managers retain their own department as their primary
+    department and are linked to Management only through the membership table.
     """
 
     permission_classes = [permissions.IsAuthenticated]
@@ -278,7 +289,14 @@ class DepartmentDetailView(APIView):
             raise PermissionDenied("You do not have permission to view this department.")
 
         dept_data = DepartmentSerializer(department).data
-        members = User.objects.filter(department=department).select_related("department")
+        mgmt = get_or_create_management_department()
+        if department.pk == mgmt.pk:
+            member_ids = DepartmentMembership.objects.filter(
+                department=department
+            ).values_list("user_id", flat=True)
+            members = User.objects.filter(pk__in=member_ids).select_related("department")
+        else:
+            members = User.objects.filter(department=department).select_related("department")
         units = Unit.objects.filter(department=department).select_related("supervisor", "department")
 
         from .serializers import _UserMinimalSerializer  # local import to avoid circular

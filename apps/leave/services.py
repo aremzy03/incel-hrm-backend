@@ -21,9 +21,9 @@ def get_eligible_leave_types(user):
     qs = LeaveType.objects.all()
     gender = getattr(user, "gender", None)
     if gender == "FEMALE":
-        qs = qs.exclude(name="Paternity")
+        qs = qs.exclude(name="Paternity Leave")
     elif gender == "MALE":
-        qs = qs.exclude(name="Maternity")
+        qs = qs.exclude(name="Maternity Leave")
     return qs
 
 

@@ -49,6 +49,7 @@ from .serializers import (
     LeaveTypeSerializer,
     PublicHolidaySerializer,
 )
+from .services import get_eligible_leave_types
 from .tasks import (
     notify_approver_required,
     notify_leave_decision,
@@ -133,7 +134,15 @@ class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         user = self.request.user
         qs = LeaveBalance.objects.select_related("employee", "leave_type")
-        return qs.filter(employee=user)
+        qs = qs.filter(employee=user, leave_type__in=get_eligible_leave_types(user))
+        year = self.request.query_params.get("year")
+        if year:
+            try:
+                year_int = int(year)
+            except ValueError:
+                raise ValidationError({"year": "year must be an integer."})
+            qs = qs.filter(year=year_int)
+        return qs
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +328,22 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             "cover_person",
         ).all()
 
-        from django.db.models import Q
+        from django.db.models import OuterRef, Q, Subquery
+
+        from .models import ApprovalAction, LeaveApprovalLog
+
+        latest_reject_prev_status = LeaveApprovalLog.objects.filter(
+            leave_request_id=OuterRef("pk"),
+            action=ApprovalAction.REJECT,
+        ).order_by("-timestamp").values("previous_status")[:1]
+
+        latest_reject_actor_id = LeaveApprovalLog.objects.filter(
+            leave_request_id=OuterRef("pk"),
+            action=ApprovalAction.REJECT,
+        ).order_by("-timestamp").values("actor_id")[:1]
+
+        qs = qs.annotate(rejected_from_status=Subquery(latest_reject_prev_status))
+        qs = qs.annotate(rejected_by_id=Subquery(latest_reject_actor_id))
 
         owner_q = Q(employee=user)
         cover_q = Q(cover_person=user)
@@ -389,9 +413,46 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         # Draft requests: creator only. cover_person only sees non-draft.
         base_visible = owner_q | cover_non_draft_q
 
-        # Terminal (REJECTED/CANCELLED): creator and cover_person only for non-privileged users
+        # Terminal (REJECTED/CANCELLED)
         terminal_visible_q = Q(status__in=(LeaveRequestStatus.REJECTED, LeaveRequestStatus.CANCELLED)) & (
             Q(pk__isnull=False) if priv else base_visible
+        )
+
+        # Exception for REJECTED: make it visible to all approvers *before* the rejecting stage.
+        rejected_q = Q(status=LeaveRequestStatus.REJECTED)
+        rejected_team_lead_q = rejected_q & Q(
+            rejected_from_status__in=(
+                LeaveRequestStatus.PENDING_SUPERVISOR,
+                LeaveRequestStatus.PENDING_MANAGER,
+                LeaveRequestStatus.PENDING_HR,
+                LeaveRequestStatus.PENDING_ED,
+            )
+        ) & team_lead_pred
+        rejected_supervisor_q = rejected_q & Q(
+            rejected_from_status__in=(
+                LeaveRequestStatus.PENDING_MANAGER,
+                LeaveRequestStatus.PENDING_HR,
+                LeaveRequestStatus.PENDING_ED,
+            )
+        ) & supervisor_pred
+        rejected_manager_q = rejected_q & Q(
+            rejected_from_status__in=(
+                LeaveRequestStatus.PENDING_HR,
+                LeaveRequestStatus.PENDING_ED,
+            )
+        ) & manager_pred
+        rejected_hr_q = rejected_q & Q(
+            rejected_from_status__in=(LeaveRequestStatus.PENDING_ED,)
+        ) & hr_pred
+
+        rejected_by_actor_q = rejected_q & Q(rejected_by_id=user.pk)
+
+        terminal_visible_q = terminal_visible_q | (
+            rejected_team_lead_q
+            | rejected_supervisor_q
+            | rejected_manager_q
+            | rejected_hr_q
+            | rejected_by_actor_q
         )
 
         visible_q = base_visible | approved_visible_q | pending_visible_q | terminal_visible_q

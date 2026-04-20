@@ -386,6 +386,88 @@ class LeaveRequestApproverListAndApproveTests(TestCase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
 
 
+class LeaveRequestRejectedPriorApproversVisibilityTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.dept = make_department("Dept Rejected Visibility")
+        self.leave_type = make_leave_type("Annual", 21)
+
+        self.team_lead = make_user(
+            "teamlead.rejected@test.com",
+            roles=[RoleName.TEAM_LEAD],
+            department=self.dept,
+        )
+        self.supervisor = make_user(
+            "supervisor.rejected@test.com",
+            roles=[RoleName.SUPERVISOR],
+            department=self.dept,
+        )
+
+        self.unit = Unit.objects.create(name="Unit RV", department=self.dept, supervisor=self.supervisor)
+        self.team = Team.objects.create(name="Team RV", unit=self.unit, team_lead=self.team_lead)
+
+        self.employee = make_user(
+            "employee.rejected@test.com",
+            roles=[RoleName.EMPLOYEE],
+            department=self.dept,
+        )
+        self.employee.unit = self.unit
+        self.employee.team = self.team
+        self.employee.save(update_fields=["unit", "team", "updated_at"])
+
+        self.other = make_user(
+            "other.rejected@test.com",
+            roles=[RoleName.EMPLOYEE],
+            department=self.dept,
+        )
+
+        self.req = make_request(
+            self.employee,
+            self.leave_type,
+            status=LeaveRequestStatus.PENDING_SUPERVISOR,
+        )
+
+        self.list_url = reverse("leave-request-list")
+        self.detail_url = reverse("leave-request-detail", args=[self.req.id])
+        self.reject_url = reverse("leave-request-reject", args=[self.req.id])
+
+    def _ids(self, response):
+        data = response.data
+        if isinstance(data, dict) and "results" in data:
+            data = data["results"]
+        return {str(item["id"]) for item in data}
+
+    def test_rejected_from_supervisor_stage_visible_to_team_lead_not_unrelated(self):
+        # Supervisor rejects at PENDING_SUPERVISOR
+        self.client.force_authenticate(self.supervisor)
+        resp = self.client.post(self.reject_url, {"comment": "nope"}, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        # Rejecting supervisor should still see it after rejection
+        self.client.force_authenticate(self.supervisor)
+        resp = self.client.get(self.list_url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIn(str(self.req.id), self._ids(resp))
+        resp = self.client.get(self.detail_url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        # Team lead (prior-stage approver) should see it after rejection
+        self.client.force_authenticate(self.team_lead)
+        resp = self.client.get(self.list_url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertIn(str(self.req.id), self._ids(resp))
+        resp = self.client.get(self.detail_url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+
+        # Unrelated employee should not see it
+        self.client.force_authenticate(self.other)
+        resp = self.client.get(self.list_url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertNotIn(str(self.req.id), self._ids(resp))
+        resp = self.client.get(self.detail_url)
+        self.assertIn(resp.status_code, (status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND))
+
+
 class LeaveRequestLogsVisibilityTests(TestCase):
     def setUp(self):
         self.client = APIClient()
