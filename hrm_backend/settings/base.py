@@ -236,7 +236,10 @@ CELERY_TASK_ALWAYS_EAGER = False
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
-CELERY_TIMEZONE = TIME_ZONE
+# Celery should run in UTC internally to avoid clock drift issues across containers.
+# Django can keep TIME_ZONE="Africa/Lagos" for user-facing display since USE_TZ=True.
+CELERY_ENABLE_UTC = True
+CELERY_TIMEZONE = "UTC"
 
 
 # ---------------------------------------------------------------------------
