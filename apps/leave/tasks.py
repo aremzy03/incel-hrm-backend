@@ -1,4 +1,5 @@
 import json
+import logging
 
 from celery import shared_task
 from django.conf import settings
@@ -15,6 +16,7 @@ from apps.notifications.models import Notification, NotificationType
 from .models import LeaveRequest, LeaveRequestStatus
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
 
 
 def _employee_name(leave_request: LeaveRequest) -> str:
@@ -39,6 +41,7 @@ def _send_email_if_possible(
 ) -> bool:
     recipients = [email for email in recipients if email]
     if not recipients:
+        logger.info("Email skipped (no recipients). subject=%r", subject)
         return False
 
     html_body = None
@@ -61,8 +64,29 @@ def _send_email_if_possible(
     )
     if html_body:
         msg.attach_alternative(html_body, "text/html")
-    msg.send(fail_silently=True)
-    return True
+    try:
+        # In dev validation, we want hard failures to surface.
+        # In prod, keep legacy "silent" behavior unless explicitly changed.
+        fail_silently = not bool(getattr(settings, "DEBUG", False))
+        sent_count = msg.send(fail_silently=fail_silently)
+        logger.info(
+            "Email send attempted. subject=%r recipients=%s sent_count=%s backend=%s fail_silently=%s",
+            subject,
+            recipients,
+            sent_count,
+            getattr(settings, "EMAIL_BACKEND", None),
+            fail_silently,
+        )
+        return bool(sent_count)
+    except Exception:
+        # Do not log full message/headers to avoid leaking PII; subject + recipients is enough.
+        logger.exception(
+            "Email send failed. subject=%r recipients=%s backend=%s",
+            subject,
+            recipients,
+            getattr(settings, "EMAIL_BACKEND", None),
+        )
+        return False
 
 
 def _publish_notifications(*, redis_url: str, user_ids: list[str], payload: dict) -> None:
