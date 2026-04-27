@@ -14,22 +14,14 @@
       table { border-collapse: collapse !important; }
       body { margin: 0 !important; padding: 0 !important; width: 100% !important; }
 
-      /* Design tokens mirrored from frontend app/globals.css */
-      :root {
-        --background: #f2f2f2;
-        --foreground: #1e293b;
-        --card: #f5f5f4;
-        --card-foreground: #1e293b;
-        --primary: #111fa2;
-        --primary-foreground: #ffffff;
-        --muted-foreground: #6b7280;
-        --border: #d6d3d1;
-        --radius: 20px;
-      }
+      /*
+        Email clients commonly do NOT support CSS variables (var(--x)).
+        Keep styling to broadly-supported CSS so it renders consistently.
+      */
 
       .container {
         width: 100%;
-        background: var(--background);
+        background: #f2f2f2;
         padding: 28px 12px;
       }
 
@@ -37,16 +29,16 @@
         width: 100%;
         max-width: 640px;
         margin: 0 auto;
-        background: var(--card);
-        border: 1px solid var(--border);
-        border-radius: var(--radius);
+        background: #f5f5f4;
+        border: 1px solid #d6d3d1;
+        border-radius: 20px;
         overflow: hidden;
       }
 
       .header {
         padding: 18px 22px;
-        background: var(--primary);
-        color: var(--primary-foreground);
+        background: #111fa2;
+        color: #ffffff;
       }
 
       .brand {
@@ -60,7 +52,7 @@
       .content {
         padding: 22px;
         font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Arial, sans-serif;
-        color: var(--card-foreground);
+        color: #1e293b;
       }
 
       .title {
@@ -68,11 +60,11 @@
         font-size: 18px;
         font-weight: 700;
         line-height: 1.25;
-        color: var(--foreground);
+        color: #1e293b;
       }
 
       .muted {
-        color: var(--muted-foreground);
+        color: #6b7280;
         font-size: 13px;
         line-height: 1.5;
         margin: 0;
@@ -80,7 +72,7 @@
 
       .divider {
         height: 1px;
-        background: var(--border);
+        background: #d6d3d1;
         margin: 16px 0;
       }
 
@@ -97,12 +89,12 @@
 
       .kv .k {
         width: 34%;
-        color: var(--muted-foreground);
+        color: #6b7280;
       }
 
       .kv .v {
         width: 66%;
-        color: var(--foreground);
+        color: #1e293b;
         font-weight: 600;
       }
 
@@ -112,8 +104,8 @@
 
       .button {
         display: inline-block;
-        background: var(--primary);
-        color: var(--primary-foreground) !important;
+        background: #111fa2;
+        color: #ffffff !important;
         text-decoration: none;
         padding: 12px 16px;
         border-radius: 14px;
@@ -124,26 +116,26 @@
       .footer {
         padding: 16px 22px 20px 22px;
         font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Arial, sans-serif;
-        color: var(--muted-foreground);
+        color: #6b7280;
         font-size: 12px;
         line-height: 1.5;
       }
     </style>
   </head>
   <body>
-    <div class="container">
-      <div class="card">
-        <div class="header">
-          <p class="brand">Incel HRM</p>
+    <div class="container" style="width:100%;background:#f2f2f2;padding:28px 12px;">
+      <div class="card" style="width:100%;max-width:640px;margin:0 auto;background:#f5f5f4;border:1px solid #d6d3d1;border-radius:20px;overflow:hidden;">
+        <div class="header" style="padding:18px 22px;background:#111fa2;color:#ffffff;">
+          <p class="brand" style="font-family:ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Arial, sans-serif;font-size:16px;font-weight:700;letter-spacing:0.2px;margin:0;">Incel HRM</p>
         </div>
 
-        <div class="content">
+        <div class="content" style="padding:22px;font-family:ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Arial, sans-serif;color:#1e293b;">
           {% block content %}{% endblock %}
         </div>
 
-        <div class="footer">
-          <div class="divider"></div>
-          <p class="muted">
+        <div class="footer" style="padding:16px 22px 20px 22px;font-family:ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Arial, sans-serif;color:#6b7280;font-size:12px;line-height:1.5;">
+          <div class="divider" style="height:1px;background:#d6d3d1;margin:16px 0;"></div>
+          <p class="muted" style="color:#6b7280;font-size:13px;line-height:1.5;margin:0;">
             This is an automated notification from Incel HRM. If you believe you received this in error, you can ignore this email.
           </p>
         </div>
