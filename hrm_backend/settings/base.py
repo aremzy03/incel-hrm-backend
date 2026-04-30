@@ -174,6 +174,7 @@ REST_FRAMEWORK = {
         "login": "30/hour",
         "register": "15/hour",
         "refresh": "120/hour",
+        "password_change": "10/hour",
     },
 }
 

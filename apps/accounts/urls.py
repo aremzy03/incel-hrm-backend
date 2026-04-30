@@ -4,6 +4,8 @@ from rest_framework.routers import DefaultRouter
 from .throttled_auth_views import ThrottledTokenObtainPairView, ThrottledTokenRefreshView
 from .views import (
     AssignRoleView,
+    PasswordChangeView,
+    PasswordResetView,
     DepartmentDetailView,
     DepartmentBulkAddMembersView,
     DepartmentBulkRemoveMembersView,
@@ -27,6 +29,7 @@ auth_urlpatterns = [
     path("register/", RegisterView.as_view(), name="register"),
     path("me/", MeView.as_view(), name="me"),
     path("profile/", UserProfileView.as_view(), name="profile"),
+    path("password/change/", PasswordChangeView.as_view(), name="password-change"),
 ]
 
 role_router = DefaultRouter()
@@ -41,6 +44,11 @@ role_urlpatterns = role_router.urls + [
         "users/<uuid:user_id>/roles/<uuid:role_id>/",
         RemoveRoleView.as_view(),
         name="user-role-remove",
+    ),
+    path(
+        "users/<uuid:user_id>/password/reset/",
+        PasswordResetView.as_view(),
+        name="user-password-reset",
     ),
 ]
 

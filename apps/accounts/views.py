@@ -1,8 +1,9 @@
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
+from django.db.models import Case, Count, IntegerField, When
 from django.shortcuts import get_object_or_404
-from rest_framework import generics, permissions, status, viewsets
+from rest_framework import filters, generics, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
@@ -15,11 +16,12 @@ from .models import (
     Unit,
     get_or_create_hr_department,
     get_or_create_management_department,
+    MANAGEMENT_DEPARTMENT_NAME,
     Role,
     RoleName,
     UserRole,
 )
-from .throttles import RegisterThrottle
+from .throttles import PasswordChangeThrottle, RegisterThrottle
 from .permissions import IsExecutiveDirector, IsHR
 from .serializers import (
     BulkUserIdsSerializer,
@@ -31,6 +33,8 @@ from .serializers import (
     UnitSerializer,
     UserCreateSerializer,
     UserDepartmentUpdateSerializer,
+    PasswordChangeSerializer,
+    PasswordResetSerializer,
     UserRoleSerializer,
     UserSelfUpdateSerializer,
     UserSerializer,
@@ -39,10 +43,20 @@ from .serializers import (
 
 User = get_user_model()
 
+
+def _blacklist_user_refresh_tokens(user):
+    from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
+
+    for token in OutstandingToken.objects.filter(user=user):
+        BlacklistedToken.objects.get_or_create(token=token)
+
+
 __all__ = [
     "RegisterView",
     "MeView",
     "UserProfileView",
+    "PasswordChangeView",
+    "PasswordResetView",
     "UserViewSet",
     "RoleViewSet",
     "AssignRoleView",
@@ -112,6 +126,45 @@ class UserProfileView(APIView):
         return Response(UserSerializer(request.user).data)
 
 
+class PasswordChangeView(APIView):
+    """
+    POST /api/v1/auth/password/change/
+
+    Authenticated user changes their own password; all refresh tokens for that user are blacklisted.
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = [PasswordChangeThrottle]
+
+    def post(self, request):
+        serializer = PasswordChangeSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        user = request.user
+        user.set_password(serializer.validated_data["new_password"])
+        user.save(update_fields=["password", "updated_at"])
+        _blacklist_user_refresh_tokens(user)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class PasswordResetView(APIView):
+    """
+    POST /api/v1/users/:user_id/password/reset/
+
+    HR or Django admin resets another user's password; all refresh tokens for that user are blacklisted.
+    """
+
+    permission_classes = [permissions.IsAuthenticated, IsHR | permissions.IsAdminUser]
+
+    def post(self, request, user_id):
+        target = get_object_or_404(User, pk=user_id)
+        serializer = PasswordResetSerializer(data=request.data, context={"user": target})
+        serializer.is_valid(raise_exception=True)
+        target.set_password(serializer.validated_data["new_password"])
+        target.save(update_fields=["password", "updated_at"])
+        _blacklist_user_refresh_tokens(target)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 # ---------------------------------------------------------------------------
 # Users (HR CRUD)
 # ---------------------------------------------------------------------------
@@ -128,6 +181,15 @@ class UserViewSet(viewsets.ModelViewSet):
 
     queryset = User.objects.select_related("department").all()
     permission_classes = [permissions.IsAuthenticated, IsHR | permissions.IsAdminUser]
+    filter_backends = [filters.SearchFilter]
+    search_fields = [
+        "email",
+        "first_name",
+        "last_name",
+        "other_names",
+        "phone",
+        "department__name",
+    ]
 
     def get_serializer_class(self):
         if self.action == "create":
@@ -153,6 +215,18 @@ class DepartmentViewSet(viewsets.ModelViewSet):
 
     queryset = Department.objects.all()
     serializer_class = DepartmentSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset().select_related("line_manager").order_by("name")
+        # "Management" department membership is tracked via DepartmentMembership so
+        # we align list counts with DepartmentDetailView semantics.
+        return qs.annotate(
+            members_count=Case(
+                When(name=MANAGEMENT_DEPARTMENT_NAME, then=Count("memberships", distinct=True)),
+                default=Count("members", distinct=True),
+                output_field=IntegerField(),
+            )
+        )
 
     def get_permissions(self):
         if self.action in ("list", "retrieve"):

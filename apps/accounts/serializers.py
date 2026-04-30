@@ -23,11 +23,12 @@ class _UserMinimalSerializer(serializers.ModelSerializer):
 
 class DepartmentSerializer(serializers.ModelSerializer):
     line_manager = _UserMinimalSerializer(read_only=True)
+    members_count = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = Department
-        fields = ("id", "name", "description", "line_manager", "created_at", "updated_at")
-        read_only_fields = ("id", "line_manager", "created_at", "updated_at")
+        fields = ("id", "name", "description", "line_manager", "members_count", "created_at", "updated_at")
+        read_only_fields = ("id", "line_manager", "members_count", "created_at", "updated_at")
 
 
 class _DepartmentMinimalSerializer(serializers.ModelSerializer):
@@ -418,6 +419,64 @@ class UserRoleSerializer(serializers.ModelSerializer):
         user = validated_data["user"]
         user_role, _ = UserRole.objects.get_or_create(user=user, role=role)
         return user_role
+
+
+# ---------------------------------------------------------------------------
+# Password change / reset
+# ---------------------------------------------------------------------------
+
+_password_field_kwargs = {"write_only": True, "style": {"input_type": "password"}}
+
+
+class PasswordChangeSerializer(serializers.Serializer):
+    """Self-service password change: current + new + confirm."""
+
+    current_password = serializers.CharField(**_password_field_kwargs)
+    new_password = serializers.CharField(**_password_field_kwargs)
+    new_password_confirm = serializers.CharField(**_password_field_kwargs)
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        if request is None or not getattr(request, "user", None) or not request.user.is_authenticated:
+            raise serializers.ValidationError("Authentication required.")
+
+        user = request.user
+        if not user.check_password(attrs["current_password"]):
+            raise serializers.ValidationError({"current_password": "Current password is incorrect."})
+
+        if attrs["new_password"] != attrs.pop("new_password_confirm"):
+            raise serializers.ValidationError({"new_password_confirm": "Passwords do not match."})
+
+        if user.check_password(attrs["new_password"]):
+            raise serializers.ValidationError(
+                {"new_password": "New password must be different from the current password."}
+            )
+
+        validate_password(attrs["new_password"], user=user)
+        return attrs
+
+
+class PasswordResetSerializer(serializers.Serializer):
+    """HR/admin reset: new + confirm only (target user in context as `user`)."""
+
+    new_password = serializers.CharField(**_password_field_kwargs)
+    new_password_confirm = serializers.CharField(**_password_field_kwargs)
+
+    def validate(self, attrs):
+        user = self.context.get("user")
+        if user is None:
+            raise serializers.ValidationError("Target user is required in serializer context.")
+
+        if attrs["new_password"] != attrs.pop("new_password_confirm"):
+            raise serializers.ValidationError({"new_password_confirm": "Passwords do not match."})
+
+        if user.check_password(attrs["new_password"]):
+            raise serializers.ValidationError(
+                {"new_password": "New password must be different from the current password."}
+            )
+
+        validate_password(attrs["new_password"], user=user)
+        return attrs
 
 
 # ---------------------------------------------------------------------------

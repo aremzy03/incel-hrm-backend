@@ -76,3 +76,4 @@ celerybeat.pid
 *.orig
 
 k6/
+hr_software_user_data.csv
