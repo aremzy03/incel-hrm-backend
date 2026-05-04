@@ -89,7 +89,7 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
     Used for POST (create) and PATCH (update) of leave requests.
 
     Validation pipeline:
-      1. start_date < end_date
+      1. start_date <= end_date (single-day leave allowed)
       2. WorkingDaysService.check_overlapping_leave()
       3. WorkingDaysService.check_department_leave_overlap() (Annual/Casual only)
       4. WorkingDaysService.validate_leave_balance()
@@ -116,9 +116,9 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
         end_date = attrs.get("end_date")
 
         if start_date and end_date:
-            if start_date >= end_date:
+            if start_date > end_date:
                 raise serializers.ValidationError(
-                    {"end_date": "end_date must be after start_date."}
+                    {"end_date": "end_date must be on or after start_date."}
                 )
 
         employee = self.context["request"].user
