@@ -9,6 +9,12 @@ class NotificationType(models.TextChoices):
     LEAVE_ACTION_REQUIRED = "LEAVE_ACTION_REQUIRED", "Leave action required"
     LEAVE_APPROVED = "LEAVE_APPROVED", "Leave approved"
     LEAVE_REJECTED = "LEAVE_REJECTED", "Leave rejected"
+    LOAN_SUBMITTED = "LOAN_SUBMITTED", "Loan submitted"
+    LOAN_APPROVED = "LOAN_APPROVED", "Loan approved"
+    LOAN_REJECTED = "LOAN_REJECTED", "Loan rejected"
+    LOAN_DISBURSED = "LOAN_DISBURSED", "Loan disbursed"
+    LOAN_LIQUIDATED = "LOAN_LIQUIDATED", "Loan liquidated"
+    LOAN_CLOSED = "LOAN_CLOSED", "Loan closed"
 
 
 class Notification(models.Model):

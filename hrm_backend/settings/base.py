@@ -44,6 +44,7 @@ THIRD_PARTY_APPS = [
 LOCAL_APPS = [
     "apps.accounts",
     "apps.leave",
+    "apps.loan",
     "apps.notifications",
 ]
 
@@ -241,6 +242,15 @@ CELERY_RESULT_SERIALIZER = "json"
 # Django can keep TIME_ZONE="Africa/Lagos" for user-facing display since USE_TZ=True.
 CELERY_ENABLE_UTC = True
 CELERY_TIMEZONE = "UTC"
+
+from celery.schedules import crontab  # noqa: E402
+
+CELERY_BEAT_SCHEDULE = {
+    "mark-overdue-loan-installments": {
+        "task": "apps.loan.tasks.mark_overdue_loan_installments",
+        "schedule": crontab(hour=0, minute=5),
+    },
+}
 
 
 # ---------------------------------------------------------------------------

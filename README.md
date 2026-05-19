@@ -225,6 +225,12 @@ To run tests using the shared `base` settings (which switches to SQLite automati
 DJANGO_SETTINGS_MODULE=hrm_backend.settings.base python manage.py test
 ```
 
+Loan workflow HTTP coverage (mirrors the Postman collection below):
+
+```bash
+DJANGO_SETTINGS_MODULE=hrm_backend.settings.base python manage.py test apps.loan.tests.test_api_endpoints
+```
+
 ## Project Layout
 
 ```
@@ -233,8 +239,54 @@ hrm_backend/settings/ - Split settings (base / dev / prod)
 apps/
   accounts/           - Custom User model, JWT auth, RBAC, Departments, user signals
   leave/              - Leave management, department calendar
+  loan/               - Loan types, applications, approval workflow, repayment schedule
 requirements/         - Pip requirement files split by environment
 ```
+
+## Loan management
+
+Staff loan applications: types are read-only; employees create **draft** applications, submit them for approval (HR → Executive Director → Managing Director), then HR **disburses** approved loans to **ACTIVE** (repayment schedule is generated). HR may **reject** at the matching stage (comment required), **liquidate** an ACTIVE loan, or **handle resignation** (ACTIVE → CLOSED). **DELETE** on an application is not supported (`405`). Approval logs (`GET .../logs/`) are visible to HR, Executive Director, Managing Director, and Django admin staff (`is_staff`), not to ordinary employees.
+
+Run migrations so `LoanType`, `LoanApplication`, and related tables exist.
+
+### REST endpoints (prefix `/api/v1/`)
+
+| Area | Method | Endpoint | Notes |
+|------|--------|----------|--------|
+| Loan types | GET | `/loan-types/` | Authenticated |
+| Applications | GET, POST | `/loan-applications/` | List (scoped); create draft |
+| Application | GET, PATCH | `/loan-applications/<uuid>/` | Owner (draft) or HR (non-terminal) |
+| Submit | POST | `/loan-applications/<uuid>/submit/` | Owner; DRAFT only; confirmed staff; eligibility checks |
+| Approve | POST | `/loan-applications/<uuid>/approve/` | HR / ED / MD by stage; MD step requires `comment` |
+| Reject | POST | `/loan-applications/<uuid>/reject/` | Stage approver; `comment` required |
+| Disburse | POST | `/loan-applications/<uuid>/disburse/` | HR; APPROVED → ACTIVE; notifies employee |
+| Liquidate | POST | `/loan-applications/<uuid>/liquidate/` | HR; ACTIVE → LIQUIDATED; notifies employee |
+| Resignation | POST | `/loan-applications/<uuid>/handle-resignation/` | HR; ACTIVE → CLOSED; notifies employee |
+| Repayment status | PATCH | `/loan-applications/<uuid>/repayment-schedule/<installment_id>/` | HR only; body `{"payment_status":"PENDING"|"PAID"|"OVERDUE"}`; ACTIVE loans; recalculates `outstanding_balance` |
+
+**Overdue automation:** PENDING installments on **ACTIVE** loans with `due_date` before today are set to **OVERDUE** when loans are listed/retrieved, and daily at 00:05 UTC via Celery beat (`mark_overdue_loan_installments`). PAID rows are never changed.
+| Logs | GET | `/loan-applications/<uuid>/logs/` | HR, ED, MD, `is_staff` |
+| Delete | DELETE | `/loan-applications/<uuid>/` | **405** — not implemented |
+
+Query params on list (privileged users): `employee`, `status`, `loan_type`.
+
+### Postman collection (manual / Collection Runner)
+
+A workspace collection **INCEL HRM Loan API Test** documents the same calls with collection variables:
+
+- `base_url` — e.g. `http://127.0.0.1:8000`
+- `access_token`, `access_token_hr`, `access_token_ed`, `access_token_md` — JWTs from `POST /api/v1/auth/login/` for an employee and for HR / ED / MD users
+- `loan_type_id` — from `GET /loan-types/`
+- `loan_id` — application UUID after create (happy path: create → patch → submit → approvals → disburse → logs)
+- `loan_id_active`, `loan_id_active2` — separate disbursed loans for **liquidate** and **handle-resignation** (each action ends in a terminal status; do not reuse the same ACTIVE loan for both)
+
+**Open in Postman:** `https://go.postman.co/collection/42849395-0fa3c05a-1990-4546-8870-06953c6c73ad`
+
+The Postman MCP in Cursor can create/update this collection (`putCollection`, `getCollection`, etc.). **Collection Runner** (`runCollection`) must be started from the Postman app if your Cursor agent does not expose that MCP tool.
+
+### Loan API automated tests
+
+`apps/loan/tests/test_api_endpoints.py` exercises list types, full approve→disburse→logs→DELETE 405, HR reject, liquidate, and handle-resignation flows (Celery `notify_*` tasks are patched). Run with `manage.py test` as shown [above](#running-tests).
 
 ## Authentication
 
@@ -277,6 +329,7 @@ curl -s http://localhost:8000/api/v1/auth/me/ \
 | `email`       | EmailField    | Unique, used as login field    |
 | `first_name`   | CharField     |                                |
 | `last_name`    | CharField     |                                |
+| `other_names`  | CharField     | Optional                       |
 | `phone`        | CharField     | Optional                       |
 | `gender`       | CharField     | MALE/FEMALE. Required on registration |
 | `date_of_birth`| DateField     | Required on registration       |
@@ -285,6 +338,10 @@ curl -s http://localhost:8000/api/v1/auth/me/ \
 | `is_staff`    | BooleanField  | Default `False`                |
 | `date_joined` | DateTimeField | Set on creation                |
 | `updated_at`  | DateTimeField | Auto-updated on every save     |
+| `unit`        | FK → Unit     | Optional; must match `department` |
+| `team`        | FK → Team     | Optional; must match `unit`    |
+
+Personnel-specific columns (`staff_id`, addresses, qualification, certification, next of kin, contract, `completeness_score`, etc.) are documented under [User personnel detail](#user-personnel-detail).
 
 ### Helpers
 
@@ -391,21 +448,213 @@ HR staff and admins can perform full CRUD on users via `/api/v1/users/`.
 }
 ```
 
-**Update payload** (`PATCH /api/v1/users/:id/`): `first_name`, `last_name`, `phone`, `gender`, `date_of_birth`, `department`, `is_active` (all optional).
+**Update payload** (`PATCH /api/v1/users/:id/`): `first_name`, `last_name`, `phone`, `gender`, `date_of_birth`, `department`, `unit`, `team`, `is_active` (all optional). Use this endpoint for HR admin list/create flows only; **do not** use it for the full employee personnel record on the user detail page (see [User personnel detail](#user-personnel-detail) below).
 
 ### User profile (self-service)
 
-For employees to manage their own profile:
+For employees to manage a **small subset** of their own profile (header / quick edit):
 
 | Method | Endpoint                 | Permission   | Description                                  |
 |--------|--------------------------|--------------|----------------------------------------------|
-| GET    | `/api/v1/auth/profile/` | Authenticated| Get current user's full profile              |
+| GET    | `/api/v1/auth/profile/` | Authenticated| Get current user's basic profile (summary)   |
 | PATCH  | `/api/v1/auth/profile/` | Authenticated| Update own `first_name`, `last_name`, `phone`, `gender`, `date_of_birth` |
 
-Role, department, and unit assignment remain restricted to HR and Line Managers via:
+For the **full personnel record** (HR user detail page or employee self-service personnel form), use [`/api/v1/users/:user_id/personnel/`](#user-personnel-detail) instead.
 
-- `PATCH /api/v1/users/:id/` — change department/unit (HR/Line Manager UI).
+Role assignment remains restricted to HR and admins via:
+
 - `POST /api/v1/users/:id/roles/` — assign a new role (overwrites any existing role).
+
+### User personnel detail
+
+Extended employee personnel data lives on the `User` model and is exposed through a dedicated endpoint. Apply migration `0014_user_personnel_fields` after pulling this change.
+
+| Method | Endpoint | Permission | Description |
+|--------|----------|------------|-------------|
+| GET | `/api/v1/users/:user_id/personnel/` | Owner, HR, or Django staff | Full personnel record (read) |
+| PATCH | `/api/v1/users/:user_id/personnel/` | Owner, HR, or Django staff | Partial update; response is the full read payload |
+| PUT | `/api/v1/users/:user_id/personnel/` | Owner, HR, or Django staff | Same as PATCH (merge semantics; you do not need to send every field) |
+
+**Access rules**
+
+- The authenticated user may read and update **their own** record (`user_id` = current user's `id`).
+- Users with the `HR` role or `is_staff=True` may read and update **any** user's record.
+- Everyone else receives `403 Forbidden` when accessing another user's `user_id`.
+
+### HR-only employment confirmation
+
+Confirmation is stored on `User` as `confirmation_status` and `confirmation_date` (no separate `is_confirmed` column).
+
+| Method | Endpoint | Permission | Description |
+|--------|----------|------------|-------------|
+| PATCH | `/api/v1/employees/:user_id/confirm/` | `HR` role only | Sets `confirmation_status` to `CONFIRMED` and `confirmation_date` to today (local date). Empty body is fine. Idempotent: calling again returns `200` and refreshes `confirmation_date` to today. |
+
+**Who can edit confirmation fields**
+
+| Action | Employee (self) | HR |
+|--------|-----------------|-----|
+| `PATCH .../personnel/` with `confirmation_status` / `confirmation_date` | `403 Forbidden` | Allowed (any valid status, including `PENDING`) |
+| `PATCH .../employees/:id/confirm/` | `403 Forbidden` | Allowed |
+
+There is **no API** to unconfirm. HR can change status or date in **Django admin** (`User` → Employment / confirmation).
+
+**Read aliases (API only, not DB columns)**
+
+| Field | Meaning |
+|-------|---------|
+| `is_confirmed` | `true` when `confirmation_status == "CONFIRMED"` |
+| `confirmed_date` | Same value as `confirmation_date` |
+
+**Example — confirm employee (HR)**
+
+```bash
+curl -s -X PATCH http://localhost:8000/api/v1/employees/<user_uuid>/confirm/ \
+  -H "Authorization: Bearer <hr_access_token>"
+```
+
+Response is the full personnel read payload (same shape as `GET .../personnel/`), including `confirmation_status`, `confirmation_date`, `is_confirmed`, and `confirmed_date`.
+
+**Official email**
+
+- Login email and official email are the **same field**: `email`.
+- Responses also include read-only `official_email`, which always equals `email`.
+
+**Server-computed fields (read-only)**
+
+| Field | Source |
+|-------|--------|
+| `full_name` | `first_name` + `last_name` |
+| `official_email` | Same as `email` |
+| `age` | From `date_of_birth` (null if unset) |
+| `length_of_service_years` | From `date_of_employment` (null if unset) |
+| `completeness_score` | 0–100; recalculated on every successful PATCH/PUT |
+
+**Choice values**
+
+| Field | Allowed values |
+|-------|----------------|
+| `gender` | `MALE`, `FEMALE` |
+| `marital_status` | `SINGLE`, `MARRIED`, `DIVORCED`, `WIDOWED`, `SEPARATED`, `OTHER` |
+| `confirmation_status` | `PENDING`, `CONFIRMED`, `NOT_APPLICABLE` |
+| `contract_type` | `PERMANENT`, `FIXED_TERM`, `CONTRACT`, `INTERN`, `OTHER` |
+
+**Org fields on write**
+
+`department`, `unit`, and `team` accept UUIDs. The same validation as `PATCH /api/v1/users/:id/` applies (unit must belong to department; team must belong to unit).
+
+**Example — load personnel for user detail page**
+
+```bash
+curl -s http://localhost:8000/api/v1/users/<user_uuid>/personnel/ \
+  -H "Authorization: Bearer <access_token>"
+```
+
+**Example — partial save from a form**
+
+```bash
+curl -s -X PATCH http://localhost:8000/api/v1/users/<user_uuid>/personnel/ \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "staff_id": "STF-001",
+    "job_role": "Software Engineer",
+    "date_of_employment": "2020-03-01",
+    "state_of_origin": "Lagos",
+    "lga": "Ikeja",
+    "qualification_school": "University of Lagos",
+    "qualification_degree": "B.Sc. Computer Science"
+  }'
+```
+
+**GET / PATCH response shape** (abbreviated; all personnel fields are returned):
+
+```json
+{
+  "id": "<uuid>",
+  "email": "jane@example.com",
+  "official_email": "jane@example.com",
+  "first_name": "Jane",
+  "last_name": "Doe",
+  "other_names": "",
+  "full_name": "Jane Doe",
+  "phone": "+2348012345678",
+  "gender": "FEMALE",
+  "date_of_birth": "1990-05-15",
+  "age": 35,
+  "department": { "id": "<uuid>", "name": "Engineering" },
+  "unit": { "id": "<uuid>", "name": "Platform" },
+  "team": null,
+  "date_joined": "2024-01-10T08:00:00Z",
+  "updated_at": "2026-05-18T12:00:00Z",
+  "staff_id": "STF-001",
+  "date_of_employment": "2020-03-01",
+  "length_of_service_years": 6.19,
+  "confirmation_status": "CONFIRMED",
+  "confirmation_date": "2021-03-01",
+  "marital_status": "SINGLE",
+  "last_promotion_date": null,
+  "is_exited": false,
+  "exit_reason": "",
+  "job_role": "Software Engineer",
+  "cost_centre": "",
+  "regions": "",
+  "state_of_locations": "",
+  "state_of_origin": "Lagos",
+  "lga": "Ikeja",
+  "religion": "",
+  "state_of_residence": "Lagos",
+  "city_of_residence": "Ikeja",
+  "landmark_of_residence": "",
+  "state_of_permanent_address": "",
+  "city_of_permanent_address": "",
+  "landmark_of_permanent_address": "",
+  "residential_address": "",
+  "permanent_address": "",
+  "qualification_school": "University of Lagos",
+  "qualification_course": "Computer Science",
+  "qualification_degree": "B.Sc.",
+  "qualification_grade": "",
+  "qualification_start_date": null,
+  "qualification_end_date": null,
+  "certification_institution": "",
+  "certification_course": "",
+  "certification_issuing_body": "",
+  "certification_license_number": "",
+  "certification_start_date": null,
+  "certification_end_date": null,
+  "next_of_kin_title": "",
+  "next_of_kin_first_name": "",
+  "next_of_kin_last_name": "",
+  "next_of_kin_phone": "",
+  "next_of_kin_email": "",
+  "next_of_kin_relationship": "",
+  "next_of_kin_address": "",
+  "contract_type": "PERMANENT",
+  "contract_start_date": null,
+  "contract_end_date": null,
+  "tenure_on_grade": "",
+  "completeness_score": 62
+}
+```
+
+**Writable fields on PATCH/PUT** (send only fields you want to change):
+
+`email`, `first_name`, `last_name`, `other_names`, `phone`, `gender`, `date_of_birth`, `department`, `unit`, `team`, `staff_id`, `date_of_employment`, `confirmation_status`, `confirmation_date`, `marital_status`, `last_promotion_date`, `is_exited`, `exit_reason`, `job_role`, `cost_centre`, `regions`, `state_of_locations`, `state_of_origin`, `lga`, `religion`, `state_of_residence`, `city_of_residence`, `landmark_of_residence`, `state_of_permanent_address`, `city_of_permanent_address`, `landmark_of_permanent_address`, `residential_address`, `permanent_address`, `qualification_school`, `qualification_course`, `qualification_degree`, `qualification_grade`, `qualification_start_date`, `qualification_end_date`, `certification_institution`, `certification_course`, `certification_issuing_body`, `certification_license_number`, `certification_start_date`, `certification_end_date`, `next_of_kin_title`, `next_of_kin_first_name`, `next_of_kin_last_name`, `next_of_kin_phone`, `next_of_kin_email`, `next_of_kin_relationship`, `next_of_kin_address`, `contract_type`, `contract_start_date`, `contract_end_date`, `tenure_on_grade`.
+
+Do **not** send `completeness_score`, `age`, `length_of_service_years`, `full_name`, or `official_email` on write; they are ignored or read-only.
+
+**New `User` model columns** (migration `0014_user_personnel_fields`):
+
+| Group | Fields |
+|-------|--------|
+| Identity / HR | `staff_id`, `date_of_employment`, `confirmation_status`, `confirmation_date`, `marital_status`, `last_promotion_date`, `is_exited`, `exit_reason`, `job_role`, `cost_centre`, `regions`, `state_of_locations`, `state_of_origin`, `lga`, `religion`, `tenure_on_grade`, `completeness_score` |
+| Addresses | `state_of_residence`, `city_of_residence`, `landmark_of_residence`, `state_of_permanent_address`, `city_of_permanent_address`, `landmark_of_permanent_address`, `residential_address`, `permanent_address` |
+| Qualification | `qualification_school`, `qualification_course`, `qualification_degree`, `qualification_grade`, `qualification_start_date`, `qualification_end_date` |
+| Certification | `certification_institution`, `certification_course`, `certification_issuing_body`, `certification_license_number`, `certification_start_date`, `certification_end_date` |
+| Next of kin | `next_of_kin_title`, `next_of_kin_first_name`, `next_of_kin_last_name`, `next_of_kin_phone`, `next_of_kin_email`, `next_of_kin_relationship`, `next_of_kin_address` |
+| Contract | `contract_type`, `contract_start_date`, `contract_end_date` |
+
+`staff_id` is unique when set (empty/null allowed for legacy users).
 
 ---
 
@@ -599,13 +848,21 @@ curl -s -X PATCH http://localhost:8000/api/v1/users/<user_uuid>/department/ \
 
 ### Frontend integration summary
 
-- **User Profile UI**
+- **User Profile UI** (header / quick self-edit)
   - Use `GET /api/v1/auth/me/` for a quick summary (e.g. header/avatar).
-  - Use `GET /api/v1/auth/profile/` to populate a full profile form.
-  - On save, send `PATCH /api/v1/auth/profile/` with any subset of: `first_name`, `last_name`, `phone`, `gender`, `date_of_birth`.
-  - For HR/Line Manager admin panels:
-    - Use `PATCH /api/v1/users/:id/` to change `department` and `unit`.
-    - Use `POST /api/v1/users/:id/roles/` to change a user's role.
+  - Use `GET /api/v1/auth/profile/` or `GET /api/v1/users/<current_user_id>/personnel/` for profile forms.
+  - For minimal self-service edits only: `PATCH /api/v1/auth/profile/` with `first_name`, `last_name`, `phone`, `gender`, `date_of_birth`.
+
+- **User detail / personnel UI** (full employee record)
+  - Load: `GET /api/v1/users/:user_id/personnel/`
+  - Save: `PATCH /api/v1/users/:user_id/personnel/` (partial body; response is the full read shape)
+  - Use `user_id` from the route (HR viewing any employee) or the logged-in user's id (self-service).
+  - Display `completeness_score`, `age`, and `length_of_service_years` from the GET response; do not send them on save.
+  - Bind `official_email` display to `email` (same value).
+
+- **HR admin panels** (roles, list CRUD)
+  - Use `PATCH /api/v1/users/:id/` only for lightweight HR fields (`is_active`, org moves in admin list).
+  - Use `POST /api/v1/users/:id/roles/` to change a user's role.
 
 - **Department Detail UI**
   - Use `GET /api/v1/departments/:id/detail/` to build a department page that shows:
@@ -803,7 +1060,10 @@ Immutable audit trail. One entry is appended per status transition. Fields inclu
 
 6. **Submit requires a line manager** -- An employee cannot submit a DRAFT request (`POST .../submit/`) unless their department has a line manager assigned. This ensures the approval chain is complete before a request enters the pipeline.
 
-7. **Approval chain** -- When a request is submitted, it flows through: Team Lead (if applicable) → Unit Supervisor (if applicable) → department Line Manager → HR → Executive Director. Certain requester roles may route through special chains.\n+\n+   - **LINE_MANAGER applicant**: Management Department Line Manager (ED) → HR → ED (final)\n+   - **HR applicant**: Department Line Manager → ED (skips HR stage)\n*** End Patch}"}]}Commentary to=functions.ApplyPatch  天天中彩票未form code with 279 more bytes to show code>
+7. **Approval chain** -- When a request is submitted, it flows through: Team Lead (if applicable) → Unit Supervisor (if applicable) → department Line Manager → HR → Executive Director. Certain requester roles may route through special chains.
+
+   - **LINE_MANAGER applicant**: Management Department Line Manager (ED) → HR → ED (final)
+   - **HR applicant**: Department Line Manager → ED (skips HR stage)
 
 8. **Line Manager scoped visibility** -- A Line Manager's `GET /api/v1/leave-requests/` queryset is now scoped to their own department (not all requests).
 
@@ -869,6 +1129,8 @@ Run the full test suite:
 ```bash
 python manage.py test
 ```
+
+Loan API integration tests: see [Loan management — Loan API automated tests](#loan-api-automated-tests).
 
 ---
 

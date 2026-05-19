@@ -6,14 +6,38 @@ from .models import Department, Role, Team, Unit, User, UserRole
 
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
-    list_display = ("email", "first_name", "last_name", "department", "unit", "team", "is_staff", "is_active", "date_joined")
-    list_filter = ("is_staff", "is_active", "is_superuser", "department", "unit", "team")
+    list_display = (
+        "email",
+        "first_name",
+        "last_name",
+        "department",
+        "unit",
+        "team",
+        "confirmation_status",
+        "confirmation_date",
+        "is_staff",
+        "is_active",
+        "date_joined",
+    )
+    list_filter = (
+        "is_staff",
+        "is_active",
+        "is_superuser",
+        "confirmation_status",
+        "department",
+        "unit",
+        "team",
+    )
     search_fields = ("email", "first_name", "last_name")
     ordering = ("-date_joined",)
 
     fieldsets = (
         (None, {"fields": ("email", "password")}),
         ("Personal info", {"fields": ("first_name", "last_name", "phone", "department", "unit", "team")}),
+        (
+            "Employment / confirmation",
+            {"fields": ("confirmation_status", "confirmation_date")},
+        ),
         (
             "Permissions",
             {

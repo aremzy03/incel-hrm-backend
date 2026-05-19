@@ -12,6 +12,7 @@ from .views import (
     DepartmentLineManagerView,
     DepartmentMembersView,
     DepartmentViewSet,
+    EmployeeConfirmView,
     MeView,
     RegisterView,
     RemoveRoleView,
@@ -19,6 +20,7 @@ from .views import (
     TeamViewSet,
     UnitViewSet,
     UserDepartmentUpdateView,
+    UserPersonnelDetailView,
     UserViewSet,
     UserProfileView,
 )
@@ -39,6 +41,16 @@ role_router.register(r"units", UnitViewSet, basename="unit")
 role_router.register(r"teams", TeamViewSet, basename="team")
 
 role_urlpatterns = role_router.urls + [
+    path(
+        "employees/<uuid:pk>/confirm/",
+        EmployeeConfirmView.as_view(),
+        name="employee-confirm",
+    ),
+    path(
+        "users/<uuid:user_id>/personnel/",
+        UserPersonnelDetailView.as_view(),
+        name="user-personnel-detail",
+    ),
     path("users/<uuid:user_id>/roles/", AssignRoleView.as_view(), name="user-role-assign"),
     path(
         "users/<uuid:user_id>/roles/<uuid:role_id>/",

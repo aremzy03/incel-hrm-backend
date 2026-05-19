@@ -38,3 +38,22 @@ class IsManagingDirector(_HasRole):
 
 class IsSupervisor(_HasRole):
     role_name = RoleName.SUPERVISOR
+
+
+class IsOwnerOrHR(BasePermission):
+    """
+    Object-level permission: the target user, HR role, or Django staff may access the object.
+    Used for personnel detail (self-service + HR).
+    """
+
+    def has_object_permission(self, request, view, obj):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        if getattr(obj, "pk", None) == user.pk:
+            return True
+        if user.has_role(RoleName.HR):
+            return True
+        if user.is_staff:
+            return True
+        return False

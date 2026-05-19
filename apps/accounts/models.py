@@ -14,6 +14,29 @@ class Gender(models.TextChoices):
     FEMALE = "FEMALE", "Female"
 
 
+class MaritalStatus(models.TextChoices):
+    SINGLE = "SINGLE", "Single"
+    MARRIED = "MARRIED", "Married"
+    DIVORCED = "DIVORCED", "Divorced"
+    WIDOWED = "WIDOWED", "Widowed"
+    SEPARATED = "SEPARATED", "Separated"
+    OTHER = "OTHER", "Other"
+
+
+class ConfirmationStatus(models.TextChoices):
+    PENDING = "PENDING", "Pending"
+    CONFIRMED = "CONFIRMED", "Confirmed"
+    NOT_APPLICABLE = "NOT_APPLICABLE", "Not applicable"
+
+
+class ContractType(models.TextChoices):
+    PERMANENT = "PERMANENT", "Permanent"
+    FIXED_TERM = "FIXED_TERM", "Fixed term"
+    CONTRACT = "CONTRACT", "Contract"
+    INTERN = "INTERN", "Intern"
+    OTHER = "OTHER", "Other"
+
+
 class RoleName(models.TextChoices):
     EMPLOYEE = "EMPLOYEE", "Employee"
     LINE_MANAGER = "LINE_MANAGER", "Line Manager"
@@ -222,6 +245,71 @@ class User(AbstractBaseUser, PermissionsMixin):
     date_joined = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
+    staff_id = models.CharField(max_length=64, null=True, blank=True)
+    date_of_employment = models.DateField(null=True, blank=True)
+    confirmation_status = models.CharField(
+        max_length=32,
+        choices=ConfirmationStatus.choices,
+        blank=True,
+    )
+    confirmation_date = models.DateField(null=True, blank=True)
+    marital_status = models.CharField(
+        max_length=20,
+        choices=MaritalStatus.choices,
+        blank=True,
+    )
+    last_promotion_date = models.DateField(null=True, blank=True)
+    is_exited = models.BooleanField(default=False)
+    exit_reason = models.TextField(blank=True)
+    job_role = models.CharField(max_length=150, blank=True)
+    cost_centre = models.CharField(max_length=100, blank=True)
+    regions = models.CharField(max_length=255, blank=True)
+    state_of_locations = models.CharField(max_length=100, blank=True)
+    state_of_origin = models.CharField(max_length=100, blank=True)
+    lga = models.CharField(max_length=100, blank=True)
+    religion = models.CharField(max_length=100, blank=True)
+    tenure_on_grade = models.CharField(max_length=100, blank=True)
+    completeness_score = models.PositiveSmallIntegerField(default=0)
+
+    state_of_residence = models.CharField(max_length=100, blank=True)
+    city_of_residence = models.CharField(max_length=100, blank=True)
+    landmark_of_residence = models.CharField(max_length=255, blank=True)
+    state_of_permanent_address = models.CharField(max_length=100, blank=True)
+    city_of_permanent_address = models.CharField(max_length=100, blank=True)
+    landmark_of_permanent_address = models.CharField(max_length=255, blank=True)
+    residential_address = models.TextField(blank=True)
+    permanent_address = models.TextField(blank=True)
+
+    qualification_school = models.CharField(max_length=255, blank=True)
+    qualification_course = models.CharField(max_length=255, blank=True)
+    qualification_degree = models.CharField(max_length=100, blank=True)
+    qualification_grade = models.CharField(max_length=50, blank=True)
+    qualification_start_date = models.DateField(null=True, blank=True)
+    qualification_end_date = models.DateField(null=True, blank=True)
+
+    certification_institution = models.CharField(max_length=255, blank=True)
+    certification_course = models.CharField(max_length=255, blank=True)
+    certification_issuing_body = models.CharField(max_length=255, blank=True)
+    certification_license_number = models.CharField(max_length=100, blank=True)
+    certification_start_date = models.DateField(null=True, blank=True)
+    certification_end_date = models.DateField(null=True, blank=True)
+
+    next_of_kin_title = models.CharField(max_length=20, blank=True)
+    next_of_kin_first_name = models.CharField(max_length=150, blank=True)
+    next_of_kin_last_name = models.CharField(max_length=150, blank=True)
+    next_of_kin_phone = models.CharField(max_length=20, blank=True)
+    next_of_kin_email = models.EmailField(blank=True)
+    next_of_kin_relationship = models.CharField(max_length=100, blank=True)
+    next_of_kin_address = models.TextField(blank=True)
+
+    contract_type = models.CharField(
+        max_length=20,
+        choices=ContractType.choices,
+        blank=True,
+    )
+    contract_start_date = models.DateField(null=True, blank=True)
+    contract_end_date = models.DateField(null=True, blank=True)
+
     objects = CustomUserManager()
 
     USERNAME_FIELD = "email"
@@ -231,6 +319,13 @@ class User(AbstractBaseUser, PermissionsMixin):
         verbose_name = "User"
         verbose_name_plural = "Users"
         ordering = ["-date_joined"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=("staff_id",),
+                condition=models.Q(staff_id__isnull=False) & ~models.Q(staff_id=""),
+                name="accounts_user_staff_id_unique_when_set",
+            ),
+        ]
 
     def get_full_name(self):
         return f"{self.first_name} {self.last_name}".strip()
@@ -248,6 +343,10 @@ class User(AbstractBaseUser, PermissionsMixin):
         if self.department_id:
             return getattr(self.department, "line_manager", None)
         return None
+
+    @property
+    def is_confirmed(self) -> bool:
+        return self.confirmation_status == ConfirmationStatus.CONFIRMED
 
     def __str__(self):
         return self.email

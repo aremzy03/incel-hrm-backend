@@ -1,9 +1,14 @@
+from datetime import date
+
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.db import transaction
 from rest_framework import serializers
 
-from .models import Department, Role, RoleName, Team, Unit, UserRole
+from rest_framework.exceptions import PermissionDenied
+
+from .models import ConfirmationStatus, Department, Role, RoleName, Team, Unit, UserRole
+from .personnel_completeness import compute_profile_completeness
 
 User = get_user_model()
 
@@ -338,6 +343,258 @@ class UserUpdateSerializer(serializers.ModelSerializer):
             setattr(instance, attr, value)
         instance.save()
         return instance
+
+
+class UserPersonnelReadSerializer(serializers.ModelSerializer):
+    """Full personnel payload for GET (official email is the same as login `email`)."""
+
+    full_name = serializers.SerializerMethodField()
+    official_email = serializers.SerializerMethodField()
+    age = serializers.SerializerMethodField()
+    length_of_service_years = serializers.SerializerMethodField()
+    is_confirmed = serializers.SerializerMethodField()
+    confirmed_date = serializers.DateField(source="confirmation_date", read_only=True)
+    department = _DepartmentMinimalSerializer(read_only=True)
+    unit = _UnitMinimalSerializer(read_only=True)
+    team = _TeamMinimalSerializer(read_only=True)
+
+    class Meta:
+        model = User
+        fields = (
+            "id",
+            "email",
+            "official_email",
+            "first_name",
+            "last_name",
+            "other_names",
+            "full_name",
+            "phone",
+            "gender",
+            "date_of_birth",
+            "age",
+            "department",
+            "unit",
+            "team",
+            "date_joined",
+            "updated_at",
+            "staff_id",
+            "date_of_employment",
+            "length_of_service_years",
+            "confirmation_status",
+            "confirmation_date",
+            "is_confirmed",
+            "confirmed_date",
+            "marital_status",
+            "last_promotion_date",
+            "is_exited",
+            "exit_reason",
+            "job_role",
+            "cost_centre",
+            "regions",
+            "state_of_locations",
+            "state_of_origin",
+            "lga",
+            "religion",
+            "state_of_residence",
+            "city_of_residence",
+            "landmark_of_residence",
+            "state_of_permanent_address",
+            "city_of_permanent_address",
+            "landmark_of_permanent_address",
+            "residential_address",
+            "permanent_address",
+            "qualification_school",
+            "qualification_course",
+            "qualification_degree",
+            "qualification_grade",
+            "qualification_start_date",
+            "qualification_end_date",
+            "certification_institution",
+            "certification_course",
+            "certification_issuing_body",
+            "certification_license_number",
+            "certification_start_date",
+            "certification_end_date",
+            "next_of_kin_title",
+            "next_of_kin_first_name",
+            "next_of_kin_last_name",
+            "next_of_kin_phone",
+            "next_of_kin_email",
+            "next_of_kin_relationship",
+            "next_of_kin_address",
+            "contract_type",
+            "contract_start_date",
+            "contract_end_date",
+            "tenure_on_grade",
+            "completeness_score",
+        )
+        read_only_fields = fields
+
+    def get_full_name(self, obj):
+        return obj.get_full_name()
+
+    def get_official_email(self, obj):
+        return obj.email
+
+    def get_age(self, obj):
+        if not obj.date_of_birth:
+            return None
+        born = obj.date_of_birth
+        today = date.today()
+        return today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+
+    def get_length_of_service_years(self, obj):
+        if not obj.date_of_employment:
+            return None
+        days = (date.today() - obj.date_of_employment).days
+        return round(days / 365.25, 2)
+
+    def get_is_confirmed(self, obj):
+        return obj.confirmation_status == ConfirmationStatus.CONFIRMED
+
+
+class UserPersonnelWriteSerializer(serializers.ModelSerializer):
+    """Writable personnel fields (including `email` as official/login). `completeness_score` is server-computed."""
+
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(),
+        required=False,
+    )
+    unit = serializers.PrimaryKeyRelatedField(
+        queryset=Unit.objects.select_related("department").all(),
+        required=False,
+        allow_null=True,
+    )
+    team = serializers.PrimaryKeyRelatedField(
+        queryset=Team.objects.select_related("unit", "unit__department").all(),
+        required=False,
+        allow_null=True,
+    )
+
+    class Meta:
+        model = User
+        fields = (
+            "email",
+            "first_name",
+            "last_name",
+            "other_names",
+            "phone",
+            "gender",
+            "date_of_birth",
+            "department",
+            "unit",
+            "team",
+            "staff_id",
+            "date_of_employment",
+            "marital_status",
+            "last_promotion_date",
+            "is_exited",
+            "exit_reason",
+            "job_role",
+            "cost_centre",
+            "regions",
+            "state_of_locations",
+            "state_of_origin",
+            "lga",
+            "religion",
+            "state_of_residence",
+            "city_of_residence",
+            "landmark_of_residence",
+            "state_of_permanent_address",
+            "city_of_permanent_address",
+            "landmark_of_permanent_address",
+            "residential_address",
+            "permanent_address",
+            "qualification_school",
+            "qualification_course",
+            "qualification_degree",
+            "qualification_grade",
+            "qualification_start_date",
+            "qualification_end_date",
+            "certification_institution",
+            "certification_course",
+            "certification_issuing_body",
+            "certification_license_number",
+            "certification_start_date",
+            "certification_end_date",
+            "next_of_kin_title",
+            "next_of_kin_first_name",
+            "next_of_kin_last_name",
+            "next_of_kin_phone",
+            "next_of_kin_email",
+            "next_of_kin_relationship",
+            "next_of_kin_address",
+            "contract_type",
+            "contract_start_date",
+            "contract_end_date",
+            "tenure_on_grade",
+        )
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        if request and request.user.is_authenticated and not request.user.has_role(RoleName.HR):
+            for key in ("confirmation_status", "confirmation_date"):
+                if key in self.initial_data:
+                    raise PermissionDenied("Only HR can update confirmation fields.")
+
+        instance = self.instance
+        if instance and attrs.get("department") is not None:
+            if instance.has_role(RoleName.EXECUTIVE_DIRECTOR) or instance.has_role(RoleName.MANAGING_DIRECTOR):
+                raise serializers.ValidationError(
+                    {"department": "Executive Director and Managing Director cannot belong to any department."}
+                )
+
+        if instance is not None:
+            new_department = attrs.get("department", instance.department)
+            new_unit = attrs.get("unit", instance.unit)
+            new_team = attrs.get("team", instance.team)
+
+            if new_unit is not None and new_department is not None:
+                if new_unit.department_id != new_department.pk:
+                    raise serializers.ValidationError(
+                        {"unit": "User unit must belong to the same department as the user."}
+                    )
+
+            if new_team is not None:
+                if new_unit is None:
+                    raise serializers.ValidationError(
+                        {"team": "User cannot be assigned to a team without being assigned to a unit."}
+                    )
+                if new_team.unit_id != new_unit.pk:
+                    raise serializers.ValidationError({"team": "User team must belong to the same unit as the user."})
+
+            if "department" in attrs and "unit" not in attrs and instance.unit_id is not None:
+                if new_department is not None and instance.unit.department_id != new_department.pk:
+                    raise serializers.ValidationError(
+                        {"department": "User cannot move departments without clearing or updating their unit."}
+                    )
+
+            if "unit" in attrs and "team" not in attrs and instance.team_id is not None:
+                if new_unit is None:
+                    raise serializers.ValidationError({"unit": "User cannot clear unit without also clearing team."})
+                if instance.team.unit_id != new_unit.pk:
+                    raise serializers.ValidationError(
+                        {"unit": "User cannot change unit without clearing or updating their team."}
+                    )
+
+        return attrs
+
+    def update(self, instance, validated_data):
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.completeness_score = compute_profile_completeness(instance)
+        instance.save()
+        return instance
+
+
+class UserPersonnelHRWriteSerializer(UserPersonnelWriteSerializer):
+    """HR-only personnel write; includes employment confirmation fields."""
+
+    class Meta(UserPersonnelWriteSerializer.Meta):
+        fields = UserPersonnelWriteSerializer.Meta.fields + (
+            "confirmation_status",
+            "confirmation_date",
+        )
 
 
 class UserDepartmentUpdateSerializer(serializers.Serializer):

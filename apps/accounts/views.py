@@ -1,6 +1,7 @@
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
+from django.utils import timezone
 from django.db.models import Case, Count, IntegerField, When
 from django.shortcuts import get_object_or_404
 from rest_framework import filters, generics, permissions, status, viewsets
@@ -10,6 +11,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import (
+    ConfirmationStatus,
     Department,
     DepartmentMembership,
     Team,
@@ -22,7 +24,7 @@ from .models import (
     UserRole,
 )
 from .throttles import PasswordChangeThrottle, RegisterThrottle
-from .permissions import IsExecutiveDirector, IsHR
+from .permissions import IsExecutiveDirector, IsHR, IsOwnerOrHR
 from .serializers import (
     BulkUserIdsSerializer,
     DepartmentLineManagerSerializer,
@@ -35,6 +37,9 @@ from .serializers import (
     UserDepartmentUpdateSerializer,
     PasswordChangeSerializer,
     PasswordResetSerializer,
+    UserPersonnelHRWriteSerializer,
+    UserPersonnelReadSerializer,
+    UserPersonnelWriteSerializer,
     UserRoleSerializer,
     UserSelfUpdateSerializer,
     UserSerializer,
@@ -69,6 +74,8 @@ __all__ = [
     "DepartmentBulkRemoveMembersView",
     "UnitViewSet",
     "TeamViewSet",
+    "UserPersonnelDetailView",
+    "EmployeeConfirmView",
 ]
 
 
@@ -197,6 +204,84 @@ class UserViewSet(viewsets.ModelViewSet):
         if self.action in ("update", "partial_update"):
             return UserUpdateSerializer
         return UserSerializer
+
+
+class UserPersonnelDetailView(generics.RetrieveUpdateAPIView):
+    """
+    GET    /api/v1/users/:user_id/personnel/ — full personnel record (owner, HR, or staff)
+    PUT    /api/v1/users/:user_id/personnel/ — replace writable personnel fields
+    PATCH  /api/v1/users/:user_id/personnel/ — partial update; returns read payload after save
+    """
+
+    queryset = User.objects.select_related(
+        "department",
+        "unit",
+        "unit__department",
+        "team",
+        "team__unit",
+    ).all()
+    lookup_field = "pk"
+    lookup_url_kwarg = "user_id"
+    permission_classes = [permissions.IsAuthenticated, IsOwnerOrHR]
+
+    def get_serializer_class(self):
+        if self.request.method in ("PUT", "PATCH"):
+            if self.request.user.has_role(RoleName.HR):
+                return UserPersonnelHRWriteSerializer
+            return UserPersonnelWriteSerializer
+        return UserPersonnelReadSerializer
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["request"] = self.request
+        return context
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.save()
+        return Response(
+            UserPersonnelReadSerializer(user, context={"request": request}).data,
+        )
+
+    def put(self, request, *args, **kwargs):
+        # Large personnel payloads: treat PUT like PATCH (merge), not a full replace.
+        kwargs["partial"] = True
+        return self.update(request, *args, **kwargs)
+
+    def partial_update(self, request, *args, **kwargs):
+        kwargs["partial"] = True
+        return self.update(request, *args, **kwargs)
+
+
+class EmployeeConfirmView(APIView):
+    """
+    PATCH /api/v1/employees/:pk/confirm/ — HR sets employment confirmation to CONFIRMED (today).
+    No API to unconfirm; use Django admin.
+    """
+
+    permission_classes = [permissions.IsAuthenticated, IsHR]
+
+    def patch(self, request, pk):
+        user = get_object_or_404(
+            User.objects.select_related(
+                "department",
+                "unit",
+                "unit__department",
+                "team",
+                "team__unit",
+            ),
+            pk=pk,
+        )
+        user.confirmation_status = ConfirmationStatus.CONFIRMED
+        user.confirmation_date = timezone.localdate()
+        user.save(update_fields=["confirmation_status", "confirmation_date", "updated_at"])
+        return Response(
+            UserPersonnelReadSerializer(user, context={"request": request}).data,
+            status=status.HTTP_200_OK,
+        )
 
 
 # ---------------------------------------------------------------------------
