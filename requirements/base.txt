@@ -10,3 +10,5 @@ redis
 python-decouple
 django-anymail
 gunicorn
+gevent
+psycogreen
