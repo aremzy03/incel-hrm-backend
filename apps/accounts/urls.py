@@ -18,6 +18,7 @@ from .views import (
     RemoveRoleView,
     RoleViewSet,
     TeamViewSet,
+    TutorialProgressView,
     UnitViewSet,
     UserDepartmentUpdateView,
     UserPersonnelDetailView,
@@ -30,6 +31,11 @@ auth_urlpatterns = [
     path("token/refresh/", ThrottledTokenRefreshView.as_view(), name="token-refresh"),
     path("register/", RegisterView.as_view(), name="register"),
     path("me/", MeView.as_view(), name="me"),
+    path(
+        "me/tutorial-progress/",
+        TutorialProgressView.as_view(),
+        name="tutorial-progress",
+    ),
     path("profile/", UserProfileView.as_view(), name="profile"),
     path("password/change/", PasswordChangeView.as_view(), name="password-change"),
 ]

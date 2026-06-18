@@ -7,7 +7,18 @@ from rest_framework import serializers
 
 from rest_framework.exceptions import PermissionDenied
 
-from .models import ConfirmationStatus, Department, Role, RoleName, Team, Unit, UserRole
+from .models import (
+    ConfirmationStatus,
+    Department,
+    Role,
+    RoleName,
+    Team,
+    TutorialProgressStatus,
+    Unit,
+    UserRole,
+    UserTutorialProgress,
+    VALID_TOUR_IDS,
+)
 from .personnel_completeness import compute_profile_completeness
 
 User = get_user_model()
@@ -763,3 +774,25 @@ class BulkUserIdsSerializer(serializers.Serializer):
                 seen.add(v)
                 unique_ids.append(v)
         return unique_ids
+
+
+# ---------------------------------------------------------------------------
+# Tutorial progress
+# ---------------------------------------------------------------------------
+
+
+class TutorialProgressSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UserTutorialProgress
+        fields = ("tour_id", "status", "updated_at")
+        read_only_fields = fields
+
+
+class TutorialProgressUpdateSerializer(serializers.Serializer):
+    tour_id = serializers.CharField(max_length=64)
+    action = serializers.ChoiceField(choices=("complete", "dismiss"))
+
+    def validate_tour_id(self, value):
+        if value not in VALID_TOUR_IDS:
+            raise serializers.ValidationError(f"Unknown tour_id: {value}")
+        return value

@@ -20,7 +20,7 @@ from rest_framework.exceptions import NotFound, PermissionDenied, ValidationErro
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.accounts.models import RoleName
+from apps.accounts.models import RoleName, get_or_create_management_department
 from apps.accounts.permissions import IsHR
 
 from .models import (
@@ -29,6 +29,7 @@ from .models import (
     LoanApprovalAction,
     LoanApprovalLog,
     LoanRepaymentSchedule,
+    LoanSettings,
     LoanType,
 )
 from .serializers import (
@@ -37,15 +38,23 @@ from .serializers import (
     LoanApplicationReadSerializer,
     LoanApprovalLogSerializer,
     LoanRepaymentSchedulePaymentStatusSerializer,
+    LoanSettingsSerializer,
     LoanTypeSerializer,
 )
-from .services import LoanEligibilityService
+from .services import (
+    LoanEligibilityService,
+    can_view_all_loans,
+    get_loan_settings,
+    is_loan_observer,
+    is_loan_privileged,
+)
 from .tasks import (
+    notify_loan_approver_required,
     notify_loan_closed,
     notify_loan_decision,
     notify_loan_disbursed,
     notify_loan_liquidated,
-    notify_loan_submitted,
+    notify_loan_observers,
     notify_next_approver,
 )
 
@@ -61,6 +70,10 @@ _TERMINAL_STATUSES = frozenset({
 })
 
 _APPROVAL_TRANSITIONS = {
+    LoanApplicationStatus.PENDING_MANAGER: (
+        LoanApplicationStatus.PENDING_HR,
+        RoleName.LINE_MANAGER,
+    ),
     LoanApplicationStatus.PENDING_HR: (
         LoanApplicationStatus.PENDING_ED,
         RoleName.HR,
@@ -76,6 +89,7 @@ _APPROVAL_TRANSITIONS = {
 }
 
 _REJECTION_ROLES = {
+    LoanApplicationStatus.PENDING_MANAGER: RoleName.LINE_MANAGER,
     LoanApplicationStatus.PENDING_HR: RoleName.HR,
     LoanApplicationStatus.PENDING_ED: RoleName.EXECUTIVE_DIRECTOR,
     LoanApplicationStatus.PENDING_MD: RoleName.MANAGING_DIRECTOR,
@@ -86,12 +100,45 @@ _HR_PATCH_FIELDS = frozenset({"amount", "tenure_months", "purpose", "loan_type"}
 
 
 def _is_privileged(user) -> bool:
-    return (
-        user.is_staff
-        or user.has_role(RoleName.HR)
-        or user.has_role(RoleName.EXECUTIVE_DIRECTOR)
-        or user.has_role(RoleName.MANAGING_DIRECTOR)
-    )
+    return is_loan_privileged(user)
+
+
+def _line_manager_visibility_q(user) -> Q:
+    manager_pred = Q(pk__isnull=True)
+    if user.has_role(RoleName.LINE_MANAGER):
+        if getattr(user, "department_id", None):
+            manager_pred = Q(employee__department_id=user.department_id)
+        mgmt = get_or_create_management_department()
+        if mgmt.line_manager_id == user.pk:
+            manager_pred = manager_pred | Q(manager_approver_is_management=True)
+    return manager_pred
+
+
+def _can_view_loan(user, loan) -> bool:
+    if loan.employee_id == user.pk:
+        return True
+    if can_view_all_loans(user):
+        return True
+    return LoanApplication.objects.filter(
+        Q(pk=loan.pk) & _line_manager_visibility_q(user)
+    ).exists()
+
+
+def _enforce_pending_manager_identity(*, loan, user) -> None:
+    if loan.status != LoanApplicationStatus.PENDING_MANAGER:
+        return
+    if loan.manager_approver_is_management:
+        mgmt = get_or_create_management_department()
+        if mgmt.line_manager_id != user.pk:
+            raise PermissionDenied(
+                "Only the Management department line manager can act at this stage for this application."
+            )
+        return
+    lm = loan.employee.get_department_line_manager()
+    if not lm or lm.pk != user.pk:
+        raise PermissionDenied(
+            "Only the employee's department line manager can act at this stage."
+        )
 
 
 def _create_loan_log(*, loan, actor, action, previous_status, new_status, comment=""):
@@ -160,8 +207,20 @@ def _employee_display_name(user) -> str:
     return full or user.email
 
 
+class IsHROrLoanObserver(permissions.BasePermission):
+    """HR staff or members of the configured loan observer department/unit."""
+
+    message = "You do not have permission to access loan reports."
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        return user.has_role(RoleName.HR) or is_loan_observer(user)
+
+
 class CanViewEmployeeLoanLedger(permissions.BasePermission):
-    """HR, Executive Director, Managing Director, or the employee themself."""
+    """HR, ED, MD, loan observer, or the employee themself."""
 
     message = "You do not have permission to view this employee's loan ledger."
 
@@ -174,11 +233,42 @@ class CanViewEmployeeLoanLedger(permissions.BasePermission):
             return False
         if str(user.pk) == str(employee_id):
             return True
+        if is_loan_observer(user):
+            return True
         return (
             user.has_role(RoleName.HR)
             or user.has_role(RoleName.EXECUTIVE_DIRECTOR)
             or user.has_role(RoleName.MANAGING_DIRECTOR)
         )
+
+
+# ---------------------------------------------------------------------------
+# Loan settings (HR only)
+# ---------------------------------------------------------------------------
+
+
+class LoanSettingsView(APIView):
+    """
+    GET /api/v1/loan-settings/ — read loan module configuration (HR only)
+    PATCH /api/v1/loan-settings/ — update loan module configuration (HR only)
+    """
+
+    permission_classes = [permissions.IsAuthenticated, IsHR]
+
+    def get(self, request, *args, **kwargs):
+        settings_obj = LoanSettings.get_solo()
+        return Response(LoanSettingsSerializer(settings_obj).data)
+
+    def patch(self, request, *args, **kwargs):
+        settings_obj = LoanSettings.get_solo()
+        serializer = LoanSettingsSerializer(
+            settings_obj,
+            data=request.data,
+            partial=True,
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(LoanSettingsSerializer(settings_obj).data)
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +284,7 @@ class ReportOutstandingLoansView(APIView):
     Query: ?loan_type=<uuid>&employee=<uuid>&format=csv
     """
 
-    permission_classes = [permissions.IsAuthenticated, IsHR]
+    permission_classes = [permissions.IsAuthenticated, IsHROrLoanObserver]
 
     def get(self, request, *args, **kwargs):
         today = timezone.localdate()
@@ -257,7 +347,7 @@ class ReportScheduleSummaryView(APIView):
     Query: ?format=csv
     """
 
-    permission_classes = [permissions.IsAuthenticated, IsHR]
+    permission_classes = [permissions.IsAuthenticated, IsHROrLoanObserver]
 
     def get(self, request, *args, **kwargs):
         today = timezone.localdate()
@@ -437,17 +527,18 @@ class LoanApplicationViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         qs = (
-            LoanApplication.objects.select_related("employee", "loan_type")
+            LoanApplication.objects.select_related("employee", "loan_type", "employee__department")
             .prefetch_related("repayment_schedule")
             .all()
         )
 
-        if not _is_privileged(user):
-            qs = qs.filter(employee=user)
-        else:
+        if can_view_all_loans(user):
             employee_id = self.request.query_params.get("employee")
             if employee_id:
                 qs = qs.filter(employee_id=employee_id)
+        else:
+            visible_q = Q(employee=user) | _line_manager_visibility_q(user)
+            qs = qs.filter(visible_q).distinct()
 
         status_param = self.request.query_params.get("status")
         if status_param:
@@ -551,13 +642,13 @@ class LoanApplicationViewSet(viewsets.ModelViewSet):
 
     def retrieve(self, request, *args, **kwargs):
         loan = _get_loan(kwargs["pk"])
-        if not _is_privileged(request.user) and loan.employee != request.user:
+        if not _can_view_loan(request.user, loan):
             raise PermissionDenied("You do not have permission to view this loan application.")
         serializer = self.get_serializer(loan)
         return Response(serializer.data)
 
     # ------------------------------------------------------------------
-    # submit — Employee: DRAFT → PENDING_HR
+    # submit — Employee: DRAFT → PENDING_MANAGER or PENDING_HR
     # ------------------------------------------------------------------
 
     @action(detail=True, methods=["post"], url_path="submit")
@@ -578,12 +669,45 @@ class LoanApplicationViewSet(viewsets.ModelViewSet):
 
         LoanEligibilityService.check_eligibility(request.user)
 
+        loan_settings = get_loan_settings()
+        employee = request.user
+        manager_approver_is_management = False
+
+        if loan_settings.require_line_manager_approval:
+            new_status = LoanApplicationStatus.PENDING_MANAGER
+            if employee.has_role(RoleName.LINE_MANAGER):
+                manager_approver_is_management = True
+            if manager_approver_is_management:
+                mgmt = get_or_create_management_department()
+                if mgmt.line_manager_id is None:
+                    raise ValidationError(
+                        {
+                            "department": (
+                                "Management department has no line manager assigned. Contact HR."
+                            )
+                        }
+                    )
+            else:
+                lm = employee.get_department_line_manager()
+                if lm is None:
+                    raise ValidationError(
+                        {
+                            "department": (
+                                "Your department has no line manager assigned. Contact HR."
+                            )
+                        }
+                    )
+        else:
+            new_status = LoanApplicationStatus.PENDING_HR
+
         prev_status = loan.status
-        new_status = LoanApplicationStatus.PENDING_HR
 
         with transaction.atomic():
             loan.status = new_status
-            loan.save(update_fields=["status", "updated_at"])
+            loan.manager_approver_is_management = manager_approver_is_management
+            loan.save(
+                update_fields=["status", "manager_approver_is_management", "updated_at"]
+            )
             _create_loan_log(
                 loan=loan,
                 actor=request.user,
@@ -593,12 +717,21 @@ class LoanApplicationViewSet(viewsets.ModelViewSet):
                 comment=request.data.get("comment", "Submitted for approval."),
             )
 
-        transaction.on_commit(lambda: notify_loan_submitted.delay(str(loan.id)))
+        loan_id = str(loan.id)
+        if loan_settings.require_line_manager_approval:
+            transaction.on_commit(
+                lambda lid=loan_id: notify_loan_approver_required.delay(lid)
+            )
+        else:
+            transaction.on_commit(
+                lambda lid=loan_id: notify_loan_approver_required.delay(lid)
+            )
+            transaction.on_commit(lambda lid=loan_id: notify_loan_observers.delay(lid))
 
         return Response(LoanApplicationReadSerializer(loan).data)
 
     # ------------------------------------------------------------------
-    # approve — HR → ED → MD → APPROVED
+    # approve — LM → HR → ED → MD → APPROVED
     # ------------------------------------------------------------------
 
     @action(detail=True, methods=["post"], url_path="approve")
@@ -624,6 +757,8 @@ class LoanApplicationViewSet(viewsets.ModelViewSet):
                 f"(current status: {loan.status})."
             )
 
+        _enforce_pending_manager_identity(loan=loan, user=user)
+
         comment = request.data.get("comment", "").strip()
         if loan.status == LoanApplicationStatus.PENDING_MD and not comment:
             raise ValidationError(
@@ -644,21 +779,25 @@ class LoanApplicationViewSet(viewsets.ModelViewSet):
                 comment=comment,
             )
 
+        loan_id = str(loan.id)
         if next_status == LoanApplicationStatus.APPROVED:
             transaction.on_commit(
-                lambda lid=str(loan.id), c=comment: notify_loan_decision.delay(
+                lambda lid=loan_id, c=comment: notify_loan_decision.delay(
                     lid,
                     LoanApplicationStatus.APPROVED,
                     c,
                 )
             )
+        elif next_status == LoanApplicationStatus.PENDING_HR:
+            transaction.on_commit(
+                lambda lid=loan_id: notify_loan_approver_required.delay(lid)
+            )
+            transaction.on_commit(lambda lid=loan_id: notify_loan_observers.delay(lid))
         elif next_status in (
             LoanApplicationStatus.PENDING_ED,
             LoanApplicationStatus.PENDING_MD,
         ):
-            transaction.on_commit(
-                lambda lid=str(loan.id): notify_next_approver.delay(lid)
-            )
+            transaction.on_commit(lambda lid=loan_id: notify_next_approver.delay(lid))
 
         return Response(LoanApplicationReadSerializer(loan).data)
 
@@ -689,6 +828,8 @@ class LoanApplicationViewSet(viewsets.ModelViewSet):
             raise PermissionDenied(
                 f"Only a user with role '{required_role}' can reject at this stage."
             )
+
+        _enforce_pending_manager_identity(loan=loan, user=request.user)
 
         prev_status = loan.status
 
@@ -891,15 +1032,15 @@ class LoanApplicationViewSet(viewsets.ModelViewSet):
         return Response(LoanApplicationReadSerializer(loan).data)
 
     # ------------------------------------------------------------------
-    # logs — HR, ED, MD only
+    # logs — HR, ED, MD, observers
     # ------------------------------------------------------------------
 
     @action(detail=True, methods=["get"], url_path="logs")
     def logs(self, request, pk=None):
-        if not _is_privileged(request.user):
+        loan = _get_loan(pk)
+        if not _can_view_loan(request.user, loan):
             raise PermissionDenied("You do not have permission to view loan approval logs.")
 
-        loan = _get_loan(pk)
         logs_qs = loan.logs.select_related("actor").all()
         serializer = LoanApprovalLogSerializer(logs_qs, many=True)
         return Response(serializer.data)

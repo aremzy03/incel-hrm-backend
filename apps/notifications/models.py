@@ -15,6 +15,8 @@ class NotificationType(models.TextChoices):
     LOAN_DISBURSED = "LOAN_DISBURSED", "Loan disbursed"
     LOAN_LIQUIDATED = "LOAN_LIQUIDATED", "Loan liquidated"
     LOAN_CLOSED = "LOAN_CLOSED", "Loan closed"
+    LOAN_OBSERVER_NOTICE = "LOAN_OBSERVER_NOTICE", "Loan observer notice"
+    LOAN_ACTION_REQUIRED = "LOAN_ACTION_REQUIRED", "Loan action required"
 
 
 class Notification(models.Model):

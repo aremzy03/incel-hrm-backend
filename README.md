@@ -245,19 +245,26 @@ requirements/         - Pip requirement files split by environment
 
 ## Loan management
 
-Staff loan applications: types are read-only; employees create **draft** applications, submit them for approval (HR → Executive Director → Managing Director), then HR **disburses** approved loans to **ACTIVE** (repayment schedule is generated). HR may **reject** at the matching stage (comment required), **liquidate** an ACTIVE loan, or **handle resignation** (ACTIVE → CLOSED). **DELETE** on an application is not supported (`405`). Approval logs (`GET .../logs/`) are visible to HR, Executive Director, Managing Director, and Django admin staff (`is_staff`), not to ordinary employees.
+Staff loan applications: types are read-only; employees create **draft** applications and submit them for approval. By default, the employee's **department line manager** approves first (`PENDING_MANAGER`), then **HR → Executive Director → Managing Director**. HR can turn off line-manager approval via **loan settings** (submit then goes straight to `PENDING_HR`). HR **disburses** approved loans to **ACTIVE** (repayment schedule is generated). HR may **reject** at the matching stage (comment required), **liquidate** an ACTIVE loan, or **handle resignation** (ACTIVE → CLOSED). **DELETE** on an application is not supported (`405`).
 
-Run migrations so `LoanType`, `LoanApplication`, and related tables exist.
+Approval logs (`GET .../logs/`) are visible to HR, Executive Director, Managing Director, Django admin staff (`is_staff`), configured **observer** department/unit members, and line managers for loans in their scope.
+
+**Loan settings** (`GET` / `PATCH /api/v1/loan-settings/`, HR only): `require_line_manager_approval` (default `true`), and optionally `observer_department_id` **or** `observer_unit_id` (mutually exclusive) for read-only Finance-style visibility. Observers are notified when a loan enters HR review (after line-manager approval if enabled, or on submit if LM approval is off). Observers can list/retrieve applications, view logs, and access loan reports; they cannot approve or disburse.
+
+Toggling `require_line_manager_approval` does **not** move in-flight applications.
+
+Run migrations so `LoanType`, `LoanApplication`, `LoanSettings`, and related tables exist.
 
 ### REST endpoints (prefix `/api/v1/`)
 
 | Area | Method | Endpoint | Notes |
 |------|--------|----------|--------|
+| Loan settings | GET, PATCH | `/loan-settings/` | HR only |
 | Loan types | GET | `/loan-types/` | Authenticated |
 | Applications | GET, POST | `/loan-applications/` | List (scoped); create draft |
 | Application | GET, PATCH | `/loan-applications/<uuid>/` | Owner (draft) or HR (non-terminal) |
-| Submit | POST | `/loan-applications/<uuid>/submit/` | Owner; DRAFT only; confirmed staff; eligibility checks |
-| Approve | POST | `/loan-applications/<uuid>/approve/` | HR / ED / MD by stage; MD step requires `comment` |
+| Submit | POST | `/loan-applications/<uuid>/submit/` | Owner; DRAFT only; confirmed staff; dept LM required when LM approval on |
+| Approve | POST | `/loan-applications/<uuid>/approve/` | LM (if enabled) / HR / ED / MD by stage; MD step requires `comment` |
 | Reject | POST | `/loan-applications/<uuid>/reject/` | Stage approver; `comment` required |
 | Disburse | POST | `/loan-applications/<uuid>/disburse/` | HR; APPROVED → ACTIVE; notifies employee |
 | Liquidate | POST | `/loan-applications/<uuid>/liquidate/` | HR; ACTIVE → LIQUIDATED; notifies employee |
@@ -265,10 +272,10 @@ Run migrations so `LoanType`, `LoanApplication`, and related tables exist.
 | Repayment status | PATCH | `/loan-applications/<uuid>/repayment-schedule/<installment_id>/` | HR only; body `{"payment_status":"PENDING"|"PAID"|"OVERDUE"}`; ACTIVE loans; recalculates `outstanding_balance` |
 
 **Overdue automation:** PENDING installments on **ACTIVE** loans with `due_date` before today are set to **OVERDUE** when loans are listed/retrieved, and daily at 00:05 UTC via Celery beat (`mark_overdue_loan_installments`). PAID rows are never changed.
-| Logs | GET | `/loan-applications/<uuid>/logs/` | HR, ED, MD, `is_staff` |
+| Logs | GET | `/loan-applications/<uuid>/logs/` | HR, ED, MD, `is_staff`, observers, scoped line managers |
 | Delete | DELETE | `/loan-applications/<uuid>/` | **405** — not implemented |
 
-Query params on list (privileged users): `employee`, `status`, `loan_type`.
+Query params on list (privileged users and observers): `employee`, `status`, `loan_type`.
 
 ### Postman collection (manual / Collection Runner)
 

@@ -3,6 +3,7 @@ from rest_framework.routers import DefaultRouter
 
 from .views import (
     LoanApplicationViewSet,
+    LoanSettingsView,
     LoanTypeViewSet,
     ReportEmployeeLoanLedgerView,
     ReportOutstandingLoansView,
@@ -14,6 +15,11 @@ router.register(r"loan-types", LoanTypeViewSet, basename="loan-type")
 router.register(r"loan-applications", LoanApplicationViewSet, basename="loan-application")
 
 urlpatterns = [
+    path(
+        "loan-settings/",
+        LoanSettingsView.as_view(),
+        name="loan-settings",
+    ),
     path(
         "loans/reports/outstanding/",
         ReportOutstandingLoansView.as_view(),

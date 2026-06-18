@@ -1,12 +1,15 @@
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
+from apps.accounts.models import Department, Unit
+
 from .models import (
     LoanApplication,
     LoanApplicationStatus,
     LoanApprovalLog,
     LoanRepaymentPaymentStatus,
     LoanRepaymentSchedule,
+    LoanSettings,
     LoanType,
 )
 from .services import LoanEligibilityService
@@ -30,6 +33,64 @@ class _ActorMinimalSerializer(serializers.ModelSerializer):
         model = User
         fields = ("first_name", "last_name")
         read_only_fields = fields
+
+
+class _DepartmentMinimalSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Department
+        fields = ("id", "name")
+        read_only_fields = fields
+
+
+class _UnitMinimalSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Unit
+        fields = ("id", "name")
+        read_only_fields = fields
+
+
+# ---------------------------------------------------------------------------
+# LoanSettings
+# ---------------------------------------------------------------------------
+
+class LoanSettingsSerializer(serializers.ModelSerializer):
+    observer_department = _DepartmentMinimalSerializer(read_only=True)
+    observer_unit = _UnitMinimalSerializer(read_only=True)
+    observer_department_id = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.all(),
+        source="observer_department",
+        allow_null=True,
+        required=False,
+        write_only=True,
+    )
+    observer_unit_id = serializers.PrimaryKeyRelatedField(
+        queryset=Unit.objects.all(),
+        source="observer_unit",
+        allow_null=True,
+        required=False,
+        write_only=True,
+    )
+
+    class Meta:
+        model = LoanSettings
+        fields = (
+            "require_line_manager_approval",
+            "observer_department",
+            "observer_unit",
+            "observer_department_id",
+            "observer_unit_id",
+            "updated_at",
+        )
+        read_only_fields = ("updated_at",)
+
+    def validate(self, attrs):
+        dept = attrs.get("observer_department", getattr(self.instance, "observer_department", None))
+        unit = attrs.get("observer_unit", getattr(self.instance, "observer_unit", None))
+        if dept is not None and unit is not None:
+            raise serializers.ValidationError(
+                "observer_department_id and observer_unit_id are mutually exclusive."
+            )
+        return attrs
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +191,7 @@ class LoanApplicationReadSerializer(serializers.ModelSerializer):
             "disbursed_at",
             "closed_at",
             "resignation_deducted",
+            "manager_approver_is_management",
             "repayment_schedule",
             "created_at",
             "updated_at",

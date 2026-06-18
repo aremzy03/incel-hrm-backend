@@ -6,47 +6,27 @@ Postman MCP ``runCollection`` is not wired to this agent; these tests provide th
 
 from unittest.mock import patch
 
-from django.contrib.auth import get_user_model
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from apps.accounts.models import ConfirmationStatus, Role, RoleName, UserRole
-from apps.loan.models import LoanApplicationStatus, LoanType
+from apps.accounts.models import RoleName
+from apps.loan.models import LoanApplicationStatus
 
-User = get_user_model()
-
-
-def ensure_role(name: str) -> Role:
-    role, _ = Role.objects.get_or_create(name=name, defaults={"description": name})
-    return role
-
-
-def make_user(email: str, *, password="testpass123", roles=None, **extra):
-    user = User.objects.create_user(
-        email=email,
-        password=password,
-        confirmation_status=ConfirmationStatus.CONFIRMED,
-        **extra,
-    )
-    for role_name in roles or []:
-        role = ensure_role(role_name)
-        UserRole.objects.get_or_create(user=user, role=role)
-    return user
+from .helpers import (
+    ensure_role,
+    make_loan_type,
+    make_user,
+    setup_department_with_line_manager,
+)
 
 
-def make_loan_type():
-    return LoanType.objects.get_or_create(
-        name="API Test Loan Type",
-        defaults={"description": "For loan API tests"},
-    )[0]
-
-
+@patch("apps.loan.views.notify_loan_observers.delay")
+@patch("apps.loan.views.notify_loan_approver_required.delay")
 @patch("apps.loan.views.notify_loan_closed.delay")
 @patch("apps.loan.views.notify_loan_liquidated.delay")
 @patch("apps.loan.views.notify_loan_disbursed.delay")
 @patch("apps.loan.views.notify_loan_decision.delay")
-@patch("apps.loan.views.notify_loan_submitted.delay")
 @patch("apps.loan.views.notify_next_approver.delay")
 class LoanAPIEndpointTests(APITestCase):
     """Covers list/create/retrieve/patch/submit/approve/reject/disburse/liquidate/resignation/logs/DELETE."""
@@ -54,18 +34,26 @@ class LoanAPIEndpointTests(APITestCase):
     def setUp(self):
         for name in (
             RoleName.EMPLOYEE,
+            RoleName.LINE_MANAGER,
             RoleName.HR,
             RoleName.EXECUTIVE_DIRECTOR,
             RoleName.MANAGING_DIRECTOR,
         ):
             ensure_role(name)
 
-        self.employee = make_user("loan-emp@test.com", roles=[RoleName.EMPLOYEE])
+        self.department, self.line_manager = setup_department_with_line_manager(
+            dept_name="Endpoint Test Dept"
+        )
+        self.employee = make_user(
+            "loan-emp@test.com",
+            roles=[RoleName.EMPLOYEE],
+            department=self.department,
+        )
         self.hr = make_user("loan-hr@test.com", roles=[RoleName.HR])
         self.ed = make_user("loan-ed@test.com", roles=[RoleName.EXECUTIVE_DIRECTOR])
         self.md = make_user("loan-md@test.com", roles=[RoleName.MANAGING_DIRECTOR])
 
-        self.loan_type = make_loan_type()
+        self.loan_type = make_loan_type("API Test Loan Type")
 
     def _loan_list_url(self):
         return reverse("loan-application-list")
@@ -76,39 +64,14 @@ class LoanAPIEndpointTests(APITestCase):
     def _action(self, pk, action):
         return reverse(f"loan-application-{action}", kwargs={"pk": str(pk)})
 
-    def test_loan_types_list_authenticated(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
-        self.client.force_authenticate(self.employee)
-        r = self.client.get(reverse("loan-type-list"))
-        self.assertEqual(r.status_code, status.HTTP_200_OK)
-        self.assertGreaterEqual(len(r.data), 1)
-
-    def test_full_workflow_disburse_logs_delete_405(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
-        self.client.force_authenticate(self.employee)
-        create = self.client.post(
-            self._loan_list_url(),
-            {
-                "loan_type": str(self.loan_type.id),
-                "amount": "5000.00",
-                "tenure_months": 6,
-                "purpose": "API test",
-            },
+    def _approve_full_chain(self, loan_id):
+        self.client.force_authenticate(self.line_manager)
+        r = self.client.post(
+            self._action(loan_id, "approve"),
+            {"comment": "LM ok"},
             format="json",
         )
-        self.assertEqual(create.status_code, status.HTTP_201_CREATED, create.data)
-        loan_id = create.data["id"]
-
-        r = self.client.get(self._loan_detail_url(loan_id))
-        self.assertEqual(r.status_code, status.HTTP_200_OK)
-
-        r = self.client.patch(
-            self._loan_detail_url(loan_id),
-            {"amount": "5200.00"},
-            format="json",
-        )
-        self.assertEqual(r.status_code, status.HTTP_200_OK)
-
-        r = self.client.post(self._action(loan_id, "submit"), {}, format="json")
-        self.assertEqual(r.status_code, status.HTTP_200_OK)
+        self.assertEqual(r.status_code, status.HTTP_200_OK, r.data)
         self.assertEqual(r.data["status"], LoanApplicationStatus.PENDING_HR)
 
         self.client.force_authenticate(self.hr)
@@ -138,6 +101,43 @@ class LoanAPIEndpointTests(APITestCase):
         self.assertEqual(r.status_code, status.HTTP_200_OK)
         self.assertEqual(r.data["status"], LoanApplicationStatus.APPROVED)
 
+    def test_loan_types_list_authenticated(self, *_mocks):
+        self.client.force_authenticate(self.employee)
+        r = self.client.get(reverse("loan-type-list"))
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+        self.assertGreaterEqual(len(r.data), 1)
+
+    def test_full_workflow_disburse_logs_delete_405(self, *_mocks):
+        self.client.force_authenticate(self.employee)
+        create = self.client.post(
+            self._loan_list_url(),
+            {
+                "loan_type": str(self.loan_type.id),
+                "amount": "5000.00",
+                "tenure_months": 6,
+                "purpose": "API test",
+            },
+            format="json",
+        )
+        self.assertEqual(create.status_code, status.HTTP_201_CREATED, create.data)
+        loan_id = create.data["id"]
+
+        r = self.client.get(self._loan_detail_url(loan_id))
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+
+        r = self.client.patch(
+            self._loan_detail_url(loan_id),
+            {"amount": "5200.00"},
+            format="json",
+        )
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+
+        r = self.client.post(self._action(loan_id, "submit"), {}, format="json")
+        self.assertEqual(r.status_code, status.HTTP_200_OK)
+        self.assertEqual(r.data["status"], LoanApplicationStatus.PENDING_MANAGER)
+
+        self._approve_full_chain(loan_id)
+
         self.client.force_authenticate(self.hr)
         r = self.client.post(self._action(loan_id, "disburse"), {}, format="json")
         self.assertEqual(r.status_code, status.HTTP_200_OK)
@@ -152,7 +152,7 @@ class LoanAPIEndpointTests(APITestCase):
         r = self.client.delete(self._loan_detail_url(loan_id))
         self.assertEqual(r.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
 
-    def test_reject_at_hr_stage(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
+    def test_reject_at_hr_stage(self, *_mocks):
         self.client.force_authenticate(self.employee)
         create = self.client.post(
             self._loan_list_url(),
@@ -167,6 +167,13 @@ class LoanAPIEndpointTests(APITestCase):
         loan_id = create.data["id"]
         self.client.post(self._action(loan_id, "submit"), {}, format="json")
 
+        self.client.force_authenticate(self.line_manager)
+        self.client.post(
+            self._action(loan_id, "approve"),
+            {"comment": "LM ok"},
+            format="json",
+        )
+
         self.client.force_authenticate(self.hr)
         r = self.client.post(
             self._action(loan_id, "reject"),
@@ -176,8 +183,12 @@ class LoanAPIEndpointTests(APITestCase):
         self.assertEqual(r.status_code, status.HTTP_200_OK)
         self.assertEqual(r.data["status"], LoanApplicationStatus.REJECTED)
 
-    def test_liquidate_active_loan(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
-        emp = make_user("loan-emp-liq@test.com", roles=[RoleName.EMPLOYEE])
+    def test_liquidate_active_loan(self, *_mocks):
+        emp = make_user(
+            "loan-emp-liq@test.com",
+            roles=[RoleName.EMPLOYEE],
+            department=self.department,
+        )
         self.client.force_authenticate(emp)
         create = self.client.post(
             self._loan_list_url(),
@@ -191,15 +202,7 @@ class LoanAPIEndpointTests(APITestCase):
         )
         loan_id = create.data["id"]
         self.client.post(self._action(loan_id, "submit"), {}, format="json")
-        for user, comment in (
-            (self.hr, "HR"),
-            (self.ed, "ED"),
-            (self.md, "MD comment for liquidate path"),
-        ):
-            self.client.force_authenticate(user)
-            body = {"comment": comment} if user == self.md else {"comment": comment}
-            r = self.client.post(self._action(loan_id, "approve"), body, format="json")
-            self.assertEqual(r.status_code, status.HTTP_200_OK, (user.email, r.data))
+        self._approve_full_chain(loan_id)
 
         self.client.force_authenticate(self.hr)
         r = self.client.post(self._action(loan_id, "disburse"), {}, format="json")
@@ -209,8 +212,12 @@ class LoanAPIEndpointTests(APITestCase):
         self.assertEqual(r.status_code, status.HTTP_200_OK)
         self.assertEqual(r.data["status"], LoanApplicationStatus.LIQUIDATED)
 
-    def test_handle_resignation_active_loan(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
-        emp = make_user("loan-emp-resign@test.com", roles=[RoleName.EMPLOYEE])
+    def test_handle_resignation_active_loan(self, *_mocks):
+        emp = make_user(
+            "loan-emp-resign@test.com",
+            roles=[RoleName.EMPLOYEE],
+            department=self.department,
+        )
         self.client.force_authenticate(emp)
         create = self.client.post(
             self._loan_list_url(),
@@ -224,18 +231,7 @@ class LoanAPIEndpointTests(APITestCase):
         )
         loan_id = create.data["id"]
         self.client.post(self._action(loan_id, "submit"), {}, format="json")
-        for user, comment in (
-            (self.hr, "HR"),
-            (self.ed, "ED"),
-            (self.md, "MD comment for resignation path"),
-        ):
-            self.client.force_authenticate(user)
-            r = self.client.post(
-                self._action(loan_id, "approve"),
-                {"comment": comment},
-                format="json",
-            )
-            self.assertEqual(r.status_code, status.HTTP_200_OK, r.data)
+        self._approve_full_chain(loan_id)
 
         self.client.force_authenticate(self.hr)
         r = self.client.post(self._action(loan_id, "disburse"), {}, format="json")

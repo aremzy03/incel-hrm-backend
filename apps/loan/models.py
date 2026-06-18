@@ -41,6 +41,7 @@ class LoanType(TimeStampedModel):
 
 class LoanApplicationStatus(models.TextChoices):
     DRAFT = "DRAFT", "Draft"
+    PENDING_MANAGER = "PENDING_MANAGER", "Pending Line Manager"
     PENDING_HR = "PENDING_HR", "Pending HR"
     PENDING_ED = "PENDING_ED", "Pending Executive Director"
     PENDING_MD = "PENDING_MD", "Pending Managing Director"
@@ -89,6 +90,10 @@ class LoanApplication(TimeStampedModel):
     disbursed_at = models.DateTimeField(null=True, blank=True)
     closed_at = models.DateTimeField(null=True, blank=True)
     resignation_deducted = models.BooleanField(default=False)
+    manager_approver_is_management = models.BooleanField(
+        default=False,
+        help_text="If True, the PENDING_MANAGER approver is Management department line manager.",
+    )
 
     class Meta:
         verbose_name = "Loan Application"
@@ -194,3 +199,38 @@ class LoanApprovalLog(models.Model):
             f"{self.actor} {self.action} on loan {self.loan_id} "
             f"at {self.timestamp:%Y-%m-%d %H:%M}"
         )
+
+
+# ---------------------------------------------------------------------------
+# LoanSettings (singleton)
+# ---------------------------------------------------------------------------
+
+class LoanSettings(models.Model):
+    require_line_manager_approval = models.BooleanField(default=True)
+    observer_department = models.ForeignKey(
+        "accounts.Department",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    observer_unit = models.ForeignKey(
+        "accounts.Unit",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Loan settings"
+        verbose_name_plural = "Loan settings"
+
+    @classmethod
+    def get_solo(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+    def __str__(self):
+        return "Loan settings"

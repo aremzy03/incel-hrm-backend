@@ -387,3 +387,51 @@ class UserRole(models.Model):
 
     def __str__(self):
         return f"{self.user.email} — {self.role.name}"
+
+
+# ---------------------------------------------------------------------------
+# Tutorial progress
+# ---------------------------------------------------------------------------
+
+class TutorialProgressStatus(models.TextChoices):
+    COMPLETED = "COMPLETED", "Completed"
+    DISMISSED = "DISMISSED", "Dismissed"
+
+
+VALID_TOUR_IDS = frozenset(
+    {
+        "leave-employee",
+        "leave-approver",
+        "leave-hr",
+        "loans-employee",
+        "loans-approver",
+        "loans-hr",
+        "loans-observer",
+    }
+)
+
+
+class UserTutorialProgress(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="tutorial_progress",
+    )
+    tour_id = models.CharField(max_length=64)
+    status = models.CharField(max_length=16, choices=TutorialProgressStatus.choices)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "User Tutorial Progress"
+        verbose_name_plural = "User Tutorial Progress"
+        constraints = [
+            models.UniqueConstraint(
+                fields=("user", "tour_id"),
+                name="accounts_user_tutorial_progress_unique",
+            ),
+        ]
+        ordering = ["tour_id"]
+
+    def __str__(self):
+        return f"{self.user.email} — {self.tour_id} ({self.status})"

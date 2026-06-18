@@ -18,7 +18,7 @@ from django.template.loader import render_to_string
 from django.utils.html import strip_tags
 from django.utils import timezone as django_timezone
 
-from apps.accounts.models import RoleName
+from apps.accounts.models import RoleName, get_or_create_management_department
 from apps.notifications.models import Notification, NotificationType
 
 from .models import (
@@ -27,7 +27,7 @@ from .models import (
     LoanApprovalAction,
     LoanApprovalLog,
 )
-from .services import LoanEligibilityService
+from .services import LoanEligibilityService, users_in_observer_scope
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
@@ -150,7 +150,7 @@ def _submitted_timestamp(loan: LoanApplication) -> str:
         LoanApprovalLog.objects.filter(
             loan=loan,
             action=LoanApprovalAction.SUBMIT,
-            new_status=LoanApplicationStatus.PENDING_HR,
+            previous_status=LoanApplicationStatus.DRAFT,
         )
         .order_by("-timestamp")
         .first()
@@ -190,45 +190,131 @@ def _monthly_installment_line(loan: LoanApplication) -> str:
 
 
 @shared_task
-def notify_loan_submitted(loan_id: str) -> bool:
-    """Email all active HR users that a new loan application was submitted."""
+def notify_loan_approver_required(loan_id: str) -> bool:
+    """Notify the approver for the loan's current pending status."""
     try:
-        loan = LoanApplication.objects.select_related("employee", "loan_type").get(pk=loan_id)
+        loan = (
+            LoanApplication.objects.select_related("employee", "employee__department", "loan_type")
+            .get(pk=loan_id)
+        )
     except LoanApplication.DoesNotExist:
-        logger.warning("notify_loan_submitted: LoanApplication missing. loan_id=%s", loan_id)
+        logger.warning(
+            "notify_loan_approver_required: LoanApplication missing. loan_id=%s", loan_id
+        )
         return False
 
-    hr_users = list(_users_with_role(RoleName.HR))
+    recipient_users: list = []
+    if loan.status == LoanApplicationStatus.PENDING_MANAGER:
+        if loan.manager_approver_is_management:
+            mgmt = get_or_create_management_department()
+            if mgmt.line_manager:
+                recipient_users = [mgmt.line_manager]
+        else:
+            manager = loan.employee.get_department_line_manager()
+            if manager:
+                recipient_users = [manager]
+        ntype = NotificationType.LOAN_ACTION_REQUIRED
+        subject_prefix = "Loan Application Awaiting Your Approval"
+    elif loan.status == LoanApplicationStatus.PENDING_HR:
+        recipient_users = list(_users_with_role(RoleName.HR))
+        ntype = NotificationType.LOAN_SUBMITTED
+        subject_prefix = "New Loan Application"
+    else:
+        logger.info(
+            "notify_loan_approver_required: skip (status not awaiting LM/HR). loan_id=%s status=%s",
+            loan_id,
+            loan.status,
+        )
+        return False
+
+    if not recipient_users:
+        logger.info(
+            "notify_loan_approver_required: no recipients. loan_id=%s status=%s",
+            loan_id,
+            loan.status,
+        )
+        return False
+
     employee_name = _employee_name(loan)
-    subject = f"New Loan Application — {employee_name}"
+    subject = f"{subject_prefix} — {employee_name}"
     body = (
         f"Employee: {employee_name}\n"
         f"Loan type: {loan.loan_type.name}\n"
         f"Amount: {loan.amount}\n"
         f"Tenure: {loan.tenure_months} month(s)\n"
         f"Purpose: {loan.purpose}\n"
-        f"Date submitted: {_submitted_timestamp(loan)}\n"
+        f"Current status: {loan.status}\n"
     )
-    emails = [u.email for u in hr_users if u.email]
+    if loan.status == LoanApplicationStatus.PENDING_HR:
+        body = (
+            f"{body}"
+            f"Date submitted: {_submitted_timestamp(loan)}\n"
+        )
+
+    emails = [u.email for u in recipient_users if u.email]
     _send_email_if_possible(subject=subject, text_body=body, recipients=emails)
 
-    if hr_users:
-        data = {
-            "loan_id": str(loan.id),
-            "status": loan.status,
-            "action_url": _loan_action_url(loan),
-        }
-        _notify_users_in_app(
-            users=hr_users,
-            title=subject,
-            body=body,
-            ntype=NotificationType.LOAN_SUBMITTED,
-            data=data,
-        )
-    else:
-        logger.info("notify_loan_submitted: no HR users to notify. loan_id=%s", loan_id)
-
+    data = {
+        "loan_id": str(loan.id),
+        "status": loan.status,
+        "action_url": _loan_action_url(loan),
+    }
+    _notify_users_in_app(
+        users=recipient_users,
+        title=subject,
+        body=body,
+        ntype=ntype,
+        data=data,
+    )
     return True
+
+
+@shared_task
+def notify_loan_observers(loan_id: str) -> bool:
+    """FYI notification to configured observer department/unit members."""
+    try:
+        loan = LoanApplication.objects.select_related("employee", "loan_type").get(pk=loan_id)
+    except LoanApplication.DoesNotExist:
+        logger.warning("notify_loan_observers: LoanApplication missing. loan_id=%s", loan_id)
+        return False
+
+    observers = list(users_in_observer_scope())
+    if not observers:
+        logger.info("notify_loan_observers: no observer scope configured. loan_id=%s", loan_id)
+        return False
+
+    employee_name = _employee_name(loan)
+    subject = f"Loan Application Update (FYI) — {employee_name}"
+    body = (
+        f"This loan application is for your information only — no action is required.\n\n"
+        f"Employee: {employee_name}\n"
+        f"Loan type: {loan.loan_type.name}\n"
+        f"Amount: {loan.amount}\n"
+        f"Tenure: {loan.tenure_months} month(s)\n"
+        f"Current status: {loan.status}\n"
+    )
+    emails = [u.email for u in observers if u.email]
+    _send_email_if_possible(subject=subject, text_body=body, recipients=emails)
+
+    data = {
+        "loan_id": str(loan.id),
+        "status": loan.status,
+        "action_url": _loan_action_url(loan),
+    }
+    _notify_users_in_app(
+        users=observers,
+        title=subject,
+        body=body,
+        ntype=NotificationType.LOAN_OBSERVER_NOTICE,
+        data=data,
+    )
+    return True
+
+
+@shared_task
+def notify_loan_submitted(loan_id: str) -> bool:
+    """Backward-compatible alias — delegates to approver-required for PENDING_HR."""
+    return notify_loan_approver_required(loan_id)
 
 
 @shared_task

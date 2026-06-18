@@ -21,7 +21,9 @@ from .models import (
     MANAGEMENT_DEPARTMENT_NAME,
     Role,
     RoleName,
+    TutorialProgressStatus,
     UserRole,
+    UserTutorialProgress,
 )
 from .throttles import PasswordChangeThrottle, RegisterThrottle
 from .permissions import IsExecutiveDirector, IsHR, IsOwnerOrHR
@@ -44,6 +46,8 @@ from .serializers import (
     UserSelfUpdateSerializer,
     UserSerializer,
     UserUpdateSerializer,
+    TutorialProgressSerializer,
+    TutorialProgressUpdateSerializer,
 )
 
 User = get_user_model()
@@ -59,6 +63,7 @@ def _blacklist_user_refresh_tokens(user):
 __all__ = [
     "RegisterView",
     "MeView",
+    "TutorialProgressView",
     "UserProfileView",
     "PasswordChangeView",
     "PasswordResetView",
@@ -109,6 +114,40 @@ class MeView(APIView):
 
     def get(self, request):
         return Response(UserSerializer(request.user).data)
+
+
+class TutorialProgressView(APIView):
+    """
+    GET  /api/v1/auth/me/tutorial-progress/ — list tutorial completion state
+    POST /api/v1/auth/me/tutorial-progress/ — mark complete or dismissed
+    """
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        items = UserTutorialProgress.objects.filter(user=request.user)
+        serializer = TutorialProgressSerializer(items, many=True)
+        return Response({"items": serializer.data})
+
+    def post(self, request):
+        serializer = TutorialProgressUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        tour_id = serializer.validated_data["tour_id"]
+        action = serializer.validated_data["action"]
+        status_value = (
+            TutorialProgressStatus.COMPLETED
+            if action == "complete"
+            else TutorialProgressStatus.DISMISSED
+        )
+        progress, _created = UserTutorialProgress.objects.update_or_create(
+            user=request.user,
+            tour_id=tour_id,
+            defaults={"status": status_value},
+        )
+        return Response(
+            TutorialProgressSerializer(progress).data,
+            status=status.HTTP_200_OK,
+        )
 
 
 class UserProfileView(APIView):

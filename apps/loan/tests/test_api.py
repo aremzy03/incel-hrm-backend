@@ -12,7 +12,7 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
 
-from apps.accounts.models import ConfirmationStatus, Role, RoleName, UserRole
+from apps.accounts.models import RoleName
 from apps.loan.models import (
     LoanApplication,
     LoanApplicationStatus,
@@ -22,51 +22,37 @@ from apps.loan.models import (
     LoanType,
 )
 from apps.loan.services import _add_months
+from apps.loan.tests.helpers import ensure_role, make_user, setup_department_with_line_manager
 
 User = get_user_model()
 
 
-def ensure_role(name: str) -> Role:
-    role, _ = Role.objects.get_or_create(name=name, defaults={"description": name})
-    return role
-
-
-def make_user(email: str, *, password="testpass123", roles=None, confirmed=True, **extra):
-    user = User.objects.create_user(
-        email=email,
-        password=password,
-        confirmation_status=(
-            ConfirmationStatus.CONFIRMED
-            if confirmed
-            else ConfirmationStatus.PENDING
-        ),
-        **extra,
-    )
-    for role_name in roles or []:
-        UserRole.objects.get_or_create(user=user, role=ensure_role(role_name))
-    return user
-
-
+@patch("apps.loan.views.notify_loan_observers.delay")
+@patch("apps.loan.views.notify_loan_approver_required.delay")
 @patch("apps.loan.views.notify_loan_closed.delay")
 @patch("apps.loan.views.notify_loan_liquidated.delay")
 @patch("apps.loan.views.notify_loan_disbursed.delay")
 @patch("apps.loan.views.notify_loan_decision.delay")
-@patch("apps.loan.views.notify_loan_submitted.delay")
 @patch("apps.loan.views.notify_next_approver.delay")
 class LoanAPITests(APITestCase):
     def setUp(self):
         for name in (
             RoleName.EMPLOYEE,
+            RoleName.LINE_MANAGER,
             RoleName.HR,
             RoleName.EXECUTIVE_DIRECTOR,
             RoleName.MANAGING_DIRECTOR,
         ):
             ensure_role(name)
 
+        self.department, self.line_manager = setup_department_with_line_manager(
+            dept_name="Loan API Test Dept"
+        )
         self.employee_confirmed = make_user(
             "confirmed-emp@test.com",
             roles=[RoleName.EMPLOYEE],
             confirmed=True,
+            department=self.department,
         )
         self.employee_unconfirmed = make_user(
             "unconfirmed-emp@test.com",
@@ -126,6 +112,15 @@ class LoanAPITests(APITestCase):
         return response
 
     def _approve_chain(self, loan_id):
+        self.client.force_authenticate(self.line_manager)
+        r = self.client.post(
+            self._action_url(loan_id, "approve"),
+            {"comment": "LM approved"},
+            format="json",
+        )
+        self.assertEqual(r.status_code, status.HTTP_200_OK, r.data)
+        self.assertEqual(r.data["status"], LoanApplicationStatus.PENDING_HR)
+
         self.client.force_authenticate(self.hr_user)
         r = self.client.post(
             self._action_url(loan_id, "approve"),
@@ -154,7 +149,7 @@ class LoanAPITests(APITestCase):
         self.assertEqual(r.data["status"], LoanApplicationStatus.APPROVED)
         return r
 
-    def test_unconfirmed_employee_cannot_apply(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
+    def test_unconfirmed_employee_cannot_apply(self, *_mocks):
         self.client.force_authenticate(self.employee_unconfirmed)
         response = self.client.post(
             self._list_url(),
@@ -165,7 +160,7 @@ class LoanAPITests(APITestCase):
         body = str(response.data).lower()
         self.assertIn("confirmed", body)
 
-    def test_confirmed_employee_can_apply(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
+    def test_confirmed_employee_can_apply(self, *_mocks):
         self.client.force_authenticate(self.employee_confirmed)
         response = self.client.post(
             self._list_url(),
@@ -175,7 +170,7 @@ class LoanAPITests(APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(response.data["status"], LoanApplicationStatus.DRAFT)
 
-    def test_tenure_over_12_months_rejected(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
+    def test_tenure_over_12_months_rejected(self, *_mocks):
         self.client.force_authenticate(self.employee_confirmed)
         response = self.client.post(
             self._list_url(),
@@ -184,7 +179,7 @@ class LoanAPITests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_zero_amount_rejected(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
+    def test_zero_amount_rejected(self, *_mocks):
         self.client.force_authenticate(self.employee_confirmed)
         response = self.client.post(
             self._list_url(),
@@ -193,7 +188,7 @@ class LoanAPITests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_duplicate_active_loan_blocked(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
+    def test_duplicate_active_loan_blocked(self, *_mocks):
         draft_id = self._create_draft()
         LoanApplication.objects.create(
             employee=self.employee_confirmed,
@@ -213,15 +208,21 @@ class LoanAPITests(APITestCase):
         body = str(response.data).lower()
         self.assertIn("active loan", body)
 
-    def test_full_approval_chain(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
+    def test_full_approval_chain(self, *_mocks):
         loan_id = self._create_draft()
         self._submit(loan_id)
         final = self._approve_chain(loan_id)
         self.assertEqual(final.data["status"], LoanApplicationStatus.APPROVED)
 
-    def test_rejection_at_hr_stage(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
+    def test_rejection_at_hr_stage(self, *_mocks):
         loan_id = self._create_draft()
         self._submit(loan_id)
+        self.client.force_authenticate(self.line_manager)
+        self.client.post(
+            self._action_url(loan_id, "approve"),
+            {"comment": "LM ok"},
+            format="json",
+        )
         self.client.force_authenticate(self.hr_user)
         response = self.client.post(
             self._action_url(loan_id, "reject"),
@@ -234,9 +235,15 @@ class LoanAPITests(APITestCase):
         self.assertIsNotNone(log)
         self.assertEqual(log.comment, "Not eligible this cycle")
 
-    def test_rejection_requires_comment(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
+    def test_rejection_requires_comment(self, *_mocks):
         loan_id = self._create_draft()
         self._submit(loan_id)
+        self.client.force_authenticate(self.line_manager)
+        self.client.post(
+            self._action_url(loan_id, "approve"),
+            {"comment": "LM ok"},
+            format="json",
+        )
         self.client.force_authenticate(self.hr_user)
         response = self.client.post(
             self._action_url(loan_id, "reject"),
@@ -245,7 +252,7 @@ class LoanAPITests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_disburse_generates_schedule(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
+    def test_disburse_generates_schedule(self, *_mocks):
         loan_id = self._create_draft(tenure_months=3, amount="9000.00")
         self._submit(loan_id)
         self._approve_chain(loan_id)
@@ -275,9 +282,7 @@ class LoanAPITests(APITestCase):
         first = loan.repayment_schedule.order_by("installment_number").first()
         self.assertEqual(first.payment_status, LoanRepaymentPaymentStatus.PENDING)
 
-    def test_hr_can_update_installment_payment_status(
-        self, _next, _submitted, _decision, _disbursed, _liquidated, _closed
-    ):
+    def test_hr_can_update_installment_payment_status(self, *_mocks):
         loan_id = self._create_draft(tenure_months=3, amount="9000.00")
         self._submit(loan_id)
         self._approve_chain(loan_id)
@@ -295,9 +300,7 @@ class LoanAPITests(APITestCase):
         self.assertEqual(installment.payment_status, LoanRepaymentPaymentStatus.PAID)
         self.assertEqual(Decimal(response.data["outstanding_balance"]), Decimal("6000.00"))
 
-    def test_employee_cannot_update_installment_payment_status(
-        self, _next, _submitted, _decision, _disbursed, _liquidated, _closed
-    ):
+    def test_employee_cannot_update_installment_payment_status(self, *_mocks):
         loan_id = self._create_draft(tenure_months=3, amount="9000.00")
         self._submit(loan_id)
         self._approve_chain(loan_id)
@@ -313,9 +316,7 @@ class LoanAPITests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_retrieve_marks_past_due_installments_overdue(
-        self, _next, _submitted, _decision, _disbursed, _liquidated, _closed
-    ):
+    def test_retrieve_marks_past_due_installments_overdue(self, *_mocks):
         loan_id = self._create_draft(tenure_months=3, amount="9000.00")
         self._submit(loan_id)
         self._approve_chain(loan_id)
@@ -333,7 +334,7 @@ class LoanAPITests(APITestCase):
         self.assertEqual(row["payment_status"], LoanRepaymentPaymentStatus.OVERDUE)
 
     def test_disburse_enqueues_employee_notification(
-        self, _next, _submitted, _decision, _disbursed, _liquidated, _closed
+        self, _next, _decision, _disbursed, _liquidated, _closed, _approver, _observers
     ):
         loan_id = self._create_draft()
         self._submit(loan_id)
@@ -343,7 +344,7 @@ class LoanAPITests(APITestCase):
             self.client.post(self._action_url(loan_id, "disburse"), {}, format="json")
         _disbursed.assert_called_once_with(str(loan_id))
 
-    def test_employee_cannot_approve(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
+    def test_employee_cannot_approve(self, *_mocks):
         loan_id = self._create_draft()
         self._submit(loan_id)
         self.client.force_authenticate(self.employee_confirmed)
@@ -354,7 +355,9 @@ class LoanAPITests(APITestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
 
-    def test_hr_can_liquidate_active_loan(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
+    def test_hr_can_liquidate_active_loan(
+        self, _next, _decision, _disbursed, _liquidated, _closed, _approver, _observers
+    ):
         loan_id = self._create_draft()
         self._submit(loan_id)
         self._approve_chain(loan_id)
@@ -372,7 +375,9 @@ class LoanAPITests(APITestCase):
         self.assertEqual(Decimal(response.data["outstanding_balance"]), Decimal("0"))
         _liquidated.assert_called_once_with(str(loan_id))
 
-    def test_resignation_handler_closes_loan(self, _next, _submitted, _decision, _disbursed, _liquidated, _closed):
+    def test_resignation_handler_closes_loan(
+        self, _next, _decision, _disbursed, _liquidated, _closed, _approver, _observers
+    ):
         loan_id = self._create_draft()
         self._submit(loan_id)
         self._approve_chain(loan_id)

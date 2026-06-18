@@ -6,17 +6,23 @@ import calendar
 from datetime import date
 from decimal import ROUND_CEILING, Decimal
 
+from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
+
+from apps.accounts.models import RoleName
 
 from .models import (
     LoanApplication,
     LoanApplicationStatus,
     LoanRepaymentPaymentStatus,
     LoanRepaymentSchedule,
+    LoanSettings,
 )
+
+User = get_user_model()
 
 
 def _add_months(base: date, months: int) -> date:
@@ -30,6 +36,46 @@ def _add_months(base: date, months: int) -> date:
 
 def _ceil_money(amount: Decimal) -> Decimal:
     return amount.quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+
+
+def get_loan_settings() -> LoanSettings:
+    return LoanSettings.get_solo()
+
+
+def is_loan_observer(user) -> bool:
+    if not user or not user.is_authenticated:
+        return False
+    settings = get_loan_settings()
+    if settings.observer_unit_id and user.unit_id == settings.observer_unit_id:
+        return True
+    if settings.observer_department_id and user.department_id == settings.observer_department_id:
+        return True
+    return False
+
+
+def is_loan_privileged(user) -> bool:
+    return (
+        user.is_staff
+        or user.has_role(RoleName.HR)
+        or user.has_role(RoleName.EXECUTIVE_DIRECTOR)
+        or user.has_role(RoleName.MANAGING_DIRECTOR)
+    )
+
+
+def can_view_all_loans(user) -> bool:
+    return is_loan_privileged(user) or is_loan_observer(user)
+
+
+def users_in_observer_scope():
+    settings = get_loan_settings()
+    if settings.observer_unit_id:
+        return User.objects.filter(is_active=True, unit_id=settings.observer_unit_id)
+    if settings.observer_department_id:
+        return User.objects.filter(
+            is_active=True,
+            department_id=settings.observer_department_id,
+        )
+    return User.objects.none()
 
 
 class LoanEligibilityService:
