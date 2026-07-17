@@ -1012,7 +1012,7 @@ Unique constraint: `(employee, leave_type, year)`.
 
 | Field               | Notes                                                       |
 |---------------------|-------------------------------------------------------------|
-| `cover_person`      | FK → User. Optional. If provided, must be in the same department and cannot be the applicant |
+| `cover_person`      | FK → User. Optional on DRAFT; required at submit for applicable leave types. Must be an active colleague in the requester's org scope (team → unit → department, with cascade fallback). HR may assign any active user when editing. |
 | `total_working_days`| Computed automatically on `save()` (excludes weekends + public holidays) |
 | `is_emergency`      | Flag for urgent requests                                    |
 | `status`            | See workflow below                                          |
@@ -1051,7 +1051,7 @@ Immutable audit trail. One entry is appended per status transition. Fields inclu
 
 1. **One Line Manager per department** -- Each department has at most one line manager (`Department.line_manager`). A user can manage at most one department (OneToOneField). HR and ED can assign/revoke via `POST/DELETE /api/v1/departments/:id/line-manager/`.
 
-2. **Cover person optional** -- When creating a leave request, `cover_person` can be omitted (for example, when no suitable cover exists). If provided, the cover person must be another active user in the same department and cannot be the requesting employee.
+2. **Reliever (cover person) required at submit** -- DRAFT requests may omit `cover_person`. Submit (`POST .../submit/`) and create-and-submit require a reliever for Annual, Casual, and other non-exempt types. Exempt: Sick, Maternity, Paternity; non-Sick requests with `is_emergency=True`; Managing Director / Executive Director requesters. Relievers must be active colleagues scoped to the requester's lowest org level (team → unit → department). If no colleagues exist at that level, the pool cascades upward. The reliever cannot have approved leave overlapping the requested dates. Use `GET /api/v1/leave-requests/eligible-relievers/` to load the picker list. HR may assign any active user (cross-department) when PATCHing a request.
 
 3. **Maternity and Paternity by gender** -- Maternity leave is only available for female staff; Paternity leave is only available for male staff. Leave balances for these types are created only for eligible users.
 
@@ -1126,6 +1126,28 @@ existing.start_date <= new.end_date  AND  existing.end_date >= new.start_date
 Raises `ValidationError` if any **other** employee in the same department already has an active **Annual or Casual** leave request (status not in `REJECTED`, `CANCELLED`) whose date range overlaps with the requested period.
 
 This check runs only when the requested leave type is Annual or Casual. For Sick, Maternity, Paternity, and other types, the rule is skipped (multiple employees may be on leave simultaneously).
+
+### Reliever validation (`apps/leave/services.py`)
+
+#### `resolve_org_scope(employee) -> (scope_level, filters)`
+
+Returns the lowest applicable org scope (`team`, `unit`, or `department`) and `User.objects.filter()` kwargs. Shared with `check_department_leave_overlap`.
+
+#### `get_eligible_relievers(employee) -> RelieverScopeResult`
+
+Returns scoped reliever queryset plus metadata (`scope_level`, `effective_scope_level`, `fallback_applied`). Cascades team → unit → department when no colleagues exist at the primary scope. Management department members are resolved via `DepartmentMembership`.
+
+#### `reliever_required(leave_request) -> bool`
+
+Returns `False` for Sick/Maternity/Paternity, non-Sick emergency requests, and MD/ED requesters.
+
+#### `validate_cover_person_for_submission(leave_request, hr_override=False) -> None`
+
+Called at submit boundaries. Enforces presence, org scope (unless `hr_override`), and reliever availability.
+
+#### `validate_cover_person_assignment(leave_request, cover_person, hr_override=False) -> None`
+
+Used on create/PATCH when `cover_person` is explicitly set.
 
 ---
 
@@ -1261,13 +1283,14 @@ Used for `POST` (create) and `PATCH` (update) requests.
 
 **Validation pipeline (in `validate()`):**
 
-1. `end_date` must be strictly after `start_date`.
-2. If provided, `cover_person` must not be the requesting employee.
-3. If provided, `cover_person` must be in the same department as the employee.
-4. Maternity leave: only available for female staff. Paternity leave: only available for male staff.
-5. `WorkingDaysService.check_overlapping_leave()` — rejects if the employee already has an active request in the same window. Passes `exclude_id` automatically on updates.
-6. `WorkingDaysService.check_department_leave_overlap()` — for Annual and Casual only: rejects if any other employee in the same department has an active Annual or Casual request overlapping the same dates. Skipped for Sick, Maternity, Paternity, and other types.
-7. `WorkingDaysService.validate_leave_balance()` — rejects if remaining balance for `(employee, leave_type, start_date.year)` is less than the computed working days.
+1. `end_date` must be on or after `start_date`.
+2. If provided, `cover_person` must pass org-scoped reliever rules (`validate_cover_person_assignment`).
+3. Maternity leave: only available for female staff. Paternity leave: only available for male staff.
+4. `WorkingDaysService.check_overlapping_leave()` — rejects if the employee already has an active request in the same window. Passes `exclude_id` automatically on updates.
+5. `WorkingDaysService.check_department_leave_overlap()` — for Annual and Casual only: rejects if any other employee in the same org scope has an active Annual or Casual request overlapping the same dates.
+6. `WorkingDaysService.validate_leave_balance()` — rejects if remaining balance is insufficient.
+
+Reliever presence is enforced at submit (`validate_cover_person_for_submission`), not on DRAFT create. HR edits use `hr_override` to allow any active user as reliever.
 
 **`create()` behaviour:**
 
@@ -1329,8 +1352,9 @@ All leave endpoints require a valid JWT `Authorization: Bearer <token>` header.
 
 | Method | Endpoint | Permission | Description |
 |--------|----------|-----------|-------------|
-| POST | `/api/v1/leave-requests/:id/submit/` | Request owner | Submit a draft into the approval workflow (requires dept line manager) |
+| POST | `/api/v1/leave-requests/:id/submit/` | Request owner | Submit a draft into the approval workflow (requires dept line manager and reliever when applicable) |
 | POST | `/api/v1/leave-requests/create-and-submit/` | Request owner | Create a new request and immediately submit it |
+| GET | `/api/v1/leave-requests/eligible-relievers/` | Authenticated | Org-scoped reliever picker for the current user |
 | POST | `/api/v1/leave-requests/:id/approve/` | Role-matched approver | Stage transition (see table below) |
 | POST | `/api/v1/leave-requests/:id/reject/` | Role-matched approver | Any pending stage → REJECTED (comment required) |
 | POST | `/api/v1/leave-requests/:id/cancel/` | Owner (DRAFT/early pending) or HR | → CANCELLED |

@@ -135,9 +135,11 @@ class LeaveApiTests(APITestCase):
             "cover_person": str(self.supervisor.id),
         }
 
-    def _create_request(self, user, start_date=None, end_date=None):
+    def _create_request(self, user, start_date=None, end_date=None, cover_person_id=None):
         self._auth(user)
         payload = self._create_payload(start_date=start_date, end_date=end_date)
+        if cover_person_id is not None:
+            payload["cover_person"] = cover_person_id
         return self.client.post(
             self.list_url,
             payload,
@@ -221,11 +223,21 @@ class LeaveApiTests(APITestCase):
         team_lead.save(update_fields=["unit", "updated_at"])
 
         team = Team.objects.create(name="API Team", unit=self.unit, team_lead=team_lead)
+        team_colleague = self._create_user_with_roles(
+            "team.colleague@test.com", [RoleName.EMPLOYEE], department=self.department
+        )
+        team_colleague.unit = self.unit
+        team_colleague.team = team
+        team_colleague.save(update_fields=["unit", "team", "updated_at"])
+
         self.employee.unit = self.unit
         self.employee.team = team
         self.employee.save(update_fields=["unit", "team", "updated_at"])
 
-        create_resp = self._create_request(self.employee)
+        create_resp = self._create_request(
+            self.employee,
+            cover_person_id=str(team_colleague.id),
+        )
         leave_request_id = self._resolve_created_request_id(create_resp)
         submit_resp = self._submit_request(self.employee, leave_request_id)
         self.assertEqual(submit_resp.status_code, status.HTTP_200_OK)
@@ -437,11 +449,21 @@ class LeaveApiTests(APITestCase):
         team_lead.save(update_fields=["unit", "updated_at"])
 
         team = Team.objects.create(name="Notify Team", unit=self.unit, team_lead=team_lead)
+        team_colleague = self._create_user_with_roles(
+            "team.colleague.notify@test.com", [RoleName.EMPLOYEE], department=self.department
+        )
+        team_colleague.unit = self.unit
+        team_colleague.team = team
+        team_colleague.save(update_fields=["unit", "team", "updated_at"])
+
         self.employee.unit = self.unit
         self.employee.team = team
         self.employee.save(update_fields=["unit", "team", "updated_at"])
 
-        create_resp = self._create_request(self.employee)
+        create_resp = self._create_request(
+            self.employee,
+            cover_person_id=str(team_colleague.id),
+        )
         leave_request_id = self._resolve_created_request_id(create_resp)
         with self.captureOnCommitCallbacks(execute=True):
             submit_resp = self._submit_request(self.employee, leave_request_id)
@@ -482,8 +504,150 @@ class LeaveApiTests(APITestCase):
             ed_approve = self._approve_request(self.executive_director, leave_request_id)
         self.assertEqual(ed_approve.status_code, status.HTTP_200_OK)
         self.assertEqual(ed_approve.data["status"], LeaveRequestStatus.APPROVED)
-        self.assertEqual(len(mail.outbox), 4)
+        # Final approval: applicant decision + reliever assignment (cover_person set in create payload)
+        self.assertEqual(len(mail.outbox), 5)
         self.assertEqual(mail.outbox[3].to, [self.employee.email])
+        self.assertEqual(mail.outbox[4].to, [self.supervisor.email])
+        self.assertIn("reliever", mail.outbox[4].subject.lower())
+
+    @override_settings(
+        CELERY_TASK_ALWAYS_EAGER=True,
+        EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+        FRONTEND_BASE_URL="http://localhost:3000",
+    )
+    def test_final_approval_notifies_reliever(self):
+        mail.outbox.clear()
+        colleague = self._create_user_with_roles(
+            "colleague.reliever@test.com",
+            [RoleName.EMPLOYEE],
+            department=self.department,
+        )
+
+        create_resp = self._create_request(
+            self.employee,
+            cover_person_id=str(colleague.id),
+        )
+        leave_request_id = self._resolve_created_request_id(create_resp)
+        with self.captureOnCommitCallbacks(execute=True):
+            self._submit_request(self.employee, leave_request_id)
+            self._approve_request(self.line_manager, leave_request_id)
+            self._approve_request(self.hr_user, leave_request_id)
+            ed_approve = self._approve_request(self.executive_director, leave_request_id)
+
+        self.assertEqual(ed_approve.status_code, status.HTTP_200_OK)
+        self.assertEqual(ed_approve.data["status"], LeaveRequestStatus.APPROVED)
+
+        reliever_mails = [m for m in mail.outbox if m.to == [colleague.email]]
+        self.assertEqual(len(reliever_mails), 1)
+        self.assertIn("reliever", reliever_mails[0].subject.lower())
+        self.assertIn("2036", reliever_mails[0].body)
+        self.assertIn("Annual", reliever_mails[0].body)
+
+    @override_settings(
+        CELERY_TASK_ALWAYS_EAGER=True,
+        EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+        FRONTEND_BASE_URL="http://localhost:3000",
+    )
+    def test_department_reminder_sent_when_start_is_tomorrow(self):
+        from apps.leave.tasks import notify_upcoming_approved_leaves
+
+        mail.outbox.clear()
+        colleague = self._create_user_with_roles(
+            "dept.colleague@test.com",
+            [RoleName.EMPLOYEE],
+            department=self.department,
+        )
+        # Use calendar tomorrow (even if weekend) so the ~24h reminder window matches.
+        tomorrow = timezone.localdate() + datetime.timedelta(days=1)
+        end = tomorrow + datetime.timedelta(days=5)
+
+        LeaveBalance.objects.update_or_create(
+            employee=self.employee,
+            leave_type=self.leave_type,
+            year=tomorrow.year,
+            defaults={"allocated_days": 21, "used_days": 0},
+        )
+
+        create_resp = self._create_request(
+            self.employee,
+            start_date=tomorrow,
+            end_date=end,
+            cover_person_id=str(colleague.id),
+        )
+        self.assertEqual(create_resp.status_code, status.HTTP_201_CREATED, msg=create_resp.data)
+        leave_request_id = self._resolve_created_request_id(
+            create_resp, start_date=tomorrow, end_date=end
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            self._submit_request(self.employee, leave_request_id)
+            self._approve_request(self.line_manager, leave_request_id)
+            self._approve_request(self.hr_user, leave_request_id)
+            ed_approve = self._approve_request(self.executive_director, leave_request_id)
+
+        self.assertEqual(ed_approve.status_code, status.HTTP_200_OK)
+
+        # Immediate department reminder because start is within ~24h.
+        department_mails = [
+            m for m in mail.outbox if "Upcoming leave" in m.subject
+        ]
+        self.assertEqual(len(department_mails), 1)
+        recipients = set(department_mails[0].to)
+        self.assertIn(colleague.email, recipients)
+        self.assertIn(self.line_manager.email, recipients)
+        self.assertIn(self.hr_user.email, recipients)
+        self.assertIn(self.executive_director.email, recipients)
+        self.assertNotIn(self.employee.email, recipients)
+
+        leave_request = LeaveRequest.objects.get(id=leave_request_id)
+        self.assertIsNotNone(leave_request.department_reminder_sent_at)
+
+        # Beat task must be idempotent — no second send.
+        mail.outbox.clear()
+        sent_count = notify_upcoming_approved_leaves()
+        self.assertEqual(sent_count, 0)
+        self.assertEqual(len(mail.outbox), 0)
+
+    @override_settings(
+        CELERY_TASK_ALWAYS_EAGER=True,
+        EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+        FRONTEND_BASE_URL="http://localhost:3000",
+    )
+    def test_upcoming_beat_sends_department_reminder_for_tomorrow_start(self):
+        from apps.leave.tasks import notify_upcoming_approved_leaves
+
+        mail.outbox.clear()
+        tomorrow = timezone.localdate() + datetime.timedelta(days=1)
+        end = tomorrow + datetime.timedelta(days=5)
+
+        LeaveBalance.objects.update_or_create(
+            employee=self.employee,
+            leave_type=self.leave_type,
+            year=tomorrow.year,
+            defaults={"allocated_days": 21, "used_days": 0},
+        )
+
+        # Approve with a far-future start first, then move start_date to tomorrow
+        # so the immediate-on-approve path does not fire.
+        with self.captureOnCommitCallbacks(execute=True):
+            leave_request_id = self._create_and_submit()
+            self._approve_request(self.line_manager, leave_request_id)
+            self._approve_request(self.hr_user, leave_request_id)
+            self._approve_request(self.executive_director, leave_request_id)
+
+        leave_request = LeaveRequest.objects.get(id=leave_request_id)
+        self.assertEqual(leave_request.status, LeaveRequestStatus.APPROVED)
+        leave_request.start_date = tomorrow
+        leave_request.end_date = end
+        leave_request.department_reminder_sent_at = None
+        leave_request.save()
+
+        mail.outbox.clear()
+        sent_count = notify_upcoming_approved_leaves()
+        self.assertEqual(sent_count, 1)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("Upcoming leave", mail.outbox[0].subject)
+        leave_request.refresh_from_db()
+        self.assertIsNotNone(leave_request.department_reminder_sent_at)
 
     @override_settings(
         CELERY_TASK_ALWAYS_EAGER=True,

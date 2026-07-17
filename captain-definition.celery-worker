@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 2,
+  "dockerfileLines": [
+    "FROM ghcr.io/aremzy03/incel-hrm-backend:latest",
+    "HEALTHCHECK NONE",
+    "USER app",
+    "CMD [\"celery\", \"-A\", \"hrm_backend\", \"worker\", \"-l\", \"info\"]"
+  ]
+}

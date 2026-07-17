@@ -250,6 +250,10 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.loan.tasks.mark_overdue_loan_installments",
         "schedule": crontab(hour=0, minute=5),
     },
+    "notify-upcoming-approved-leaves": {
+        "task": "apps.leave.tasks.notify_upcoming_approved_leaves",
+        "schedule": crontab(minute=0),  # hourly; sends ~24h before start day
+    },
 }
 
 

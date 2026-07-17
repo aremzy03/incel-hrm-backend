@@ -9,6 +9,8 @@ class NotificationType(models.TextChoices):
     LEAVE_ACTION_REQUIRED = "LEAVE_ACTION_REQUIRED", "Leave action required"
     LEAVE_APPROVED = "LEAVE_APPROVED", "Leave approved"
     LEAVE_REJECTED = "LEAVE_REJECTED", "Leave rejected"
+    LEAVE_RELIEVER_ASSIGNED = "LEAVE_RELIEVER_ASSIGNED", "Leave reliever assigned"
+    LEAVE_DEPARTMENT_REMINDER = "LEAVE_DEPARTMENT_REMINDER", "Leave department reminder"
     LOAN_SUBMITTED = "LOAN_SUBMITTED", "Loan submitted"
     LOAN_APPROVED = "LOAN_APPROVED", "Loan approved"
     LOAN_REJECTED = "LOAN_REJECTED", "Loan rejected"

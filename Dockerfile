@@ -49,7 +49,7 @@ COPY --from=builder /usr/local/lib/python3.11 /usr/local/lib/python3.11
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY --from=builder /app /app
 
-RUN chown -R app:app /app
+RUN chmod +x /app/docker-entrypoint.sh && chown -R app:app /app
 USER app
 
 # System user home is /nonexistent by default; Gunicorn needs a writable directory.
@@ -64,6 +64,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
   CMD python -c "import urllib.request; r=urllib.request.Request('http://127.0.0.1:8000/health/', headers={'Host':'localhost','X-Forwarded-Proto':'https'}); urllib.request.urlopen(r)" || exit 1
 
-# Default command: run Django via Gunicorn (gevent workers for SSE long-lived connections)
-CMD ["gunicorn", "hrm_backend.wsgi:application", "-c", "gunicorn.conf.py"]
+# Roles: web (default) | worker | beat — see docker-entrypoint.sh
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["web"]
 

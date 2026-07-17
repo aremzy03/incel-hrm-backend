@@ -76,7 +76,13 @@ class LeaveRequestAdmin(admin.ModelAdmin):
     )
     list_filter = ("status", "leave_type", "created_at")
     search_fields = ("employee__email", "employee__first_name")
-    readonly_fields = ("id", "total_working_days", "created_at", "updated_at")
+    readonly_fields = (
+        "id",
+        "total_working_days",
+        "department_reminder_sent_at",
+        "created_at",
+        "updated_at",
+    )
     inlines = (LeaveApprovalLogInline,)
 
 

@@ -170,6 +170,11 @@ class LeaveRequest(TimeStampedModel):
         default=False,
         help_text="If True, the PENDING_MANAGER approver is Management department line manager.",
     )
+    department_reminder_sent_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the 24h-before-start department reminder email was sent.",
+    )
 
     class Meta:
         verbose_name = "Leave Request"

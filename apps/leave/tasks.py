@@ -1,3 +1,4 @@
+import datetime
 import json
 import logging
 
@@ -6,6 +7,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.mail import EmailMultiAlternatives
 from django.template.loader import render_to_string
+from django.utils import timezone
 from django.utils.html import strip_tags
 
 import redis
@@ -14,6 +16,7 @@ from apps.accounts.models import RoleName, get_or_create_management_department
 from apps.notifications.models import Notification, NotificationType
 
 from .models import LeaveRequest, LeaveRequestStatus
+from .services import get_department_leave_reminder_recipients
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
@@ -325,3 +328,184 @@ def notify_approver_required(leave_request_id: str) -> bool:
             "action_url": _leave_request_action_url(leave_request),
         },
     )
+
+
+@shared_task
+def notify_reliever_assigned(leave_request_id: str) -> bool:
+    """Notify the cover person when a leave request is finally approved."""
+    try:
+        leave_request = (
+            LeaveRequest.objects.select_related(
+                "employee",
+                "leave_type",
+                "cover_person",
+            ).get(pk=leave_request_id)
+        )
+    except LeaveRequest.DoesNotExist:
+        return False
+
+    cover_person = leave_request.cover_person
+    if not cover_person or not cover_person.is_active:
+        return False
+
+    employee_name = _employee_name(leave_request)
+    subject = f"You have been assigned as reliever — {employee_name}"
+    body = (
+        f"{employee_name} is going on leave and you have been assigned as their reliever.\n\n"
+        f"Employee: {employee_name}\n"
+        f"Leave Type: {leave_request.leave_type.name}\n"
+        f"Dates: {leave_request.start_date} to {leave_request.end_date}\n"
+        f"Total Days: {leave_request.total_working_days}\n"
+    )
+
+    notification = Notification.objects.create(
+        recipient=cover_person,
+        title=subject,
+        body=body,
+        type=NotificationType.LEAVE_RELIEVER_ASSIGNED,
+        data={
+            "leave_request_id": str(leave_request.id),
+            "status": leave_request.status,
+        },
+    )
+    _publish_notifications(
+        redis_url=settings.NOTIFICATIONS_REDIS_URL,
+        user_ids=[str(cover_person.id)],
+        payload={
+            "notification_id": str(notification.id),
+            "type": notification.type,
+            "title": notification.title,
+            "body": notification.body,
+            "data": notification.data,
+            "created_at": notification.created_at.isoformat(),
+        },
+    )
+
+    return _send_email_if_possible(
+        subject=subject,
+        text_body=body,
+        recipients=[cover_person.email],
+        html_template="email/leave_reliever.html",
+        text_template="email/leave_reliever.txt",
+        template_context={
+            "employee_name": employee_name,
+            "reliever_name": cover_person.get_full_name() or cover_person.email,
+            "leave_type": leave_request.leave_type.name,
+            "start_date": leave_request.start_date,
+            "end_date": leave_request.end_date,
+            "total_days": leave_request.total_working_days,
+            "status": leave_request.status,
+            "action_url": _leave_request_action_url(leave_request),
+        },
+    )
+
+
+@shared_task
+def notify_department_leave_reminder(leave_request_id: str) -> bool:
+    """
+    Notify department colleagues, line manager, HR, and ED that an approved
+    leave starts within ~24 hours.
+    """
+    try:
+        leave_request = (
+            LeaveRequest.objects.select_related(
+                "employee",
+                "leave_type",
+                "employee__department",
+            ).get(pk=leave_request_id)
+        )
+    except LeaveRequest.DoesNotExist:
+        return False
+
+    if leave_request.status != LeaveRequestStatus.APPROVED:
+        return False
+    if leave_request.department_reminder_sent_at is not None:
+        return False
+
+    recipient_users = get_department_leave_reminder_recipients(leave_request.employee)
+    employee_name = _employee_name(leave_request)
+    department_name = (
+        leave_request.employee.department.name
+        if leave_request.employee.department_id
+        else "N/A"
+    )
+    subject = f"Upcoming leave — {employee_name} ({leave_request.start_date})"
+    body = (
+        f"{employee_name} from {department_name} will be on leave starting tomorrow "
+        f"(or within 24 hours).\n\n"
+        f"Employee: {employee_name}\n"
+        f"Department: {department_name}\n"
+        f"Leave Type: {leave_request.leave_type.name}\n"
+        f"Dates: {leave_request.start_date} to {leave_request.end_date}\n"
+        f"Total Days: {leave_request.total_working_days}\n"
+    )
+
+    for user in recipient_users:
+        notification = Notification.objects.create(
+            recipient=user,
+            title=subject,
+            body=body,
+            type=NotificationType.LEAVE_DEPARTMENT_REMINDER,
+            data={
+                "leave_request_id": str(leave_request.id),
+                "status": leave_request.status,
+            },
+        )
+        _publish_notifications(
+            redis_url=settings.NOTIFICATIONS_REDIS_URL,
+            user_ids=[str(user.id)],
+            payload={
+                "notification_id": str(notification.id),
+                "type": notification.type,
+                "title": notification.title,
+                "body": notification.body,
+                "data": notification.data,
+                "created_at": notification.created_at.isoformat(),
+            },
+        )
+
+    recipients = [u.email for u in recipient_users if getattr(u, "email", None)]
+    sent = _send_email_if_possible(
+        subject=subject,
+        text_body=body,
+        recipients=recipients,
+        html_template="email/leave_department_reminder.html",
+        text_template="email/leave_department_reminder.txt",
+        template_context={
+            "employee_name": employee_name,
+            "department_name": department_name,
+            "leave_type": leave_request.leave_type.name,
+            "start_date": leave_request.start_date,
+            "end_date": leave_request.end_date,
+            "total_days": leave_request.total_working_days,
+            "status": leave_request.status,
+            "action_url": _leave_request_action_url(leave_request),
+        },
+    )
+
+    # Mark as sent even when there were no recipients, to avoid hourly retries.
+    LeaveRequest.objects.filter(pk=leave_request.pk).update(
+        department_reminder_sent_at=timezone.now()
+    )
+    return sent
+
+
+@shared_task
+def notify_upcoming_approved_leaves() -> int:
+    """
+    Celery Beat entry: send department reminders for approved leaves starting
+    tomorrow (≈24 hours before the start day).
+    """
+    today = timezone.localdate()
+    target_start = today + datetime.timedelta(days=1)
+    qs = LeaveRequest.objects.filter(
+        status=LeaveRequestStatus.APPROVED,
+        start_date=target_start,
+        department_reminder_sent_at__isnull=True,
+    ).only("id")
+
+    sent_count = 0
+    for leave_request_id in qs.values_list("id", flat=True):
+        if notify_department_leave_reminder(str(leave_request_id)):
+            sent_count += 1
+    return sent_count

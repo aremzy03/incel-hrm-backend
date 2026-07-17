@@ -173,6 +173,31 @@ class LeaveRequestVisibilityTests(TestCase):
         self.assertIn(str(self.approved_a.id), ids)
         self.assertNotIn(str(self.draft_b.id), ids)
 
+    def test_list_filters_by_leave_type(self):
+        self.client.force_authenticate(self.emp_a)
+
+        resp = self.client.get(self.list_url, {"leave_type": str(self.sick.id)})
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        ids = self._ids(resp)
+        self.assertEqual(ids, {str(self.approved_a.id)})
+
+        resp = self.client.get(self.list_url, {"leave_type": str(self.annual.id)})
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        ids = self._ids(resp)
+        self.assertIn(str(self.draft_a.id), ids)
+        self.assertIn(str(self.pending_manager_a.id), ids)
+        self.assertNotIn(str(self.approved_a.id), ids)
+
+        resp = self.client.get(
+            self.list_url,
+            {"leave_type": f"{self.annual.id},{self.sick.id}"},
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        ids = self._ids(resp)
+        self.assertIn(str(self.draft_a.id), ids)
+        self.assertIn(str(self.pending_manager_a.id), ids)
+        self.assertIn(str(self.approved_a.id), ids)
+
     def test_privileged_user_does_not_see_others_drafts(self):
         self.client.force_authenticate(self.hr)
         resp = self.client.get(self.list_url)
@@ -562,10 +587,16 @@ class LeaveRequestSubmitTests(TestCase):
             department=make_department("Human Resources (HR)"),
         )
         annual = make_leave_type("Annual", 21)
+        self.cover = make_user(
+            "cover_submit@test.com",
+            roles=[RoleName.EMPLOYEE],
+            department=dept,
+        )
         self.req = make_request(
             self.emp,
             annual,
             status=LeaveRequestStatus.DRAFT,
+            cover_person=self.cover,
         )
         self.submit_url = reverse("leave-request-submit", args=[self.req.id])
 
@@ -922,6 +953,26 @@ class LeaveRequestCreateTests(TestCase):
         self.assertIsNotNone(leave_request)
         self.assertIsNone(leave_request.cover_person)
 
+    def test_submit_annual_without_cover_person_fails(self):
+        self._create_balance(self.female_emp, self.annual)
+        resp = self._post_create(self.female_emp, self.annual, cover_person=None)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        leave_request = LeaveRequest.objects.filter(
+            employee=self.female_emp,
+            leave_type=self.annual,
+            start_date=self.start,
+            end_date=self.end,
+        ).order_by("-created_at").first()
+        dept = self.female_emp.department
+        lm = make_user("lm_submit@test.com", roles=[RoleName.LINE_MANAGER], department=dept)
+        dept.line_manager = lm
+        dept.save(update_fields=["line_manager", "updated_at"])
+        self.client.force_authenticate(self.female_emp)
+        submit_url = reverse("leave-request-submit", args=[leave_request.id])
+        submit_resp = self.client.post(submit_url)
+        self.assertEqual(submit_resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("cover_person", submit_resp.data)
+
     def test_annual_department_overlap_blocked_for_other_employee(self):
         # No units in department -> overlap enforced at department level
         make_request(
@@ -949,6 +1000,10 @@ class LeaveRequestCreateTests(TestCase):
         self.female_emp.unit = unit_a
         self.female_emp.team = None
         self.female_emp.save(update_fields=["unit", "team", "updated_at"])
+
+        self.cover_same_dept.unit = unit_a
+        self.cover_same_dept.team = None
+        self.cover_same_dept.save(update_fields=["unit", "team", "updated_at"])
 
         self.other_emp.unit = unit_b
         self.other_emp.team = None
@@ -997,6 +1052,10 @@ class LeaveRequestCreateTests(TestCase):
         self.female_emp.unit = unit
         self.female_emp.team = team_1
         self.female_emp.save(update_fields=["unit", "team", "updated_at"])
+
+        self.cover_same_dept.unit = unit
+        self.cover_same_dept.team = team_1
+        self.cover_same_dept.save(update_fields=["unit", "team", "updated_at"])
 
         self.other_emp.unit = unit
         self.other_emp.team = team_2
@@ -1084,3 +1143,161 @@ class LeaveRequestCreateTests(TestCase):
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("leave_balance", resp.data)
 
+
+class LeaveRequestRelieverTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.dept = make_department("Reliever Enforcement Dept")
+        self.unit = Unit.objects.create(name="Reliever Unit", department=self.dept)
+        self.team_a = Team.objects.create(name="Team A", unit=self.unit)
+        self.team_b = Team.objects.create(name="Team B", unit=self.unit)
+
+        self.annual = make_leave_type("Annual", 21)
+        self.sick = make_leave_type("Sick", 14)
+        today = datetime.date.today()
+        self.start = today
+        self.end = today + datetime.timedelta(days=1)
+
+        User = get_user_model()
+        self.applicant = User.objects.create_user(
+            email="applicant@test.com",
+            password="testpass123",
+            gender="FEMALE",
+            department=self.dept,
+            unit=self.unit,
+            team=self.team_a,
+            date_of_birth=datetime.date(1990, 1, 1),
+        )
+        self.same_team_cover = User.objects.create_user(
+            email="same_team_cover@test.com",
+            password="testpass123",
+            gender="FEMALE",
+            department=self.dept,
+            unit=self.unit,
+            team=self.team_a,
+            date_of_birth=datetime.date(1990, 1, 1),
+        )
+        self.other_team_cover = User.objects.create_user(
+            email="other_team_cover@test.com",
+            password="testpass123",
+            gender="FEMALE",
+            department=self.dept,
+            unit=self.unit,
+            team=self.team_b,
+            date_of_birth=datetime.date(1990, 1, 1),
+        )
+        self.lm = make_user(
+            "lm_reliever@test.com",
+            roles=[RoleName.LINE_MANAGER],
+            department=self.dept,
+        )
+        self.dept.line_manager = self.lm
+        self.dept.save(update_fields=["line_manager", "updated_at"])
+        self.hr = make_user(
+            "hr_reliever@test.com",
+            roles=[RoleName.HR],
+            department=make_department("Human Resources (HR)"),
+        )
+        self.other_dept_user = User.objects.create_user(
+            email="other_dept_reliever@test.com",
+            password="testpass123",
+            gender="FEMALE",
+            department=make_department("Other Dept"),
+            date_of_birth=datetime.date(1990, 1, 1),
+        )
+
+        self.list_url = reverse("leave-request-list")
+        self.eligible_url = reverse("leave-request-eligible-relievers")
+
+    def _create_balance(self, employee, leave_type):
+        LeaveBalance.objects.update_or_create(
+            employee=employee,
+            leave_type=leave_type,
+            year=self.start.year,
+            defaults={"allocated_days": 21, "used_days": 0},
+        )
+
+    def _post_create(self, user, leave_type, cover_person=None, is_emergency=False):
+        self.client.force_authenticate(user)
+        payload = {
+            "leave_type": str(leave_type.id),
+            "start_date": self.start.isoformat(),
+            "end_date": self.end.isoformat(),
+            "reason": "test",
+            "is_emergency": is_emergency,
+        }
+        if cover_person is not None:
+            payload["cover_person"] = str(cover_person.id)
+        return self.client.post(self.list_url, payload, format="json")
+
+    def test_cover_person_rejected_when_not_in_same_team(self):
+        self._create_balance(self.applicant, self.annual)
+        resp = self._post_create(self.applicant, self.annual, cover_person=self.other_team_cover)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("cover_person", resp.data)
+
+    def test_cover_person_accepted_when_in_same_team(self):
+        self._create_balance(self.applicant, self.annual)
+        resp = self._post_create(self.applicant, self.annual, cover_person=self.same_team_cover)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+    def test_eligible_relievers_endpoint_returns_team_scoped_members(self):
+        self.client.force_authenticate(self.applicant)
+        resp = self.client.get(self.eligible_url)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(resp.data["scope_level"], "team")
+        ids = {item["id"] for item in resp.data["relievers"]}
+        self.assertIn(str(self.same_team_cover.id), ids)
+        self.assertNotIn(str(self.other_team_cover.id), ids)
+
+    def test_submit_sick_without_reliever_succeeds(self):
+        self._create_balance(self.applicant, self.sick)
+        resp = self._post_create(self.applicant, self.sick, cover_person=None)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        leave_request = LeaveRequest.objects.filter(employee=self.applicant, leave_type=self.sick).latest("created_at")
+        submit_url = reverse("leave-request-submit", args=[leave_request.id])
+        submit_resp = self.client.post(submit_url)
+        self.assertEqual(submit_resp.status_code, status.HTTP_200_OK)
+
+    def test_submit_emergency_annual_without_reliever_succeeds(self):
+        self._create_balance(self.applicant, self.annual)
+        resp = self._post_create(self.applicant, self.annual, cover_person=None, is_emergency=True)
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+        leave_request = LeaveRequest.objects.filter(employee=self.applicant, leave_type=self.annual).latest("created_at")
+        submit_url = reverse("leave-request-submit", args=[leave_request.id])
+        submit_resp = self.client.post(submit_url)
+        self.assertEqual(submit_resp.status_code, status.HTTP_200_OK)
+
+    def test_submit_blocks_when_reliever_on_approved_leave(self):
+        self._create_balance(self.applicant, self.annual)
+        make_request(
+            self.same_team_cover,
+            self.annual,
+            status=LeaveRequestStatus.APPROVED,
+            start=self.start,
+            end=self.end,
+        )
+        resp = self._post_create(self.applicant, self.annual, cover_person=self.same_team_cover)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("cover_person", resp.data)
+
+    def test_hr_can_assign_cross_department_reliever_on_pending_request(self):
+        self._create_balance(self.applicant, self.annual)
+        leave_request = make_request(
+            self.applicant,
+            self.annual,
+            status=LeaveRequestStatus.PENDING_HR,
+            cover_person=self.same_team_cover,
+            start=self.start,
+            end=self.end,
+        )
+        self.client.force_authenticate(self.hr)
+        detail_url = reverse("leave-request-detail", args=[leave_request.id])
+        resp = self.client.patch(
+            detail_url,
+            {"cover_person": str(self.other_dept_user.id)},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        leave_request.refresh_from_db()
+        self.assertEqual(leave_request.cover_person_id, self.other_dept_user.id)

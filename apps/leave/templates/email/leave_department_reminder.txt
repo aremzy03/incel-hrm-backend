@@ -1,0 +1,15 @@
+Upcoming leave reminder
+
+{{ employee_name }} from {{ department_name }} will be on leave starting within
+approximately 24 hours.
+
+Employee: {{ employee_name }}
+Department: {{ department_name }}
+Leave type: {{ leave_type }}
+Dates: {{ start_date }} to {{ end_date }}
+Total days: {{ total_days }}
+Status: {{ status }}
+
+{% if action_url %}
+View request: {{ action_url }}
+{% endif %}

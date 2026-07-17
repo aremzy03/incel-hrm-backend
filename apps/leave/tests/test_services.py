@@ -36,6 +36,7 @@ import datetime
 from django.test import TestCase
 from rest_framework.exceptions import ValidationError
 
+from apps.accounts.models import Department, Team, Unit
 from apps.leave.models import (
     LeaveBalance,
     LeaveRequest,
@@ -43,17 +44,36 @@ from apps.leave.models import (
     LeaveType,
     PublicHoliday,
 )
-from apps.leave.services import WorkingDaysService
+from apps.leave.services import (
+    WorkingDaysService,
+    get_eligible_relievers,
+    reliever_required,
+    resolve_org_scope,
+    validate_cover_person_availability,
+    validate_cover_person_for_submission,
+)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_user(email="worker@test.com"):
+def make_user(email="worker@test.com", department=None, unit=None, team=None):
     from django.contrib.auth import get_user_model
     User = get_user_model()
-    return User.objects.create_user(email=email, password="testpass123")
+    user = User.objects.create_user(email=email, password="testpass123")
+    if department is not None:
+        user.department = department
+    if unit is not None:
+        user.unit = unit
+    if team is not None:
+        user.team = team
+    user.save()
+    return user
+
+
+def make_department(name="Engineering"):
+    return Department.objects.create(name=name)
 
 
 def make_leave_type(name="Annual", default_days=21):
@@ -365,3 +385,130 @@ class CheckOverlappingLeaveTests(TestCase):
                 datetime.date(2025, 3, 3),
                 datetime.date(2025, 3, 7),
             )
+
+
+# ---------------------------------------------------------------------------
+# Org scope + reliever service
+# ---------------------------------------------------------------------------
+
+class ResolveOrgScopeTests(TestCase):
+    def setUp(self):
+        self.dept = make_department("Scope Dept")
+        self.unit_a = Unit.objects.create(name="Unit A", department=self.dept)
+        self.unit_b = Unit.objects.create(name="Unit B", department=self.dept)
+        self.team_a = Team.objects.create(name="Team A", unit=self.unit_a)
+        self.team_b = Team.objects.create(name="Team B", unit=self.unit_b)
+
+    def test_team_scope_when_department_has_teams(self):
+        employee = make_user("team@test.com", department=self.dept, unit=self.unit_a, team=self.team_a)
+        level, filters = resolve_org_scope(employee)
+        self.assertEqual(level, "team")
+        self.assertEqual(filters, {"team_id": self.team_a.pk})
+
+    def test_unit_scope_when_no_team_assignment(self):
+        employee = make_user("unit@test.com", department=self.dept, unit=self.unit_a)
+        level, filters = resolve_org_scope(employee)
+        self.assertEqual(level, "unit")
+        self.assertEqual(filters, {"unit_id": self.unit_a.pk})
+
+    def test_department_scope_when_no_units_in_department(self):
+        dept = make_department("Flat Dept")
+        employee = make_user("flat@test.com", department=dept)
+        level, filters = resolve_org_scope(employee)
+        self.assertEqual(level, "department")
+        self.assertEqual(filters, {"department_id": dept.pk})
+
+
+class RelieverRequiredTests(TestCase):
+    def setUp(self):
+        from apps.accounts.models import Role, RoleName, UserRole
+
+        self.employee = make_user()
+        self.annual = make_leave_type("Annual")
+        self.sick = make_leave_type("Sick")
+
+    def _request(self, leave_type, is_emergency=False):
+        return LeaveRequest(
+            employee=self.employee,
+            leave_type=leave_type,
+            is_emergency=is_emergency,
+            start_date=datetime.date(2025, 3, 3),
+            end_date=datetime.date(2025, 3, 7),
+        )
+
+    def test_annual_requires_reliever(self):
+        self.assertTrue(reliever_required(self._request(self.annual)))
+
+    def test_sick_does_not_require_reliever(self):
+        self.assertFalse(reliever_required(self._request(self.sick)))
+
+    def test_emergency_annual_does_not_require_reliever(self):
+        self.assertFalse(reliever_required(self._request(self.annual, is_emergency=True)))
+
+    def test_emergency_sick_still_exempt(self):
+        self.assertFalse(reliever_required(self._request(self.sick, is_emergency=True)))
+
+    def test_executive_director_exempt(self):
+        from apps.accounts.models import Role, RoleName, UserRole
+
+        role = Role.objects.get(name=RoleName.EXECUTIVE_DIRECTOR)
+        UserRole.objects.get_or_create(user=self.employee, role=role)
+        self.assertFalse(reliever_required(self._request(self.annual)))
+
+
+class GetEligibleRelieversTests(TestCase):
+    def setUp(self):
+        self.dept = make_department("Reliever Dept")
+        self.unit = Unit.objects.create(name="Reliever Unit", department=self.dept)
+        self.team_a = Team.objects.create(name="Team A", unit=self.unit)
+        self.team_b = Team.objects.create(name="Team B", unit=self.unit)
+
+        self.emp_a = make_user("emp_a@test.com", department=self.dept, unit=self.unit, team=self.team_a)
+        self.emp_b = make_user("emp_b@test.com", department=self.dept, unit=self.unit, team=self.team_b)
+        self.emp_same_team = make_user("same_team@test.com", department=self.dept, unit=self.unit, team=self.team_a)
+
+    def test_team_scoped_relievers_exclude_other_teams(self):
+        result = get_eligible_relievers(self.emp_a)
+        self.assertEqual(result.scope_level, "team")
+        self.assertEqual(result.effective_scope_level, "team")
+        ids = set(result.relievers.values_list("pk", flat=True))
+        self.assertIn(self.emp_same_team.pk, ids)
+        self.assertNotIn(self.emp_b.pk, ids)
+
+    def test_cascade_to_unit_when_sole_team_member(self):
+        solo_team = Team.objects.create(name="Solo Team", unit=self.unit)
+        sole = make_user("sole_team@test.com", department=self.dept, unit=self.unit, team=solo_team)
+        result = get_eligible_relievers(sole)
+        self.assertEqual(result.scope_level, "team")
+        self.assertEqual(result.effective_scope_level, "unit")
+        self.assertTrue(result.fallback_applied)
+        ids = set(result.relievers.values_list("pk", flat=True))
+        self.assertIn(self.emp_a.pk, ids)
+
+
+class CoverPersonAvailabilityTests(TestCase):
+    def setUp(self):
+        self.cover = make_user("cover@test.com")
+        self.annual = make_leave_type("Annual")
+        self.start = datetime.date(2025, 4, 7)
+        self.end = datetime.date(2025, 4, 11)
+
+    def test_blocks_when_reliever_has_overlapping_approved_leave(self):
+        make_request(self.cover, self.annual, self.start, self.end, status=LeaveRequestStatus.APPROVED)
+        with self.assertRaises(ValidationError) as ctx:
+            validate_cover_person_availability(self.cover, self.start, self.end)
+        self.assertIn("cover_person", ctx.exception.detail)
+
+    def test_validate_for_submission_requires_cover_person(self):
+        employee = make_user("req@test.com")
+        req = LeaveRequest(
+            employee=employee,
+            leave_type=self.annual,
+            start_date=self.start,
+            end_date=self.end,
+            cover_person=None,
+        )
+        with self.assertRaises(ValidationError) as ctx:
+            validate_cover_person_for_submission(req)
+        self.assertIn("cover_person", ctx.exception.detail)
+

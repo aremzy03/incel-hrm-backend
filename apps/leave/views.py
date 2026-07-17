@@ -8,6 +8,7 @@ LeaveBalanceViewSet        – ReadOnly, role-filtered queryset + ?employee=&yea
 LeaveRequestViewSet        – Full CRUD minus DELETE, role-filtered queryset
   custom actions:
     POST  submit/:id/      – Employee: DRAFT → PENDING_MANAGER
+    GET   eligible-relievers/ – Org-scoped reliever picker for current user
     POST  approve/:id/     – Stage-based role transitions
     POST  reject/:id/      – Matching approver at current stage (comment required)
     POST  cancel/:id/      – Employee (own DRAFT/PENDING_MANAGER) or HR (any active)
@@ -48,11 +49,19 @@ from .serializers import (
     LeaveRequestReadSerializer,
     LeaveTypeSerializer,
     PublicHolidaySerializer,
+    _EmployeeMinimalSerializer,
 )
-from .services import get_eligible_leave_types
+from .services import (
+    get_eligible_leave_types,
+    get_eligible_relievers,
+    leave_starts_within_reminder_window,
+    validate_cover_person_for_submission,
+)
 from .tasks import (
     notify_approver_required,
+    notify_department_leave_reminder,
     notify_leave_decision,
+    notify_reliever_assigned,
 )
 
 
@@ -68,6 +77,59 @@ def _is_privileged(user) -> bool:
         or user.has_role(RoleName.EXECUTIVE_DIRECTOR)
         or user.has_role(RoleName.MANAGING_DIRECTOR)
     )
+
+
+def _queue_final_approval_notifications(leave_request, *, decision_comment: str = "") -> None:
+    """
+    Queue emails/notifications after a leave request reaches APPROVED:
+    - decision email to the applicant
+    - reliever assignment email when a cover person is set
+    - department reminder immediately when start is within ~24 hours
+    """
+    leave_request_id = str(leave_request.id)
+    transaction.on_commit(
+        lambda: notify_leave_decision.delay(
+            leave_request_id,
+            LeaveRequestStatus.APPROVED,
+            decision_comment,
+        )
+    )
+    if leave_request.cover_person_id:
+        transaction.on_commit(
+            lambda: notify_reliever_assigned.delay(leave_request_id)
+        )
+    if leave_starts_within_reminder_window(leave_request):
+        transaction.on_commit(
+            lambda: notify_department_leave_reminder.delay(leave_request_id)
+        )
+
+
+def _can_view_employee_leave_profile(viewer, employee) -> bool:
+    """Whether *viewer* may see another employee's leave history or balances."""
+    if viewer.pk == employee.pk:
+        return True
+    if _is_privileged(viewer):
+        return True
+
+    if viewer.has_role(RoleName.LINE_MANAGER) and viewer.department_id:
+        if employee.department_id == viewer.department_id:
+            return True
+
+    if viewer.has_role(RoleName.SUPERVISOR) and getattr(employee, "unit_id", None):
+        unit = getattr(employee, "unit", None)
+        configured = unit and getattr(unit, "supervisor_id", None) == viewer.pk
+        same_unit = getattr(viewer, "unit_id", None) == employee.unit_id
+        if configured or same_unit:
+            return True
+
+    if viewer.has_role(RoleName.TEAM_LEAD) and getattr(employee, "team_id", None):
+        team = getattr(employee, "team", None)
+        configured = team and getattr(team, "team_lead_id", None) == viewer.pk
+        same_team = getattr(viewer, "team_id", None) == employee.team_id
+        if configured or same_team:
+            return True
+
+    return False
 
 
 def _create_log(*, leave_request, actor, action, previous_status, new_status, comment=""):
@@ -125,16 +187,36 @@ class LeaveTypeViewSet(viewsets.ModelViewSet):
 class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
     """
     GET /api/v1/leave-balances/
-    Each authenticated user can only see their own balances.
+    Authenticated users see their own balances.
+    Approvers / HR may pass ?employee=<uuid> for a subordinate they can view.
     """
 
     serializer_class = LeaveBalanceSerializer
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
+        from apps.accounts.models import User
+
         user = self.request.user
         qs = LeaveBalance.objects.select_related("employee", "leave_type")
-        qs = qs.filter(employee=user, leave_type__in=get_eligible_leave_types(user))
+
+        employee_param = self.request.query_params.get("employee")
+        if employee_param:
+            try:
+                target = User.objects.select_related("unit", "team").get(pk=employee_param)
+            except (User.DoesNotExist, ValueError):
+                raise ValidationError({"employee": "Invalid employee id."})
+            if not _can_view_employee_leave_profile(user, target):
+                raise PermissionDenied(
+                    "You do not have permission to view this employee's leave balances."
+                )
+            qs = qs.filter(
+                employee=target,
+                leave_type__in=get_eligible_leave_types(target),
+            )
+        else:
+            qs = qs.filter(employee=user, leave_type__in=get_eligible_leave_types(user))
+
         year = self.request.query_params.get("year")
         if year:
             try:
@@ -289,6 +371,23 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             return LeaveRequestCreateSerializer
         return LeaveRequestReadSerializer
 
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        if self.action == "partial_update":
+            pk = self.kwargs.get("pk")
+            leave_request = (
+                LeaveRequest.objects.select_related("employee")
+                .filter(pk=pk)
+                .first()
+            )
+            if leave_request is not None:
+                user = self.request.user
+                is_hr = user.has_role(RoleName.HR)
+                is_owner = leave_request.employee == user
+                context["hr_override"] = is_hr and not is_owner
+                context["applicant"] = leave_request.employee
+        return context
+
     def partial_update(self, request, *args, **kwargs):
         """
         PATCH /api/v1/leave-requests/{id}/
@@ -316,6 +415,24 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             )
 
         return super().partial_update(request, *args, **kwargs)
+
+    # ------------------------------------------------------------------
+    # eligible_relievers — org-scoped reliever picker for the current user
+    # ------------------------------------------------------------------
+
+    @action(detail=False, methods=["get"], url_path="eligible-relievers")
+    def eligible_relievers(self, request):
+        scope_result = get_eligible_relievers(request.user)
+        return Response(
+            {
+                "scope_level": scope_result.scope_level,
+                "effective_scope_level": scope_result.effective_scope_level,
+                "fallback_applied": scope_result.fallback_applied,
+                "relievers": _EmployeeMinimalSerializer(
+                    scope_result.relievers, many=True
+                ).data,
+            }
+        )
 
     def get_queryset(self):
         user = self.request.user
@@ -458,6 +575,37 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         visible_q = base_visible | approved_visible_q | pending_visible_q | terminal_visible_q
         return qs.filter(visible_q).distinct()
 
+    def filter_queryset(self, queryset):
+        qs = super().filter_queryset(queryset)
+        if self.action != "list":
+            return qs
+
+        employee_id = self.request.query_params.get("employee")
+        if employee_id:
+            qs = qs.filter(employee_id=employee_id)
+
+        status_param = self.request.query_params.get("status")
+        if status_param:
+            statuses = [s.strip() for s in status_param.split(",") if s.strip()]
+            if len(statuses) == 1:
+                qs = qs.filter(status=statuses[0])
+            elif statuses:
+                qs = qs.filter(status__in=statuses)
+
+        leave_type_param = self.request.query_params.get("leave_type")
+        if leave_type_param:
+            leave_type_ids = [lt.strip() for lt in leave_type_param.split(",") if lt.strip()]
+            if len(leave_type_ids) == 1:
+                qs = qs.filter(leave_type_id=leave_type_ids[0])
+            elif leave_type_ids:
+                qs = qs.filter(leave_type_id__in=leave_type_ids)
+
+        exclude_id = self.request.query_params.get("exclude")
+        if exclude_id:
+            qs = qs.exclude(pk=exclude_id)
+
+        return qs
+
     # ------------------------------------------------------------------
     # Blocked HTTP methods
     # ------------------------------------------------------------------
@@ -529,6 +677,8 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                         {"department": "Your department has no line manager assigned. Contact HR."}
                     )
 
+        validate_cover_person_for_submission(leave_request, hr_override=False)
+
         prev_status = leave_request.status
         leave_request.status = first_status
         leave_request.skip_hr_stage = skip_hr_stage
@@ -546,12 +696,9 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
         if first_status == LeaveRequestStatus.APPROVED:
             _deduct_leave_balance(leave_request)
-            transaction.on_commit(
-                lambda: notify_leave_decision.delay(
-                    str(leave_request.id),
-                    LeaveRequestStatus.APPROVED,
-                    "Auto-approved based on requester role.",
-                )
+            _queue_final_approval_notifications(
+                leave_request,
+                decision_comment="Auto-approved based on requester role.",
             )
         else:
             transaction.on_commit(
@@ -613,6 +760,8 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                         {"department": "Your department has no line manager assigned. Contact HR."}
                     )
 
+        validate_cover_person_for_submission(leave_request, hr_override=False)
+
         prev_status = leave_request.status
         leave_request.status = first_status
         leave_request.skip_hr_stage = skip_hr_stage
@@ -630,12 +779,9 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
         if first_status == LeaveRequestStatus.APPROVED:
             _deduct_leave_balance(leave_request)
-            transaction.on_commit(
-                lambda: notify_leave_decision.delay(
-                    str(leave_request.id),
-                    LeaveRequestStatus.APPROVED,
-                    "Auto-approved based on requester role.",
-                )
+            _queue_final_approval_notifications(
+                leave_request,
+                decision_comment="Auto-approved based on requester role.",
             )
         else:
             transaction.on_commit(
@@ -739,12 +885,9 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             lambda: notify_approver_required.delay(str(leave_request.id))
         )
         if next_status == LeaveRequestStatus.APPROVED:
-            transaction.on_commit(
-                lambda: notify_leave_decision.delay(
-                    str(leave_request.id),
-                    LeaveRequestStatus.APPROVED,
-                    request.data.get("comment", ""),
-                )
+            _queue_final_approval_notifications(
+                leave_request,
+                decision_comment=request.data.get("comment", ""),
             )
 
         return Response(LeaveRequestReadSerializer(leave_request).data)

@@ -1,6 +1,8 @@
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
 
+from apps.accounts.models import RoleName
+
 from .models import (
     LeaveApprovalLog,
     LeaveBalance,
@@ -9,11 +11,14 @@ from .models import (
     LeaveType,
     PublicHoliday,
 )
-from .services import WorkingDaysService
+from .services import (
+    get_eligible_relievers,
+    reliever_required,
+    validate_cover_person_assignment,
+    WorkingDaysService,
+)
 
 User = get_user_model()
-
-_COVER_PERSON_QUERYSET = User.objects.filter(is_active=True)
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +98,7 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
       2. WorkingDaysService.check_overlapping_leave()
       3. WorkingDaysService.check_department_leave_overlap() (Annual/Casual only)
       4. WorkingDaysService.validate_leave_balance()
-      5. cover_person validations (not self, same department)
+      5. cover_person validations (org-scoped reliever rules)
 
     On create():
       - total_working_days is computed via WorkingDaysService.calculate_working_days()
@@ -102,7 +107,7 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
     """
 
     cover_person = serializers.PrimaryKeyRelatedField(
-        queryset=_COVER_PERSON_QUERYSET,
+        queryset=User.objects.filter(is_active=True),
         required=False,
         allow_null=True,
     )
@@ -110,6 +115,19 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = LeaveRequest
         fields = ("leave_type", "start_date", "end_date", "reason", "is_emergency", "cover_person")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get("request")
+        if request is None:
+            return
+
+        hr_override = self.context.get("hr_override", False)
+        applicant = self.context.get("applicant", request.user)
+        if hr_override:
+            self.fields["cover_person"].queryset = User.objects.filter(is_active=True)
+        else:
+            self.fields["cover_person"].queryset = get_eligible_relievers(applicant).relievers
 
     def validate(self, attrs):
         start_date = attrs.get("start_date")
@@ -121,19 +139,74 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
                     {"end_date": "end_date must be on or after start_date."}
                 )
 
-        employee = self.context["request"].user
+        request = self.context["request"]
+        employee = self.context.get("applicant", request.user)
+        hr_override = self.context.get("hr_override", False)
         leave_type = attrs.get("leave_type")
-        cover_person = attrs.get("cover_person")
+        cover_person = attrs.get("cover_person", serializers.empty)
 
-        if cover_person:
-            if cover_person == employee:
+        if self.instance is not None:
+            merged_leave_type = leave_type if leave_type is not None else self.instance.leave_type
+            merged_is_emergency = (
+                attrs["is_emergency"] if "is_emergency" in attrs else self.instance.is_emergency
+            )
+            merged_start = start_date if start_date is not None else self.instance.start_date
+            merged_end = end_date if end_date is not None else self.instance.end_date
+
+            if cover_person is serializers.empty:
+                merged_cover_person = self.instance.cover_person
+            else:
+                merged_cover_person = cover_person
+
+            preview = LeaveRequest(
+                employee=self.instance.employee,
+                leave_type=merged_leave_type,
+                is_emergency=merged_is_emergency,
+                start_date=merged_start,
+                end_date=merged_end,
+                cover_person=merged_cover_person,
+            )
+
+            if (
+                cover_person is not serializers.empty
+                and cover_person is None
+                and self.instance.status != LeaveRequestStatus.DRAFT
+                and reliever_required(preview)
+            ):
                 raise serializers.ValidationError(
-                    {"cover_person": "You cannot assign yourself as the cover person."}
+                    {"cover_person": "A reliever is required for this leave request."}
                 )
-            if getattr(employee, "department_id", None) and cover_person.department_id != employee.department_id:
+
+            if (
+                cover_person is serializers.empty
+                and merged_cover_person is None
+                and self.instance.status != LeaveRequestStatus.DRAFT
+                and reliever_required(preview)
+            ):
                 raise serializers.ValidationError(
-                    {"cover_person": "The cover person must be in the same department as you."}
+                    {"cover_person": "A reliever is required for this leave request."}
                 )
+
+            if cover_person is not serializers.empty:
+                validate_cover_person_assignment(
+                    preview,
+                    cover_person,
+                    hr_override=hr_override,
+                )
+        elif cover_person is not serializers.empty and cover_person is not None:
+            preview = LeaveRequest(
+                employee=employee,
+                leave_type=leave_type,
+                is_emergency=attrs.get("is_emergency", False),
+                start_date=start_date,
+                end_date=end_date,
+                cover_person=cover_person,
+            )
+            validate_cover_person_assignment(
+                preview,
+                cover_person,
+                hr_override=hr_override,
+            )
 
         if leave_type:
             if leave_type.name in ("Maternity", "Maternity Leave") and getattr(employee, "gender", None) != "FEMALE":
@@ -146,31 +219,39 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
                 )
 
         exclude_id = self.instance.pk if self.instance else None
-
-        WorkingDaysService.check_overlapping_leave(
-            employee=employee,
-            start_date=start_date,
-            end_date=end_date,
-            exclude_id=exclude_id,
-        )
-
-        leave_type_for_overlap = leave_type or (self.instance.leave_type if self.instance else None)
+        overlap_employee = self.instance.employee if self.instance else employee
         start_for_overlap = start_date or (self.instance.start_date if self.instance else None)
         end_for_overlap = end_date or (self.instance.end_date if self.instance else None)
+
+        if start_for_overlap and end_for_overlap:
+            WorkingDaysService.check_overlapping_leave(
+                employee=overlap_employee,
+                start_date=start_for_overlap,
+                end_date=end_for_overlap,
+                exclude_id=exclude_id,
+            )
+
+        leave_type_for_overlap = leave_type or (self.instance.leave_type if self.instance else None)
         WorkingDaysService.check_department_leave_overlap(
-            employee=employee,
+            employee=overlap_employee,
             start_date=start_for_overlap,
             end_date=end_for_overlap,
             leave_type=leave_type_for_overlap,
             exclude_id=exclude_id,
         )
 
-        if leave_type and start_date and end_date:
-            working_days = WorkingDaysService.calculate_working_days(start_date, end_date)
-            year = start_date.year
+        if leave_type_for_overlap and start_for_overlap and end_for_overlap:
+            if leave_type and start_date and end_date:
+                working_days = WorkingDaysService.calculate_working_days(start_date, end_date)
+                year = start_date.year
+            else:
+                working_days = WorkingDaysService.calculate_working_days(
+                    start_for_overlap, end_for_overlap
+                )
+                year = start_for_overlap.year
             WorkingDaysService.validate_leave_balance(
-                employee=employee,
-                leave_type=leave_type,
+                employee=overlap_employee,
+                leave_type=leave_type_for_overlap,
                 year=year,
                 requested_days=working_days,
             )

@@ -1,0 +1,14 @@
+You have been assigned as reliever
+
+{{ employee_name }} is going on leave and you ({{ reliever_name }}) have been
+assigned as their reliever for the period below.
+
+Employee: {{ employee_name }}
+Leave type: {{ leave_type }}
+Dates: {{ start_date }} to {{ end_date }}
+Total days: {{ total_days }}
+Status: {{ status }}
+
+{% if action_url %}
+View request: {{ action_url }}
+{% endif %}
