@@ -8,6 +8,10 @@ LeaveBalanceViewSet        – ReadOnly, role-filtered queryset + ?employee=&yea
 LeaveRequestViewSet        – Full CRUD minus DELETE, role-filtered queryset
   custom actions:
     POST  submit/:id/      – Employee: DRAFT → PENDING_MANAGER
+    POST  create-and-submit/ – Create + submit atomically
+    POST  reconcile/       – HR: backdated leave without approval workflow
+    POST  bulk-reconcile/  – HR: batch backdated leave
+    POST  bulk-reconcile-csv/ – HR: CSV upload for bulk reconcile
     GET   eligible-relievers/ – Org-scoped reliever picker for current user
     POST  approve/:id/     – Stage-based role transitions
     POST  reject/:id/      – Matching approver at current stage (comment required)
@@ -34,6 +38,7 @@ from apps.accounts.permissions import IsEmployee, IsHR
 
 from .models import (
     ApprovalAction,
+    BalanceTransactionSource,
     LeaveApprovalLog,
     LeaveBalance,
     LeaveRequest,
@@ -45,22 +50,30 @@ from .serializers import (
     CalendarEntrySerializer,
     LeaveApprovalLogSerializer,
     LeaveBalanceSerializer,
+    LeaveRequestBulkReconcileSerializer,
     LeaveRequestCreateSerializer,
     LeaveRequestReadSerializer,
+    LeaveRequestReconcileEditSerializer,
+    LeaveRequestReconcileSerializer,
     LeaveTypeSerializer,
     PublicHolidaySerializer,
     _EmployeeMinimalSerializer,
 )
 from .services import (
+    deduct_leave_balance,
     get_eligible_leave_types,
     get_eligible_relievers,
     leave_starts_within_reminder_window,
+    reconcile_leave_request,
+    restore_leave_balance,
     validate_cover_person_for_submission,
+    validate_reconcile_row,
 )
 from .tasks import (
     notify_approver_required,
     notify_department_leave_reminder,
     notify_leave_decision,
+    notify_leave_reconciled,
     notify_reliever_assigned,
 )
 
@@ -141,20 +154,6 @@ def _create_log(*, leave_request, actor, action, previous_status, new_status, co
         new_status=new_status,
         comment=comment,
     )
-
-
-def _deduct_leave_balance(leave_request) -> None:
-    """
-    Atomically add total_working_days to used_days for the employee's balance.
-    Uses F() to avoid a read-modify-write race condition.
-    """
-    from django.db.models import F
-
-    LeaveBalance.objects.filter(
-        employee=leave_request.employee,
-        leave_type=leave_request.leave_type,
-        year=leave_request.start_date.year,
-    ).update(used_days=F("used_days") + leave_request.total_working_days)
 
 
 # ---------------------------------------------------------------------------
@@ -362,11 +361,17 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_permissions(self):
+        if self.action in ("reconcile", "bulk_reconcile", "bulk_reconcile_csv"):
+            return [permissions.IsAuthenticated(), IsHR()]
         # All leave request actions require authentication. Additional
         # per-action checks are enforced inside the view methods.
         return [permissions.IsAuthenticated()]
 
     def get_serializer_class(self):
+        if self.action == "reconcile":
+            return LeaveRequestReconcileSerializer
+        if self.action in ("bulk_reconcile", "bulk_reconcile_csv"):
+            return LeaveRequestBulkReconcileSerializer
         if self.action in ("create", "partial_update"):
             return LeaveRequestCreateSerializer
         return LeaveRequestReadSerializer
@@ -393,7 +398,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         PATCH /api/v1/leave-requests/{id}/
 
         - Request owner: can edit their own request only while in DRAFT.
-        - HR: can edit any request, regardless of status.
+        - HR: can edit any request; reconciled APPROVED requests use balance-adjust flow.
         """
         leave_request = LeaveRequest.objects.select_related("employee").get(pk=kwargs.get("pk"))
         user = request.user
@@ -413,6 +418,27 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                     )
                 }
             )
+
+        if (
+            is_hr
+            and leave_request.is_reconciled
+            and leave_request.status == LeaveRequestStatus.APPROVED
+        ):
+            serializer = LeaveRequestReconcileEditSerializer(
+                leave_request,
+                data=request.data,
+                partial=True,
+                context={"request": request},
+            )
+            serializer.is_valid(raise_exception=True)
+            leave_request = serializer.save()
+            leave_request = LeaveRequest.objects.select_related(
+                "employee",
+                "leave_type",
+                "cover_person",
+                "reconciled_by",
+            ).get(pk=leave_request.pk)
+            return Response(LeaveRequestReadSerializer(leave_request).data)
 
         return super().partial_update(request, *args, **kwargs)
 
@@ -604,6 +630,13 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         if exclude_id:
             qs = qs.exclude(pk=exclude_id)
 
+        is_reconciled = self.request.query_params.get("is_reconciled")
+        if is_reconciled is not None:
+            if is_reconciled.lower() in ("true", "1", "yes"):
+                qs = qs.filter(is_reconciled=True)
+            elif is_reconciled.lower() in ("false", "0", "no"):
+                qs = qs.filter(is_reconciled=False)
+
         return qs
 
     # ------------------------------------------------------------------
@@ -695,7 +728,12 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         )
 
         if first_status == LeaveRequestStatus.APPROVED:
-            _deduct_leave_balance(leave_request)
+            deduct_leave_balance(
+                leave_request,
+                source=BalanceTransactionSource.APPROVAL,
+                actor=request.user,
+                reason="Auto-approved based on requester role.",
+            )
             _queue_final_approval_notifications(
                 leave_request,
                 decision_comment="Auto-approved based on requester role.",
@@ -778,7 +816,12 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         )
 
         if first_status == LeaveRequestStatus.APPROVED:
-            _deduct_leave_balance(leave_request)
+            deduct_leave_balance(
+                leave_request,
+                source=BalanceTransactionSource.APPROVAL,
+                actor=request.user,
+                reason="Auto-approved based on requester role.",
+            )
             _queue_final_approval_notifications(
                 leave_request,
                 decision_comment="Auto-approved based on requester role.",
@@ -792,6 +835,258 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             LeaveRequestReadSerializer(leave_request).data,
             status=status.HTTP_201_CREATED,
         )
+
+    # ------------------------------------------------------------------
+    # reconcile — HR: backdated leave without approval workflow
+    # ------------------------------------------------------------------
+
+    @action(detail=False, methods=["post"], url_path="reconcile")
+    def reconcile(self, request):
+        """
+        POST /api/v1/leave-requests/reconcile/
+
+        HR records backdated leave for an employee who was absent without applying.
+        Creates an APPROVED request, deducts leave balance, writes an audit log,
+        and notifies approval-chain stakeholders (informational only).
+        """
+        serializer = LeaveRequestReconcileSerializer(
+            data=request.data,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        notify_department = serializer.validated_data.get("notify_department_colleagues", False)
+
+        with transaction.atomic():
+            leave_request = serializer.save()
+
+        transaction.on_commit(
+            lambda: notify_leave_reconciled.delay(
+                str(leave_request.id),
+                notify_department_colleagues=notify_department,
+            )
+        )
+
+        leave_request = LeaveRequest.objects.select_related(
+            "employee",
+            "leave_type",
+            "cover_person",
+            "reconciled_by",
+        ).get(pk=leave_request.pk)
+
+        return Response(
+            LeaveRequestReadSerializer(leave_request).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    def _run_bulk_reconcile(
+        self,
+        *,
+        hr_user,
+        rows: list[dict],
+        allow_insufficient_balance: bool,
+        notify_department_colleagues: bool,
+    ) -> dict:
+        created = []
+        errors = []
+
+        for index, row in enumerate(rows):
+            try:
+                validate_reconcile_row(
+                    employee=row["employee"],
+                    leave_type=row["leave_type"],
+                    start_date=row["start_date"],
+                    end_date=row["end_date"],
+                    cover_person=row.get("cover_person"),
+                    allow_insufficient_balance=allow_insufficient_balance,
+                )
+                with transaction.atomic():
+                    leave_request = reconcile_leave_request(
+                        hr_user=hr_user,
+                        employee=row["employee"],
+                        leave_type=row["leave_type"],
+                        start_date=row["start_date"],
+                        end_date=row["end_date"],
+                        reason=row.get("reason", ""),
+                        reconciliation_note=row["reconciliation_note"],
+                        cover_person=row.get("cover_person"),
+                        allow_insufficient_balance=allow_insufficient_balance,
+                    )
+                transaction.on_commit(
+                    lambda lr_id=str(leave_request.id), nd=notify_department_colleagues: notify_leave_reconciled.delay(
+                        lr_id,
+                        notify_department_colleagues=nd,
+                    )
+                )
+                created.append(str(leave_request.id))
+            except ValidationError as exc:
+                detail = exc.detail if hasattr(exc, "detail") else str(exc)
+                errors.append({"index": index, "errors": detail})
+            except Exception as exc:
+                errors.append({"index": index, "errors": str(exc)})
+
+        return {"created": created, "errors": errors, "created_count": len(created)}
+
+    @action(detail=False, methods=["post"], url_path="bulk-reconcile")
+    def bulk_reconcile(self, request):
+        """
+        POST /api/v1/leave-requests/bulk-reconcile/
+
+        HR batch reconcile. Body: { rows: [...], allow_insufficient_balance?, notify_department_colleagues? }
+        """
+        serializer = LeaveRequestBulkReconcileSerializer(
+            data=request.data,
+            context={"request": request},
+        )
+        serializer.is_valid(raise_exception=True)
+        rows = serializer.validated_data["rows"]
+        result = self._run_bulk_reconcile(
+            hr_user=request.user,
+            rows=rows,
+            allow_insufficient_balance=serializer.validated_data.get(
+                "allow_insufficient_balance", False
+            ),
+            notify_department_colleagues=serializer.validated_data.get(
+                "notify_department_colleagues", False
+            ),
+        )
+        status_code = (
+            status.HTTP_201_CREATED
+            if result["created_count"] and not result["errors"]
+            else status.HTTP_207_MULTI_STATUS
+            if result["created_count"]
+            else status.HTTP_400_BAD_REQUEST
+        )
+        return Response(result, status=status_code)
+
+    @action(detail=False, methods=["post"], url_path="bulk-reconcile-csv")
+    def bulk_reconcile_csv(self, request):
+        """
+        POST /api/v1/leave-requests/bulk-reconcile-csv/
+
+        Multipart CSV upload. Columns:
+        email, leave_type, start_date, end_date, reconciliation_note
+        Optional: reason, cover_person_email
+        Form fields: allow_insufficient_balance, notify_department_colleagues (true/false)
+        """
+        upload_file = request.FILES.get("file")
+        if not upload_file:
+            raise ValidationError({"file": "CSV file is required (multipart field 'file')."})
+
+        try:
+            text = upload_file.read().decode("utf-8-sig")
+        except Exception:
+            raise ValidationError({"file": "Unable to read file as UTF-8 text."})
+
+        reader = csv.DictReader(io.StringIO(text))
+        required = {"email", "leave_type", "start_date", "end_date", "reconciliation_note"}
+        if not reader.fieldnames or not required.issubset(
+            {h.strip().lower() for h in reader.fieldnames}
+        ):
+            raise ValidationError(
+                {"file": "CSV header must include: email, leave_type, start_date, end_date, reconciliation_note"}
+            )
+
+        field_map = {h.strip().lower(): h for h in reader.fieldnames}
+        rows = []
+        parse_errors = []
+
+        for line_no, row in enumerate(reader, start=2):
+            email = (row.get(field_map["email"]) or "").strip().lower()
+            leave_type_name = (row.get(field_map["leave_type"]) or "").strip()
+            start_str = (row.get(field_map["start_date"]) or "").strip()
+            end_str = (row.get(field_map["end_date"]) or "").strip()
+            reconciliation_note = (row.get(field_map["reconciliation_note"]) or "").strip()
+            reason_key = field_map.get("reason")
+            reason = (row.get(reason_key, "") if reason_key else "").strip()
+            cover_key = field_map.get("cover_person_email")
+            cover_email = (
+                (row.get(cover_key, "") if cover_key else "").strip().lower()
+            )
+
+            if not all([email, leave_type_name, start_str, end_str, reconciliation_note]):
+                parse_errors.append({"line": line_no, "error": "Missing required column value."})
+                continue
+
+            try:
+                start_date = datetime.date.fromisoformat(start_str)
+                end_date = datetime.date.fromisoformat(end_str)
+            except ValueError:
+                parse_errors.append({"line": line_no, "error": "Dates must be YYYY-MM-DD."})
+                continue
+
+            from django.contrib.auth import get_user_model
+
+            User = get_user_model()
+            try:
+                employee = User.objects.get(email=email, is_active=True)
+            except User.DoesNotExist:
+                parse_errors.append({"line": line_no, "error": f"Unknown active user: {email}"})
+                continue
+
+            try:
+                leave_type = LeaveType.objects.get(name=leave_type_name)
+            except LeaveType.DoesNotExist:
+                parse_errors.append(
+                    {"line": line_no, "error": f"Unknown leave type: {leave_type_name}"}
+                )
+                continue
+
+            cover_person = None
+            if cover_email:
+                try:
+                    cover_person = User.objects.get(email=cover_email, is_active=True)
+                except User.DoesNotExist:
+                    parse_errors.append(
+                        {"line": line_no, "error": f"Unknown cover person: {cover_email}"}
+                    )
+                    continue
+
+            rows.append(
+                {
+                    "employee": employee,
+                    "leave_type": leave_type,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "reason": reason,
+                    "reconciliation_note": reconciliation_note,
+                    "cover_person": cover_person,
+                }
+            )
+
+        allow_insufficient = request.data.get("allow_insufficient_balance", "false").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+        notify_department = request.data.get("notify_department_colleagues", "false").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+
+        if not rows and parse_errors:
+            return Response(
+                {"created": [], "errors": parse_errors, "created_count": 0},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        result = self._run_bulk_reconcile(
+            hr_user=request.user,
+            rows=rows,
+            allow_insufficient_balance=allow_insufficient,
+            notify_department_colleagues=notify_department,
+        )
+        result["parse_errors"] = parse_errors
+        if parse_errors:
+            result["errors"] = parse_errors + result.get("errors", [])
+
+        status_code = status.HTTP_201_CREATED
+        if result["created_count"] and (result.get("errors") or parse_errors):
+            status_code = status.HTTP_207_MULTI_STATUS
+        elif not result["created_count"]:
+            status_code = status.HTTP_400_BAD_REQUEST
+
+        return Response(result, status=status_code)
 
     # ------------------------------------------------------------------
     # approve — Stage-based transitions with role enforcement
@@ -870,7 +1165,12 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             leave_request.save(update_fields=["status", "updated_at"])
 
             if next_status == LeaveRequestStatus.APPROVED:
-                _deduct_leave_balance(leave_request)
+                deduct_leave_balance(
+                    leave_request,
+                    source=BalanceTransactionSource.APPROVAL,
+                    actor=request.user,
+                    reason=request.data.get("comment", ""),
+                )
 
             _create_log(
                 leave_request=leave_request,
@@ -1009,10 +1309,19 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("You do not have permission to cancel this request.")
 
         prev_status = leave_request.status
+        was_approved = prev_status == LeaveRequestStatus.APPROVED
+        cancel_comment = request.data.get("comment", "")
 
         with transaction.atomic():
             leave_request.status = LeaveRequestStatus.CANCELLED
             leave_request.save(update_fields=["status", "updated_at"])
+
+            if was_approved:
+                restore_leave_balance(
+                    leave_request,
+                    actor=user,
+                    reason=cancel_comment or "Leave request cancelled.",
+                )
 
             _create_log(
                 leave_request=leave_request,
@@ -1020,7 +1329,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                 action=ApprovalAction.CANCEL,
                 previous_status=prev_status,
                 new_status=LeaveRequestStatus.CANCELLED,
-                comment=request.data.get("comment", ""),
+                comment=cancel_comment,
             )
 
         return Response(LeaveRequestReadSerializer(leave_request).data)

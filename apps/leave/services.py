@@ -21,7 +21,17 @@ from apps.accounts.models import (
     get_or_create_management_department,
 )
 
-from .models import LeaveBalance, LeaveRequest, LeaveRequestStatus, LeaveType, PublicHoliday
+from .models import (
+    BalanceTransactionSource,
+    BalanceTransactionType,
+    LeaveBalance,
+    LeaveBalanceTransaction,
+    LeavePolicy,
+    LeaveRequest,
+    LeaveRequestStatus,
+    LeaveType,
+    PublicHoliday,
+)
 from .utils import calculate_working_days
 
 User = get_user_model()
@@ -111,6 +121,473 @@ def get_department_leave_reminder_recipients(employee) -> list:
             users_by_id[user.pk] = user
 
     return list(users_by_id.values())
+
+
+def get_leave_approval_stakeholders(employee) -> list:
+    """
+    Everyone who would have been in the approval chain for *employee*:
+    team lead, unit supervisor, department line manager, all HR, all EDs,
+    and the employee themselves. Deduplicated.
+    """
+    users_by_id: dict = {employee.pk: employee}
+
+    team = getattr(employee, "team", None)
+    if team and team.team_lead_id:
+        users_by_id[team.team_lead_id] = team.team_lead
+
+    unit = getattr(employee, "unit", None)
+    if unit and unit.supervisor_id:
+        users_by_id[unit.supervisor_id] = unit.supervisor
+
+    line_manager = employee.get_department_line_manager()
+    if line_manager:
+        users_by_id[line_manager.pk] = line_manager
+
+    role_recipients = User.objects.filter(
+        is_active=True,
+        user_roles__role__name__in=(RoleName.HR, RoleName.EXECUTIVE_DIRECTOR),
+    ).distinct()
+    for user in role_recipients:
+        users_by_id[user.pk] = user
+
+    return list(users_by_id.values())
+
+
+def ensure_leave_balance_record(employee, leave_type, year: int) -> LeaveBalance:
+    """Create a balance row for the year when missing (e.g. backdated reconciliation)."""
+    balance, _ = LeaveBalance.objects.get_or_create(
+        employee=employee,
+        leave_type=leave_type,
+        year=year,
+        defaults={
+            "allocated_days": leave_type.default_days,
+            "used_days": 0,
+        },
+    )
+    return balance
+
+
+def get_active_policy(leave_type) -> Optional[LeavePolicy]:
+    """Return the most recently created policy for a leave type, if any."""
+    return (
+        LeavePolicy.objects.filter(leave_type=leave_type)
+        .order_by("-created_at")
+        .first()
+    )
+
+
+def validate_backdating_for_reconcile(leave_type, start_date: datetime.date) -> None:
+    """
+    Enforce LeavePolicy backdating rules for HR reconciliation.
+    Permissive when no policy exists.
+    """
+    policy = get_active_policy(leave_type)
+    if policy is None:
+        return
+
+    today = timezone.localdate()
+    if start_date >= today:
+        return
+
+    if not policy.allow_backdated:
+        raise ValidationError(
+            {
+                "start_date": (
+                    f"Backdated leave is not allowed for {leave_type.name}. "
+                    "Update the leave policy or choose a current/future start date."
+                )
+            }
+        )
+
+    if policy.maximum_backdate_days is not None:
+        earliest = today - datetime.timedelta(days=policy.maximum_backdate_days)
+        if start_date < earliest:
+            raise ValidationError(
+                {
+                    "start_date": (
+                        f"Start date is too far in the past. "
+                        f"Maximum backdate for {leave_type.name} is "
+                        f"{policy.maximum_backdate_days} day(s) "
+                        f"(earliest allowed: {earliest.isoformat()})."
+                    )
+                }
+            )
+
+
+def split_working_days_by_year(
+    start_date: datetime.date,
+    end_date: datetime.date,
+) -> dict[int, int]:
+    """Return {calendar_year: working_days} for each year spanned by the range."""
+    if start_date > end_date:
+        return {}
+
+    if start_date.year == end_date.year:
+        days = calculate_working_days(start_date, end_date)
+        return {start_date.year: days} if days else {}
+
+    result: dict[int, int] = {}
+    for year in range(start_date.year, end_date.year + 1):
+        segment_start = start_date if year == start_date.year else datetime.date(year, 1, 1)
+        segment_end = end_date if year == end_date.year else datetime.date(year, 12, 31)
+        days = calculate_working_days(segment_start, segment_end)
+        if days:
+            result[year] = days
+    return result
+
+
+def _year_days_for_request(leave_request) -> dict[tuple, int]:
+    """Map (leave_type_id, year) -> working days for a leave request."""
+    splits = split_working_days_by_year(leave_request.start_date, leave_request.end_date)
+    return {(leave_request.leave_type_id, year): days for year, days in splits.items()}
+
+
+def has_balance_been_deducted(leave_request) -> bool:
+    return LeaveBalanceTransaction.objects.filter(
+        leave_request=leave_request,
+        transaction_type=BalanceTransactionType.DEDUCT,
+    ).exists()
+
+
+def has_balance_been_refunded(leave_request) -> bool:
+    return LeaveBalanceTransaction.objects.filter(
+        leave_request=leave_request,
+        transaction_type=BalanceTransactionType.REFUND,
+    ).exists()
+
+
+def record_balance_change(
+    *,
+    employee,
+    leave_type,
+    year: int,
+    delta_used_days: int,
+    transaction_type: str,
+    source: str,
+    leave_request=None,
+    actor=None,
+    reason: str = "",
+    allow_insufficient_balance: bool = False,
+) -> LeaveBalanceTransaction:
+    """
+    Atomically update used_days and write an immutable ledger row.
+    delta_used_days > 0 deducts; delta_used_days < 0 refunds.
+    """
+    from django.db import transaction
+    from django.db.models import F
+
+    if delta_used_days == 0:
+        raise ValidationError({"leave_balance": "Balance delta cannot be zero."})
+
+    balance = ensure_leave_balance_record(employee, leave_type, year)
+
+    if delta_used_days > 0 and not allow_insufficient_balance:
+        remaining = balance.allocated_days - balance.used_days
+        if remaining < delta_used_days:
+            raise ValidationError(
+                {
+                    "leave_balance": (
+                        f"Insufficient leave balance for {leave_type.name} in {year}. "
+                        f"Available: {remaining}, Requested: {delta_used_days}"
+                    )
+                }
+            )
+
+    with transaction.atomic():
+        LeaveBalance.objects.filter(pk=balance.pk).update(
+            used_days=F("used_days") + delta_used_days,
+        )
+        return LeaveBalanceTransaction.objects.create(
+            leave_balance=balance,
+            leave_request=leave_request,
+            transaction_type=transaction_type,
+            source=source,
+            delta_used_days=delta_used_days,
+            actor=actor,
+            reason=reason,
+        )
+
+
+def deduct_leave_balance(
+    leave_request,
+    *,
+    source: str = BalanceTransactionSource.APPROVAL,
+    actor=None,
+    reason: str = "",
+    allow_insufficient_balance: bool = False,
+) -> list[LeaveBalanceTransaction]:
+    """Deduct working days across calendar years with ledger entries."""
+    if has_balance_been_deducted(leave_request):
+        return list(
+            LeaveBalanceTransaction.objects.filter(
+                leave_request=leave_request,
+                transaction_type=BalanceTransactionType.DEDUCT,
+            )
+        )
+
+    year_days = split_working_days_by_year(
+        leave_request.start_date,
+        leave_request.end_date,
+    )
+    transactions = []
+    for year, days in year_days.items():
+        txn = record_balance_change(
+            employee=leave_request.employee,
+            leave_type=leave_request.leave_type,
+            year=year,
+            delta_used_days=days,
+            transaction_type=BalanceTransactionType.DEDUCT,
+            source=source,
+            leave_request=leave_request,
+            actor=actor,
+            reason=reason,
+            allow_insufficient_balance=allow_insufficient_balance,
+        )
+        transactions.append(txn)
+    return transactions
+
+
+def restore_leave_balance(
+    leave_request,
+    *,
+    actor=None,
+    reason: str = "",
+) -> list[LeaveBalanceTransaction]:
+    """
+    Refund deducted days when an APPROVED request is cancelled.
+    Guards against double-refund via unique REFUND constraint per request.
+    """
+    if not has_balance_been_deducted(leave_request):
+        return []
+    if has_balance_been_refunded(leave_request):
+        raise ValidationError(
+            {"leave_balance": "Balance has already been refunded for this leave request."}
+        )
+
+    deduct_txns = LeaveBalanceTransaction.objects.filter(
+        leave_request=leave_request,
+        transaction_type=BalanceTransactionType.DEDUCT,
+    ).select_related("leave_balance", "leave_balance__leave_type")
+
+    transactions = []
+    for deduct_txn in deduct_txns:
+        refund_days = -deduct_txn.delta_used_days
+        balance = deduct_txn.leave_balance
+        txn = record_balance_change(
+            employee=balance.employee,
+            leave_type=balance.leave_type,
+            year=balance.year,
+            delta_used_days=refund_days,
+            transaction_type=BalanceTransactionType.REFUND,
+            source=BalanceTransactionSource.CANCEL_REFUND,
+            leave_request=leave_request,
+            actor=actor,
+            reason=reason,
+            allow_insufficient_balance=True,
+        )
+        transactions.append(txn)
+    return transactions
+
+
+def adjust_balance_for_reconciled_edit(
+    old_request,
+    new_request,
+    *,
+    actor,
+    reason: str = "",
+    allow_insufficient_balance: bool = False,
+) -> list[LeaveBalanceTransaction]:
+    """
+    Apply net balance delta when HR edits a reconciled APPROVED request.
+    Handles leave type and/or date changes including cross-year splits.
+    """
+    old_map = _year_days_for_request(old_request)
+    new_map = _year_days_for_request(new_request)
+    all_keys = set(old_map) | set(new_map)
+
+    transactions = []
+    for leave_type_id, year in all_keys:
+        old_days = old_map.get((leave_type_id, year), 0)
+        new_days = new_map.get((leave_type_id, year), 0)
+        delta = new_days - old_days
+        if delta == 0:
+            continue
+
+        leave_type = (
+            new_request.leave_type
+            if leave_type_id == new_request.leave_type_id
+            else old_request.leave_type
+        )
+        if leave_type_id != leave_type.id:
+            leave_type = LeaveType.objects.get(pk=leave_type_id)
+
+        txn = record_balance_change(
+            employee=new_request.employee,
+            leave_type=leave_type,
+            year=year,
+            delta_used_days=delta,
+            transaction_type=BalanceTransactionType.ADJUST,
+            source=BalanceTransactionSource.RECONCILE_EDIT,
+            leave_request=new_request,
+            actor=actor,
+            reason=reason,
+            allow_insufficient_balance=allow_insufficient_balance,
+        )
+        transactions.append(txn)
+    return transactions
+
+
+def validate_reconcile_balance(
+    employee,
+    leave_type,
+    start_date: datetime.date,
+    end_date: datetime.date,
+    *,
+    allow_insufficient_balance: bool = False,
+) -> None:
+    """Validate sufficient balance per calendar year spanned by the date range."""
+    if allow_insufficient_balance:
+        return
+
+    year_days = split_working_days_by_year(start_date, end_date)
+    for year, days in year_days.items():
+        ensure_leave_balance_record(employee, leave_type, year)
+        WorkingDaysService.validate_leave_balance(
+            employee=employee,
+            leave_type=leave_type,
+            year=year,
+            requested_days=days,
+        )
+
+
+def reconcile_leave_request(
+    *,
+    hr_user,
+    employee,
+    leave_type,
+    start_date: datetime.date,
+    end_date: datetime.date,
+    reason: str,
+    reconciliation_note: str,
+    cover_person=None,
+    allow_insufficient_balance: bool = False,
+) -> LeaveRequest:
+    """
+    Create an APPROVED, backdated leave request recorded by HR, deduct balance,
+    and write an audit log. Caller should queue stakeholder notifications.
+    """
+    from django.db import transaction
+
+    from .models import ApprovalAction, LeaveApprovalLog
+
+    validate_backdating_for_reconcile(leave_type, start_date)
+    validate_reconcile_balance(
+        employee,
+        leave_type,
+        start_date,
+        end_date,
+        allow_insufficient_balance=allow_insufficient_balance,
+    )
+
+    with transaction.atomic():
+        leave_request = LeaveRequest.objects.create(
+            employee=employee,
+            leave_type=leave_type,
+            cover_person=cover_person,
+            start_date=start_date,
+            end_date=end_date,
+            reason=reason,
+            status=LeaveRequestStatus.APPROVED,
+            is_reconciled=True,
+            reconciled_by=hr_user,
+            reconciled_at=timezone.now(),
+            reconciliation_note=reconciliation_note,
+        )
+        LeaveApprovalLog.objects.create(
+            leave_request=leave_request,
+            actor=hr_user,
+            action=ApprovalAction.RECONCILE,
+            previous_status="",
+            new_status=LeaveRequestStatus.APPROVED,
+            comment=reconciliation_note,
+        )
+        deduct_leave_balance(
+            leave_request,
+            source=BalanceTransactionSource.RECONCILE,
+            actor=hr_user,
+            reason=reconciliation_note,
+            allow_insufficient_balance=allow_insufficient_balance,
+        )
+
+    return leave_request
+
+
+def validate_reconcile_row(
+    *,
+    employee,
+    leave_type,
+    start_date: datetime.date,
+    end_date: datetime.date,
+    cover_person=None,
+    allow_insufficient_balance: bool = False,
+    exclude_request_id=None,
+) -> None:
+    """Shared validation for single and bulk reconcile."""
+    if start_date > end_date:
+        raise ValidationError({"end_date": "end_date must be on or after start_date."})
+
+    if leave_type.name in ("Maternity", "Maternity Leave") and getattr(employee, "gender", None) != "FEMALE":
+        raise ValidationError({"leave_type": "Maternity leave is only available for female staff."})
+    if leave_type.name in ("Paternity", "Paternity Leave") and getattr(employee, "gender", None) != "MALE":
+        raise ValidationError({"leave_type": "Paternity leave is only available for male staff."})
+
+    validate_backdating_for_reconcile(leave_type, start_date)
+
+    WorkingDaysService.check_overlapping_leave(
+        employee=employee,
+        start_date=start_date,
+        end_date=end_date,
+        exclude_id=exclude_request_id,
+    )
+    WorkingDaysService.check_department_leave_overlap(
+        employee=employee,
+        start_date=start_date,
+        end_date=end_date,
+        leave_type=leave_type,
+        exclude_id=exclude_request_id,
+    )
+    validate_reconcile_balance(
+        employee,
+        leave_type,
+        start_date,
+        end_date,
+        allow_insufficient_balance=allow_insufficient_balance,
+    )
+
+    if cover_person is not None:
+        preview = LeaveRequest(
+            employee=employee,
+            leave_type=leave_type,
+            start_date=start_date,
+            end_date=end_date,
+            cover_person=cover_person,
+        )
+        validate_cover_person_assignment(preview, cover_person, hr_override=True)
+
+    duplicate_qs = LeaveRequest.objects.filter(
+        employee=employee,
+        leave_type=leave_type,
+        start_date=start_date,
+        end_date=end_date,
+        status=LeaveRequestStatus.APPROVED,
+    )
+    if exclude_request_id:
+        duplicate_qs = duplicate_qs.exclude(pk=exclude_request_id)
+    if duplicate_qs.exists():
+        raise ValidationError(
+            "An approved leave request already exists for this employee, "
+            "leave type, and date range."
+        )
 
 
 def leave_starts_within_reminder_window(leave_request, *, today: Optional[datetime.date] = None) -> bool:

@@ -5,6 +5,34 @@ Items are ordered by impact and dependency. Complete earlier phases before later
 
 ---
 
+## Leave reconciliation
+
+> HR can record backdated leave for staff who were absent without applying through the app.
+
+### MVP (shipped)
+
+- [x] `POST /api/v1/leave-requests/reconcile/` — HR-only endpoint
+- [x] `LeaveRequest` fields: `is_reconciled`, `reconciled_by`, `reconciled_at`, `reconciliation_note`
+- [x] `ApprovalAction.RECONCILE` audit log entry
+- [x] Balance deduction on reconcile (same `used_days` increment as final approval)
+- [x] `notify_leave_reconciled` — informational email/in-app notice to approval-chain stakeholders + cover person
+- [x] `NotificationType.LEAVE_RECONCILED`
+- [x] List filter: `?is_reconciled=true|false`
+- [x] API tests under `apps/leave/tests/test_reconcile.py`
+
+### Phase 2 — Reconciliation hardening (shipped)
+
+- [x] **Balance restoration on cancel** — HR cancel of APPROVED (including reconciled) decrements `used_days`; guarded by unique REFUND ledger row per request
+- [x] **`allow_insufficient_balance` override** — optional flag on reconcile/bulk payloads; recorded in ledger
+- [x] **Policy-driven backdating rules** — `LeavePolicy.allow_backdated` and `maximum_backdate_days` enforced on reconcile
+- [x] **`LeaveBalanceTransaction` ledger** — immutable audit row per balance change (DEDUCT, REFUND, ADJUST)
+- [x] **Department-wide awareness** — optional `notify_department_colleagues` on reconcile/bulk
+- [x] **Edit reconciled leave** — HR PATCH on reconciled APPROVED requests with automatic balance delta + MODIFY log
+- [x] **Cross-year reconciliation** — `split_working_days_by_year()` splits deduction/refund/adjust by calendar year
+- [x] **Bulk reconcile** — `POST bulk-reconcile/` (JSON rows) and `POST bulk-reconcile-csv/` (CSV upload)
+
+---
+
 ## Phase 1 — Activate LeavePolicy (foundation)
 
 > Unlocks correct allocation, day-counting rules, and HR self-service policy editing. Do this first.

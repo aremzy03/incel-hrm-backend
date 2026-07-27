@@ -52,6 +52,15 @@ class LeavePolicy(TimeStampedModel):
     weekend_excluded = models.BooleanField(default=True)
     public_holiday_excluded = models.BooleanField(default=True)
     forfeited_on_resignation = models.BooleanField(default=True)
+    allow_backdated = models.BooleanField(
+        default=True,
+        help_text="When False, reconciled leave cannot start before today.",
+    )
+    maximum_backdate_days = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="Max days in the past for reconciled leave start_date. Null = unlimited.",
+    )
 
     class Meta:
         verbose_name = "Leave Policy"
@@ -175,6 +184,22 @@ class LeaveRequest(TimeStampedModel):
         blank=True,
         help_text="When the 24h-before-start department reminder email was sent.",
     )
+    is_reconciled = models.BooleanField(
+        default=False,
+        help_text="True when HR recorded this leave retroactively without the approval workflow.",
+    )
+    reconciled_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="reconciled_leave_requests",
+    )
+    reconciled_at = models.DateTimeField(null=True, blank=True)
+    reconciliation_note = models.TextField(
+        blank=True,
+        help_text="HR justification for backdated / reconciled leave.",
+    )
 
     class Meta:
         verbose_name = "Leave Request"
@@ -199,6 +224,88 @@ class LeaveRequest(TimeStampedModel):
 
 
 # ---------------------------------------------------------------------------
+# LeaveBalanceTransaction — immutable balance audit ledger
+# ---------------------------------------------------------------------------
+
+class BalanceTransactionType(models.TextChoices):
+    DEDUCT = "DEDUCT", "Deduct"
+    REFUND = "REFUND", "Refund"
+    ADJUST = "ADJUST", "Adjust"
+
+
+class BalanceTransactionSource(models.TextChoices):
+    APPROVAL = "APPROVAL", "Approval"
+    RECONCILE = "RECONCILE", "Reconcile"
+    CANCEL_REFUND = "CANCEL_REFUND", "Cancel refund"
+    RECONCILE_EDIT = "RECONCILE_EDIT", "Reconcile edit"
+    HR_ADJUST = "HR_ADJUST", "HR adjust"
+
+
+class LeaveBalanceTransaction(models.Model):
+    """
+    Immutable ledger row for every change to LeaveBalance.used_days.
+    delta_used_days: positive increases used_days (deduction), negative decreases (refund).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    leave_balance = models.ForeignKey(
+        LeaveBalance,
+        on_delete=models.PROTECT,
+        related_name="transactions",
+    )
+    leave_request = models.ForeignKey(
+        LeaveRequest,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="balance_transactions",
+    )
+    transaction_type = models.CharField(
+        max_length=10,
+        choices=BalanceTransactionType.choices,
+    )
+    source = models.CharField(
+        max_length=20,
+        choices=BalanceTransactionSource.choices,
+    )
+    delta_used_days = models.IntegerField(
+        help_text="Change applied to used_days (positive = deduct, negative = refund).",
+    )
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="leave_balance_transactions",
+    )
+    reason = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Leave Balance Transaction"
+        verbose_name_plural = "Leave Balance Transactions"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["leave_request"],
+                condition=models.Q(transaction_type=BalanceTransactionType.REFUND),
+                name="unique_refund_per_leave_request",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["leave_request", "transaction_type"]),
+            models.Index(fields=["leave_balance", "-created_at"]),
+        ]
+
+    def __str__(self):
+        sign = "+" if self.delta_used_days >= 0 else ""
+        return (
+            f"{self.transaction_type} {sign}{self.delta_used_days}d "
+            f"on balance {self.leave_balance_id}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # LeaveApprovalLog
 # ---------------------------------------------------------------------------
 
@@ -207,6 +314,7 @@ class ApprovalAction(models.TextChoices):
     REJECT = "REJECT", "Reject"
     CANCEL = "CANCEL", "Cancel"
     MODIFY = "MODIFY", "Modify"
+    RECONCILE = "RECONCILE", "Reconcile"
 
 
 class LeaveApprovalLog(models.Model):

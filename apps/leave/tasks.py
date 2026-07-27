@@ -16,7 +16,7 @@ from apps.accounts.models import RoleName, get_or_create_management_department
 from apps.notifications.models import Notification, NotificationType
 
 from .models import LeaveRequest, LeaveRequestStatus
-from .services import get_department_leave_reminder_recipients
+from .services import get_department_leave_reminder_recipients, get_leave_approval_stakeholders
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
@@ -488,6 +488,106 @@ def notify_department_leave_reminder(leave_request_id: str) -> bool:
         department_reminder_sent_at=timezone.now()
     )
     return sent
+
+
+@shared_task
+def notify_leave_reconciled(
+    leave_request_id: str,
+    notify_department_colleagues: bool = False,
+) -> bool:
+    """
+    Notify approval-chain stakeholders that HR recorded backdated leave.
+    Informational only — no approval action is required.
+    """
+    try:
+        leave_request = (
+            LeaveRequest.objects.select_related(
+                "employee",
+                "leave_type",
+                "cover_person",
+                "reconciled_by",
+            ).get(pk=leave_request_id)
+        )
+    except LeaveRequest.DoesNotExist:
+        return False
+
+    if not leave_request.is_reconciled:
+        return False
+
+    users_by_id = {user.pk: user for user in get_leave_approval_stakeholders(leave_request.employee)}
+    if leave_request.cover_person_id and leave_request.cover_person.is_active:
+        users_by_id[leave_request.cover_person_id] = leave_request.cover_person
+
+    if notify_department_colleagues:
+        for user in get_department_leave_reminder_recipients(leave_request.employee):
+            users_by_id[user.pk] = user
+
+    employee_name = _employee_name(leave_request)
+    reconciled_by_name = (
+        leave_request.reconciled_by.get_full_name() or leave_request.reconciled_by.email
+        if leave_request.reconciled_by_id
+        else "HR"
+    )
+    subject = f"Leave reconciled by HR — {employee_name}"
+    body = (
+        f"HR has recorded backdated leave for {employee_name}. "
+        f"No approval action is required.\n\n"
+        f"Recorded by: {reconciled_by_name}\n"
+        f"Employee: {employee_name}\n"
+        f"Leave Type: {leave_request.leave_type.name}\n"
+        f"Dates: {leave_request.start_date} to {leave_request.end_date}\n"
+        f"Total Days: {leave_request.total_working_days}\n"
+        f"Note: {leave_request.reconciliation_note or 'N/A'}\n"
+    )
+
+    recipients = [u.email for u in users_by_id.values() if getattr(u, "email", None)]
+    user_ids: list[str] = []
+
+    for user in users_by_id.values():
+        notification = Notification.objects.create(
+            recipient=user,
+            title=subject,
+            body=body,
+            type=NotificationType.LEAVE_RECONCILED,
+            data={
+                "leave_request_id": str(leave_request.id),
+                "status": leave_request.status,
+                "is_reconciled": True,
+            },
+        )
+        user_ids.append(str(user.id))
+        _publish_notifications(
+            redis_url=settings.NOTIFICATIONS_REDIS_URL,
+            user_ids=[str(user.id)],
+            payload={
+                "notification_id": str(notification.id),
+                "type": notification.type,
+                "title": notification.title,
+                "body": notification.body,
+                "data": notification.data,
+                "created_at": notification.created_at.isoformat(),
+            },
+        )
+
+    return _send_email_if_possible(
+        subject=subject,
+        text_body=body,
+        recipients=recipients,
+        html_template="email/leave_reconciled.html",
+        text_template="email/leave_reconciled.txt",
+        template_context={
+            "employee_name": employee_name,
+            "reconciled_by_name": reconciled_by_name,
+            "leave_type": leave_request.leave_type.name,
+            "start_date": leave_request.start_date,
+            "end_date": leave_request.end_date,
+            "total_days": leave_request.total_working_days,
+            "status": leave_request.status,
+            "reconciliation_note": leave_request.reconciliation_note or "",
+            "reason": leave_request.reason or "",
+            "action_url": _leave_request_action_url(leave_request),
+        },
+    )
 
 
 @shared_task

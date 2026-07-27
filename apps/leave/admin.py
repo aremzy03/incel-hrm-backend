@@ -3,6 +3,7 @@ from django.contrib import admin
 from .models import (
     LeaveApprovalLog,
     LeaveBalance,
+    LeaveBalanceTransaction,
     LeavePolicy,
     LeaveRequest,
     LeaveType,
@@ -42,6 +43,8 @@ class LeavePolicyAdmin(admin.ModelAdmin):
         "annual_entitlement",
         "carry_forward",
         "half_day_allowed",
+        "allow_backdated",
+        "maximum_backdate_days",
     )
     list_filter = ("leave_type",)
     readonly_fields = ("id", "created_at", "updated_at")
@@ -72,14 +75,18 @@ class LeaveRequestAdmin(admin.ModelAdmin):
         "end_date",
         "total_working_days",
         "status",
+        "is_reconciled",
         "created_at",
     )
-    list_filter = ("status", "leave_type", "created_at")
+    list_filter = ("status", "leave_type", "is_reconciled", "created_at")
     search_fields = ("employee__email", "employee__first_name")
     readonly_fields = (
         "id",
         "total_working_days",
         "department_reminder_sent_at",
+        "is_reconciled",
+        "reconciled_by",
+        "reconciled_at",
         "created_at",
         "updated_at",
     )
@@ -92,3 +99,42 @@ class LeaveApprovalLogAdmin(admin.ModelAdmin):
     list_filter = ("action",)
     search_fields = ("actor__email", "leave_request__employee__email")
     readonly_fields = ("id", "timestamp")
+
+
+@admin.register(LeaveBalanceTransaction)
+class LeaveBalanceTransactionAdmin(admin.ModelAdmin):
+    list_display = (
+        "leave_balance",
+        "transaction_type",
+        "source",
+        "delta_used_days",
+        "leave_request",
+        "actor",
+        "created_at",
+    )
+    list_filter = ("transaction_type", "source", "created_at")
+    search_fields = (
+        "leave_balance__employee__email",
+        "leave_request__employee__email",
+        "reason",
+    )
+    readonly_fields = (
+        "id",
+        "leave_balance",
+        "leave_request",
+        "transaction_type",
+        "source",
+        "delta_used_days",
+        "actor",
+        "reason",
+        "created_at",
+    )
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

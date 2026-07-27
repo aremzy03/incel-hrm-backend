@@ -12,9 +12,14 @@ from .models import (
     PublicHoliday,
 )
 from .services import (
+    adjust_balance_for_reconciled_edit,
+    ensure_leave_balance_record,
     get_eligible_relievers,
+    reconcile_leave_request,
     reliever_required,
     validate_cover_person_assignment,
+    validate_reconcile_balance,
+    validate_reconcile_row,
     WorkingDaysService,
 )
 
@@ -280,6 +285,7 @@ class LeaveRequestReadSerializer(serializers.ModelSerializer):
     employee = _EmployeeMinimalSerializer(read_only=True)
     leave_type = LeaveTypeSerializer(read_only=True)
     cover_person = _EmployeeMinimalSerializer(read_only=True)
+    reconciled_by = _EmployeeMinimalSerializer(read_only=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
 
     class Meta:
@@ -296,10 +302,236 @@ class LeaveRequestReadSerializer(serializers.ModelSerializer):
             "is_emergency",
             "status",
             "status_display",
+            "is_reconciled",
+            "reconciled_by",
+            "reconciled_at",
+            "reconciliation_note",
             "created_at",
             "updated_at",
         )
         read_only_fields = fields
+
+
+# ---------------------------------------------------------------------------
+# LeaveRequest — HR reconciliation
+# ---------------------------------------------------------------------------
+
+class LeaveRequestReconcileSerializer(serializers.Serializer):
+    """
+    HR-only: record backdated leave for an employee without the approval workflow.
+    Creates an APPROVED request, deducts balance, and queues stakeholder notifications.
+    """
+
+    employee = serializers.PrimaryKeyRelatedField(queryset=User.objects.filter(is_active=True))
+    leave_type = serializers.PrimaryKeyRelatedField(queryset=LeaveType.objects.all())
+    start_date = serializers.DateField()
+    end_date = serializers.DateField()
+    reason = serializers.CharField(required=False, allow_blank=True, default="")
+    reconciliation_note = serializers.CharField()
+    cover_person = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.filter(is_active=True),
+        required=False,
+        allow_null=True,
+    )
+    allow_insufficient_balance = serializers.BooleanField(required=False, default=False)
+    notify_department_colleagues = serializers.BooleanField(required=False, default=False)
+
+    def validate_reconciliation_note(self, value):
+        note = (value or "").strip()
+        if not note:
+            raise serializers.ValidationError("A reconciliation note is required.")
+        return note
+
+    def validate(self, attrs):
+        validate_reconcile_row(
+            employee=attrs["employee"],
+            leave_type=attrs["leave_type"],
+            start_date=attrs["start_date"],
+            end_date=attrs["end_date"],
+            cover_person=attrs.get("cover_person"),
+            allow_insufficient_balance=attrs.get("allow_insufficient_balance", False),
+        )
+        return attrs
+
+    def create(self, validated_data):
+        hr_user = self.context["request"].user
+        return reconcile_leave_request(
+            hr_user=hr_user,
+            employee=validated_data["employee"],
+            leave_type=validated_data["leave_type"],
+            start_date=validated_data["start_date"],
+            end_date=validated_data["end_date"],
+            reason=validated_data.get("reason", ""),
+            reconciliation_note=validated_data["reconciliation_note"],
+            cover_person=validated_data.get("cover_person"),
+            allow_insufficient_balance=validated_data.get("allow_insufficient_balance", False),
+        )
+
+
+class LeaveRequestReconcileRowSerializer(serializers.Serializer):
+    """One row in a bulk reconcile request."""
+
+    employee = serializers.PrimaryKeyRelatedField(queryset=User.objects.filter(is_active=True))
+    leave_type = serializers.PrimaryKeyRelatedField(queryset=LeaveType.objects.all())
+    start_date = serializers.DateField()
+    end_date = serializers.DateField()
+    reason = serializers.CharField(required=False, allow_blank=True, default="")
+    reconciliation_note = serializers.CharField()
+    cover_person = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.filter(is_active=True),
+        required=False,
+        allow_null=True,
+    )
+
+    def validate_reconciliation_note(self, value):
+        note = (value or "").strip()
+        if not note:
+            raise serializers.ValidationError("A reconciliation note is required.")
+        return note
+
+
+class LeaveRequestBulkReconcileSerializer(serializers.Serializer):
+    """HR-only: reconcile multiple backdated leave rows in one request."""
+
+    rows = LeaveRequestReconcileRowSerializer(many=True)
+    allow_insufficient_balance = serializers.BooleanField(required=False, default=False)
+    notify_department_colleagues = serializers.BooleanField(required=False, default=False)
+
+    def validate_rows(self, value):
+        if not value:
+            raise serializers.ValidationError("At least one row is required.")
+        return value
+
+
+class LeaveRequestReconcileEditSerializer(serializers.ModelSerializer):
+    """HR-only: edit a reconciled APPROVED leave request with balance adjustment."""
+
+    cover_person = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.filter(is_active=True),
+        required=False,
+        allow_null=True,
+    )
+    edit_note = serializers.CharField(required=False, allow_blank=True, default="")
+    allow_insufficient_balance = serializers.BooleanField(required=False, default=False)
+
+    class Meta:
+        model = LeaveRequest
+        fields = (
+            "leave_type",
+            "start_date",
+            "end_date",
+            "reason",
+            "cover_person",
+            "edit_note",
+            "allow_insufficient_balance",
+        )
+
+    def validate(self, attrs):
+        instance = self.instance
+        leave_type = attrs.get("leave_type", instance.leave_type)
+        start_date = attrs.get("start_date", instance.start_date)
+        end_date = attrs.get("end_date", instance.end_date)
+        cover_person = attrs.get("cover_person", instance.cover_person)
+        allow_insufficient = attrs.get("allow_insufficient_balance", False)
+
+        if start_date > end_date:
+            raise serializers.ValidationError(
+                {"end_date": "end_date must be on or after start_date."}
+            )
+
+        validate_reconcile_row(
+            employee=instance.employee,
+            leave_type=leave_type,
+            start_date=start_date,
+            end_date=end_date,
+            cover_person=cover_person,
+            allow_insufficient_balance=allow_insufficient,
+            exclude_request_id=instance.pk,
+        )
+
+        preview = LeaveRequest(
+            employee=instance.employee,
+            leave_type=leave_type,
+            start_date=start_date,
+            end_date=end_date,
+            cover_person=cover_person,
+        )
+        old_preview = LeaveRequest(
+            employee=instance.employee,
+            leave_type=instance.leave_type,
+            start_date=instance.start_date,
+            end_date=instance.end_date,
+        )
+        preview.total_working_days = WorkingDaysService.calculate_working_days(
+            start_date, end_date
+        )
+        old_preview.total_working_days = instance.total_working_days
+
+        if not allow_insufficient:
+            from .services import _year_days_for_request, split_working_days_by_year
+
+            old_map = _year_days_for_request(old_preview)
+            new_splits = split_working_days_by_year(start_date, end_date)
+            new_map = {(leave_type.id, year): days for year, days in new_splits.items()}
+            all_keys = set(old_map) | set(new_map)
+            for leave_type_id, year in all_keys:
+                old_days = old_map.get((leave_type_id, year), 0)
+                new_days = new_map.get((leave_type_id, year), 0)
+                delta = new_days - old_days
+                if delta <= 0:
+                    continue
+                lt = leave_type if leave_type_id == leave_type.id else instance.leave_type
+                if leave_type_id != lt.id:
+                    lt = LeaveType.objects.get(pk=leave_type_id)
+                ensure_leave_balance_record(instance.employee, lt, year)
+                WorkingDaysService.validate_leave_balance(
+                    employee=instance.employee,
+                    leave_type=lt,
+                    year=year,
+                    requested_days=delta,
+                )
+
+        return attrs
+
+    def update(self, instance, validated_data):
+        from copy import copy
+
+        from django.db import transaction
+
+        from .models import ApprovalAction, LeaveApprovalLog
+
+        edit_note = validated_data.pop("edit_note", "")
+        allow_insufficient = validated_data.pop("allow_insufficient_balance", False)
+
+        old_snapshot = copy(instance)
+        old_snapshot.leave_type = instance.leave_type
+        old_snapshot.start_date = instance.start_date
+        old_snapshot.end_date = instance.end_date
+        old_snapshot.total_working_days = instance.total_working_days
+
+        hr_user = self.context["request"].user
+        with transaction.atomic():
+            for attr, value in validated_data.items():
+                setattr(instance, attr, value)
+            instance.save()
+
+            adjust_balance_for_reconciled_edit(
+                old_snapshot,
+                instance,
+                actor=hr_user,
+                reason=edit_note or "Reconciled leave edited by HR.",
+                allow_insufficient_balance=allow_insufficient,
+            )
+            LeaveApprovalLog.objects.create(
+                leave_request=instance,
+                actor=hr_user,
+                action=ApprovalAction.MODIFY,
+                previous_status=instance.status,
+                new_status=instance.status,
+                comment=edit_note or "Reconciled leave edited by HR.",
+            )
+
+        return instance
 
 
 # ---------------------------------------------------------------------------
