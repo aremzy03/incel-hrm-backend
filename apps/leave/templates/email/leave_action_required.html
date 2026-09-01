@@ -1,8 +1,11 @@
 {% extends "email/base.html" %}
 
 {% block content %}
-  <p class="title">Leave request awaiting your approval</p>
-  <p class="muted">A leave request has reached your approval stage. Please review and take action.</p>
+  <p class="title">Leave approval required</p>
+  <p class="muted">
+    {{ employee_name }} has submitted a leave request that is waiting for your approval.
+    Please review the details below and approve or reject the request in the HRM portal.
+  </p>
 
   <div class="divider"></div>
 

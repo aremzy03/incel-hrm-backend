@@ -11,6 +11,7 @@ from django.db import transaction
 from django.db.models import F
 
 from apps.leave.models import LeaveBalance, LeaveRequest, LeaveRequestStatus, LeaveType
+from apps.leave.services import get_annual_entitlement
 
 User = get_user_model()
 
@@ -166,8 +167,11 @@ class Command(BaseCommand):
                     leave_type=leave_type,
                     year=year,
                     defaults={
-                        "allocated_days": leave_type.default_days,
+                        "allocated_days": get_annual_entitlement(
+                            leave_type, employee=user
+                        ),
                         "used_days": 0,
+                        "pending_days": 0,
                     },
                 )
 

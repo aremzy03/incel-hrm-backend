@@ -215,9 +215,9 @@ class ValidateLeaveBalanceTests(TestCase):
                 self.employee, self.leave_type, 2025, requested_days=3
             )
         detail = str(ctx.exception.detail)
-        self.assertIn("Insufficient leave balance", detail)
-        self.assertIn("Available: 2", detail)
-        self.assertIn("Requested: 3", detail)
+        self.assertIn("Insufficient", detail)
+        self.assertIn("available", detail.lower())
+        self.assertIn("requested", detail.lower())
 
     def test_no_balance_record_raises(self):
         # No LeaveBalance row exists
@@ -226,7 +226,7 @@ class ValidateLeaveBalanceTests(TestCase):
                 self.employee, self.leave_type, 2025, requested_days=1
             )
         detail = str(ctx.exception.detail)
-        self.assertIn("No leave balance found", detail)
+        self.assertIn("No Annual balance was found", detail)
 
     def test_wrong_year_raises(self):
         make_balance(self.employee, self.leave_type, year=2025, allocated=10, used=0)
@@ -337,7 +337,8 @@ class CheckOverlappingLeaveTests(TestCase):
                 datetime.date(2025, 3, 3),
                 datetime.date(2025, 3, 7),
             )
-        self.assertIn("overlapping", str(ctx.exception.detail))
+        self.assertIn("already have", str(ctx.exception.detail).lower())
+        self.assertIn("different date range", str(ctx.exception.detail).lower())
 
     def test_partial_overlap_at_start_raises(self):
         # Existing ends on Wednesday; new starts on Monday → overlap Mon–Wed

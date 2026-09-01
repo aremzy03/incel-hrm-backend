@@ -28,7 +28,7 @@ def create_leave_balances_on_user_create(sender, instance, created, **kwargs):
     """Create default leave balances for newly created users."""
     if created:
         from apps.leave.models import LeaveBalance
-        from apps.leave.services import get_eligible_leave_types
+        from apps.leave.services import get_annual_entitlement, get_eligible_leave_types
 
         year = timezone.now().year
         for leave_type in get_eligible_leave_types(instance):
@@ -36,7 +36,11 @@ def create_leave_balances_on_user_create(sender, instance, created, **kwargs):
                 employee=instance,
                 leave_type=leave_type,
                 year=year,
-                defaults={"allocated_days": leave_type.default_days},
+                defaults={
+                    "allocated_days": get_annual_entitlement(
+                        leave_type, employee=instance
+                    )
+                },
             )
 
 
