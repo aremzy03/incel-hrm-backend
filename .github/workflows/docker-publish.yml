@@ -16,7 +16,6 @@ env:
 
 jobs:
   test:
-    if: github.base_ref == 'staging'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -37,11 +36,17 @@ jobs:
       - name: Run full test suite
         env:
           DJANGO_SETTINGS_MODULE: hrm_backend.settings.base
+          # CI-only values — not production secrets
+          SECRET_KEY: django-insecure-ci-test-key-not-for-production
+          DEBUG: "True"
+          ALLOWED_HOSTS: localhost,127.0.0.1
+          EMAIL_BACKEND: django.core.mail.backends.console.EmailBackend
+          FRONTEND_BASE_URL: http://localhost:3000
         run: python manage.py test
 
   docker-build-and-push:
     needs: test
-    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    if: always() && needs.test.result == 'success'
     runs-on: ubuntu-latest
 
     steps:
