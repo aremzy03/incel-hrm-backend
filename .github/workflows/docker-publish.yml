@@ -16,6 +16,7 @@ env:
 
 jobs:
   test:
+    if: github.base_ref == 'staging'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -46,7 +47,7 @@ jobs:
 
   docker-build-and-push:
     needs: test
-    if: always() && needs.test.result == 'success'
+    if: always() && (github.base_ref == 'main' || needs.test.result == 'success')
     runs-on: ubuntu-latest
 
     steps:
