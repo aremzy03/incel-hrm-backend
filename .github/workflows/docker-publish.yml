@@ -1,10 +1,10 @@
 name: Build and publish Docker image to GHCR
 
 on:
-  push:
+  pull_request:
     branches:
-      - "**"
-  workflow_dispatch:
+      - main
+      - staging
 
 permissions:
   contents: read
@@ -15,7 +15,36 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  test:
+    if: github.base_ref == 'staging'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements/base.txt
+            requirements/dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements/base.txt -r requirements/dev.txt
+
+      - name: Run full test suite
+        env:
+          DJANGO_SETTINGS_MODULE: hrm_backend.settings.test
+          SECRET_KEY: django-insecure-ci-test-key-not-for-production
+        run: python manage.py test
+
   docker-build-and-push:
+    needs: test
+    if: always() && (github.base_ref == 'main' || needs.test.result == 'success')
     runs-on: ubuntu-latest
 
     steps:
@@ -38,9 +67,10 @@ jobs:
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
-            type=ref,event=branch
+            type=raw,value=staging,enable=${{ github.base_ref == 'staging' }}
+            type=ref,event=branch,enable=${{ github.base_ref == 'main' }}
             type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ github.base_ref == 'main' }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -53,4 +83,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-

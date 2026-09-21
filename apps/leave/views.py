@@ -23,9 +23,11 @@ DepartmentCalendarView     – GET /api/v1/calendar/  dept-scoped approved leave
 import csv
 import datetime
 import io
+import json
 
 from django.db import transaction
 from django.db.models import Q
+from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
@@ -38,36 +40,91 @@ from apps.accounts.permissions import IsEmployee, IsHR
 
 from .models import (
     ApprovalAction,
+    ApproverDelegate,
     BalanceTransactionSource,
+    CalendarAssignment,
+    CalendarHoliday,
+    HolidayCalendar,
     LeaveApprovalLog,
     LeaveBalance,
+    LeaveBalanceTransaction,
+    LeaveBlackoutPeriod,
+    LeavePolicy,
+    LeavePolicyAssignment,
+    LeavePolicyStatus,
     LeaveRequest,
     LeaveRequestStatus,
+    LeaveSettingsAuditLog,
     LeaveType,
+    LeaveWorkflowTemplate,
     PublicHoliday,
+    SettingsAuditAction,
+    WorkingCalendar,
 )
 from .serializers import (
+    CalendarAssignmentSerializer,
     CalendarEntrySerializer,
+    CalendarHolidaySerializer,
+    HolidayCalendarSerializer,
     LeaveApprovalLogSerializer,
+    LeaveBalanceAdjustSerializer,
     LeaveBalanceSerializer,
+    LeaveBalanceTransactionSerializer,
+    LeaveBlackoutPeriodSerializer,
+    LeavePolicyActionSerializer,
+    LeavePolicyAssignmentSerializer,
+    LeavePolicySerializer,
     LeaveRequestBulkReconcileSerializer,
     LeaveRequestCreateSerializer,
     LeaveRequestReadSerializer,
     LeaveRequestReconcileEditSerializer,
     LeaveRequestReconcileSerializer,
+    LeaveSettingsAuditLogSerializer,
+    LeaveSettingsSerializer,
     LeaveTypeSerializer,
+    LeaveAccrualPreviewSerializer,
+    LeaveWorkflowSimulateSerializer,
+    LeaveWorkflowTemplateSerializer,
+    ApproverDelegateSerializer,
     PublicHolidaySerializer,
+    WorkingCalendarSerializer,
     _EmployeeMinimalSerializer,
 )
+from . import messages as leave_messages
 from .services import (
+    apply_policy_snapshot,
+    archive_leave_policy,
+    clone_leave_policy,
     deduct_leave_balance,
     get_eligible_leave_types,
     get_eligible_relievers,
+    get_leave_settings,
+    preview_or_run_accrual,
+    preview_policy_impact,
+    record_settings_audit,
+    release_leave_balance,
+    reserve_leave_balance,
     leave_starts_within_reminder_window,
+    publish_leave_policy,
     reconcile_leave_request,
+    resolve_leave_policy,
     restore_leave_balance,
+    snapshot_leave_assignment,
+    snapshot_leave_policy,
+    snapshot_leave_settings,
+    snapshot_leave_type,
+    sync_public_holiday_to_default_calendar,
     validate_cover_person_for_submission,
     validate_reconcile_row,
+)
+from .workflow import (
+    LEGACY_TRANSITIONS,
+    actor_may_decide,
+    advance_snapshot_pointer,
+    comment_requirements,
+    next_status_from_snapshot,
+    plan_leave_submission,
+    simulate_workflow,
 )
 from .tasks import (
     notify_approver_required,
@@ -167,7 +224,9 @@ class LeaveTypeViewSet(viewsets.ModelViewSet):
     GET    /api/v1/leave-types/:id/  — any authenticated user
     PUT    /api/v1/leave-types/:id/  — HR or admin
     PATCH  /api/v1/leave-types/:id/  — HR or admin
-    DELETE /api/v1/leave-types/:id/  — HR or admin
+    DELETE /api/v1/leave-types/:id/  — HR or admin (blocked if in use)
+    POST   /api/v1/leave-types/:id/activate/
+    POST   /api/v1/leave-types/:id/deactivate/
     """
 
     queryset = LeaveType.objects.all()
@@ -177,6 +236,366 @@ class LeaveTypeViewSet(viewsets.ModelViewSet):
         if self.action in ("list", "retrieve"):
             return [permissions.IsAuthenticated()]
         return [permissions.IsAuthenticated(), (IsHR | permissions.IsAdminUser)()]
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        record_settings_audit(
+            actor=self.request.user,
+            object_type="LeaveType",
+            object_id=instance.pk,
+            action=SettingsAuditAction.CREATE,
+            previous_values=None,
+            new_values=snapshot_leave_type(instance),
+            reason=self.request.data.get("reason", ""),
+            request=self.request,
+        )
+
+    def perform_update(self, serializer):
+        previous = snapshot_leave_type(serializer.instance)
+        instance = serializer.save()
+        record_settings_audit(
+            actor=self.request.user,
+            object_type="LeaveType",
+            object_id=instance.pk,
+            action=SettingsAuditAction.UPDATE,
+            previous_values=previous,
+            new_values=snapshot_leave_type(instance),
+            reason=self.request.data.get("reason", ""),
+            request=self.request,
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if instance.policies.exists() or instance.balances.exists() or instance.requests.exists():
+            raise ValidationError({"detail": leave_messages.leave_type_delete_blocked()})
+        previous = snapshot_leave_type(instance)
+        response = super().destroy(request, *args, **kwargs)
+        record_settings_audit(
+            actor=request.user,
+            object_type="LeaveType",
+            object_id=instance.pk,
+            action=SettingsAuditAction.DELETE,
+            previous_values=previous,
+            new_values=None,
+            reason=request.data.get("reason", "") if hasattr(request, "data") else "",
+            request=request,
+        )
+        return response
+
+    @action(detail=True, methods=["post"], url_path="activate")
+    def activate(self, request, pk=None):
+        instance = self.get_object()
+        previous = snapshot_leave_type(instance)
+        instance.is_active = True
+        instance.save(update_fields=["is_active", "updated_at"])
+        record_settings_audit(
+            actor=request.user,
+            object_type="LeaveType",
+            object_id=instance.pk,
+            action=SettingsAuditAction.ACTIVATE,
+            previous_values=previous,
+            new_values=snapshot_leave_type(instance),
+            reason=request.data.get("reason", ""),
+            request=request,
+        )
+        return Response(LeaveTypeSerializer(instance).data)
+
+    @action(detail=True, methods=["post"], url_path="deactivate")
+    def deactivate(self, request, pk=None):
+        instance = self.get_object()
+        previous = snapshot_leave_type(instance)
+        instance.is_active = False
+        instance.save(update_fields=["is_active", "updated_at"])
+        record_settings_audit(
+            actor=request.user,
+            object_type="LeaveType",
+            object_id=instance.pk,
+            action=SettingsAuditAction.DEACTIVATE,
+            previous_values=previous,
+            new_values=snapshot_leave_type(instance),
+            reason=request.data.get("reason", ""),
+            request=request,
+        )
+        return Response(LeaveTypeSerializer(instance).data)
+
+
+# ---------------------------------------------------------------------------
+# LeavePolicy
+# ---------------------------------------------------------------------------
+
+class LeavePolicyViewSet(viewsets.ModelViewSet):
+    """
+    GET    /api/v1/leave-policies/            — authenticated
+    POST   /api/v1/leave-policies/            — HR/Admin (creates DRAFT)
+    GET    /api/v1/leave-policies/:id/        — authenticated
+    PATCH  /api/v1/leave-policies/:id/        — HR/Admin (DRAFT only)
+    DELETE /api/v1/leave-policies/:id/        — HR/Admin (DRAFT only)
+    POST   /api/v1/leave-policies/:id/publish/
+    POST   /api/v1/leave-policies/:id/archive/
+    POST   /api/v1/leave-policies/:id/clone/
+    GET    /api/v1/leave-policies/:id/audit-log/
+    """
+
+    queryset = LeavePolicy.objects.select_related("leave_type").all()
+    serializer_class = LeavePolicySerializer
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [permissions.IsAuthenticated()]
+        return [permissions.IsAuthenticated(), (IsHR | permissions.IsAdminUser)()]
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        record_settings_audit(
+            actor=self.request.user,
+            object_type="LeavePolicy",
+            object_id=instance.pk,
+            action=SettingsAuditAction.CREATE,
+            previous_values=None,
+            new_values=snapshot_leave_policy(instance),
+            reason=self.request.data.get("reason", ""),
+            request=self.request,
+        )
+
+    def perform_update(self, serializer):
+        previous = snapshot_leave_policy(serializer.instance)
+        instance = serializer.save()
+        record_settings_audit(
+            actor=self.request.user,
+            object_type="LeavePolicy",
+            object_id=instance.pk,
+            action=SettingsAuditAction.UPDATE,
+            previous_values=previous,
+            new_values=snapshot_leave_policy(instance),
+            reason=self.request.data.get("reason", ""),
+            request=self.request,
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if instance.status != LeavePolicyStatus.DRAFT:
+            raise ValidationError({"status": leave_messages.policy_delete_draft_only()})
+        previous = snapshot_leave_policy(instance)
+        response = super().destroy(request, *args, **kwargs)
+        record_settings_audit(
+            actor=request.user,
+            object_type="LeavePolicy",
+            object_id=instance.pk,
+            action=SettingsAuditAction.DELETE,
+            previous_values=previous,
+            new_values=None,
+            reason=request.data.get("reason", "") if hasattr(request, "data") else "",
+            request=request,
+        )
+        return response
+
+    @action(detail=True, methods=["post"], url_path="publish")
+    def publish(self, request, pk=None):
+        serializer = LeavePolicyActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        policy = publish_leave_policy(
+            self.get_object(),
+            actor=request.user,
+            reason=serializer.validated_data.get("reason", ""),
+            request=request,
+            keep_existing_active=serializer.validated_data.get(
+                "keep_existing_active", False
+            ),
+        )
+        return Response(LeavePolicySerializer(policy).data)
+
+    @action(detail=True, methods=["post"], url_path="archive")
+    def archive(self, request, pk=None):
+        serializer = LeavePolicyActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        policy = archive_leave_policy(
+            self.get_object(),
+            actor=request.user,
+            reason=serializer.validated_data.get("reason", ""),
+            request=request,
+        )
+        return Response(LeavePolicySerializer(policy).data)
+
+    @action(detail=True, methods=["post"], url_path="clone")
+    def clone(self, request, pk=None):
+        serializer = LeavePolicyActionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        policy = clone_leave_policy(
+            self.get_object(),
+            actor=request.user,
+            reason=serializer.validated_data.get("reason", ""),
+            request=request,
+        )
+        return Response(LeavePolicySerializer(policy).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get"], url_path="audit-log")
+    def audit_log(self, request, pk=None):
+        policy = self.get_object()
+        if not (
+            request.user.is_staff
+            or request.user.has_role(RoleName.HR)
+            or request.user.is_superuser
+        ):
+            raise PermissionDenied(leave_messages.permission_policy_audit())
+        logs = LeaveSettingsAuditLog.objects.filter(
+            object_type="LeavePolicy",
+            object_id=policy.pk,
+        )
+        return Response(LeaveSettingsAuditLogSerializer(logs, many=True).data)
+
+    @action(detail=True, methods=["get"], url_path="impact-preview")
+    def impact_preview(self, request, pk=None):
+        policy = self.get_object()
+        on_date = request.query_params.get("date")
+        parsed = None
+        if on_date:
+            try:
+                parsed = datetime.date.fromisoformat(on_date)
+            except ValueError:
+                raise ValidationError({"date": leave_messages.iso_date_required("date")})
+        payload = preview_policy_impact(policy, on_date=parsed)
+        payload["policy"] = LeavePolicySerializer(policy).data
+        return Response(payload)
+
+
+# ---------------------------------------------------------------------------
+# LeavePolicyAssignment
+# ---------------------------------------------------------------------------
+
+class LeavePolicyAssignmentViewSet(viewsets.ModelViewSet):
+    """CRUD /api/v1/leave-policy-assignments/ — HR/Admin write; authenticated read."""
+
+    queryset = LeavePolicyAssignment.objects.select_related(
+        "policy", "policy__leave_type", "employee"
+    ).all()
+    serializer_class = LeavePolicyAssignmentSerializer
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [permissions.IsAuthenticated()]
+        return [permissions.IsAuthenticated(), (IsHR | permissions.IsAdminUser)()]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        leave_type = self.request.query_params.get("leave_type")
+        policy = self.request.query_params.get("policy")
+        scope_type = self.request.query_params.get("scope_type")
+        is_active = self.request.query_params.get("is_active")
+        if leave_type:
+            qs = qs.filter(policy__leave_type_id=leave_type)
+        if policy:
+            qs = qs.filter(policy_id=policy)
+        if scope_type:
+            qs = qs.filter(scope_type=scope_type)
+        if is_active is not None:
+            if is_active.lower() in ("true", "1", "yes"):
+                qs = qs.filter(is_active=True)
+            elif is_active.lower() in ("false", "0", "no"):
+                qs = qs.filter(is_active=False)
+        return qs
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        record_settings_audit(
+            actor=self.request.user,
+            object_type="LeavePolicyAssignment",
+            object_id=instance.pk,
+            action=SettingsAuditAction.CREATE,
+            previous_values=None,
+            new_values=snapshot_leave_assignment(instance),
+            reason=self.request.data.get("reason", ""),
+            request=self.request,
+        )
+
+    def perform_update(self, serializer):
+        previous = snapshot_leave_assignment(serializer.instance)
+        instance = serializer.save()
+        record_settings_audit(
+            actor=self.request.user,
+            object_type="LeavePolicyAssignment",
+            object_id=instance.pk,
+            action=SettingsAuditAction.UPDATE,
+            previous_values=previous,
+            new_values=snapshot_leave_assignment(instance),
+            reason=self.request.data.get("reason", ""),
+            request=self.request,
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        previous = snapshot_leave_assignment(instance)
+        response = super().destroy(request, *args, **kwargs)
+        record_settings_audit(
+            actor=request.user,
+            object_type="LeavePolicyAssignment",
+            object_id=instance.pk,
+            action=SettingsAuditAction.DELETE,
+            previous_values=previous,
+            new_values=None,
+            reason=request.data.get("reason", "") if hasattr(request, "data") else "",
+            request=request,
+        )
+        return response
+
+
+class LeavePolicyResolutionView(APIView):
+    """GET /api/v1/leave-policy-resolution/?employee=&leave_type=&date="""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        from apps.accounts.models import User
+
+        leave_type_id = request.query_params.get("leave_type")
+        if not leave_type_id:
+            raise ValidationError({"leave_type": "This query parameter is required."})
+        leave_type = LeaveType.objects.filter(pk=leave_type_id).first()
+        if leave_type is None:
+            raise ValidationError({"leave_type": "Leave type not found."})
+
+        employee_id = request.query_params.get("employee")
+        if employee_id:
+            employee = User.objects.filter(pk=employee_id).first()
+            if employee is None:
+                raise ValidationError({"employee": "Employee not found."})
+            is_privileged = (
+                request.user.is_staff
+                or request.user.is_superuser
+                or request.user.has_role(RoleName.HR)
+            )
+            if employee != request.user and not is_privileged:
+                raise PermissionDenied("You can only resolve policies for yourself.")
+        else:
+            employee = request.user
+
+        on_date = request.query_params.get("date")
+        parsed = timezone.localdate()
+        if on_date:
+            try:
+                parsed = datetime.date.fromisoformat(on_date)
+            except ValueError:
+                raise ValidationError({"date": leave_messages.iso_date_required("date")})
+
+        resolution = resolve_leave_policy(employee, leave_type, parsed)
+        return Response(
+            {
+                "employee": str(employee.pk),
+                "leave_type": str(leave_type.pk),
+                "effective_date": resolution.effective_date.isoformat(),
+                "source": resolution.source,
+                "assignment_scope": resolution.assignment_scope,
+                "assignment": (
+                    LeavePolicyAssignmentSerializer(resolution.assignment).data
+                    if resolution.assignment
+                    else None
+                ),
+                "resolved_policy": (
+                    LeavePolicySerializer(resolution.policy).data
+                    if resolution.policy
+                    else None
+                ),
+            }
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +607,7 @@ class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
     GET /api/v1/leave-balances/
     Authenticated users see their own balances.
     Approvers / HR may pass ?employee=<uuid> for a subordinate they can view.
+    HR/Admin: POST adjust/, GET transactions/ on a balance id.
     """
 
     serializer_class = LeaveBalanceSerializer
@@ -198,6 +618,11 @@ class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
 
         user = self.request.user
         qs = LeaveBalance.objects.select_related("employee", "leave_type")
+
+        if self.action in ("retrieve", "adjust", "transactions") and self.kwargs.get("pk"):
+            if user.is_staff or user.has_role(RoleName.HR):
+                return qs
+            return qs.filter(employee=user)
 
         employee_param = self.request.query_params.get("employee")
         if employee_param:
@@ -224,6 +649,48 @@ class LeaveBalanceViewSet(viewsets.ReadOnlyModelViewSet):
                 raise ValidationError({"year": "year must be an integer."})
             qs = qs.filter(year=year_int)
         return qs
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="adjust",
+        permission_classes=[permissions.IsAuthenticated, IsHR | permissions.IsAdminUser],
+    )
+    def adjust(self, request, pk=None):
+        from .services import adjust_leave_balance
+
+        balance = self.get_object()
+        serializer = LeaveBalanceAdjustSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        txn = adjust_leave_balance(
+            balance,
+            delta=serializer.validated_data["delta"],
+            reason=serializer.validated_data["reason"],
+            actor=request.user,
+            effective_date=serializer.validated_data.get("effective_date"),
+        )
+        balance.refresh_from_db()
+        return Response(
+            {
+                "balance": LeaveBalanceSerializer(balance).data,
+                "transaction": LeaveBalanceTransactionSerializer(txn).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+    @action(detail=True, methods=["get"], url_path="transactions")
+    def transactions(self, request, pk=None):
+        balance = self.get_object()
+        viewer = request.user
+        if not (
+            viewer.is_staff
+            or viewer.has_role(RoleName.HR)
+            or balance.employee_id == viewer.id
+            or _can_view_employee_leave_profile(viewer, balance.employee)
+        ):
+            raise PermissionDenied(leave_messages.permission_balance_ledger())
+        qs = balance.transactions.select_related("actor", "leave_request").order_by("-created_at")
+        return Response(LeaveBalanceTransactionSerializer(qs, many=True).data)
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +761,9 @@ class PublicHolidayViewSet(viewsets.ReadOnlyModelViewSet):
                 date=date,
                 defaults={"name": name, "is_recurring": False},
             )
+            sync_public_holiday_to_default_calendar(
+                name=name, date=date, is_recurring=False
+            )
             if was_created:
                 created += 1
             else:
@@ -306,38 +776,8 @@ class PublicHolidayViewSet(viewsets.ReadOnlyModelViewSet):
 # LeaveRequest
 # ---------------------------------------------------------------------------
 
-# Approval stage machine: current_status → (next_status, required_role)
-_APPROVAL_TRANSITIONS = {
-    LeaveRequestStatus.PENDING_TEAM_LEAD: (
-        LeaveRequestStatus.PENDING_SUPERVISOR,
-        RoleName.TEAM_LEAD,
-    ),
-    LeaveRequestStatus.PENDING_SUPERVISOR: (
-        LeaveRequestStatus.PENDING_MANAGER,
-        RoleName.SUPERVISOR,
-    ),
-    LeaveRequestStatus.PENDING_MANAGER: (
-        LeaveRequestStatus.PENDING_HR,
-        RoleName.LINE_MANAGER,
-    ),
-    LeaveRequestStatus.PENDING_HR: (
-        LeaveRequestStatus.PENDING_ED,
-        RoleName.HR,
-    ),
-    LeaveRequestStatus.PENDING_ED: (
-        LeaveRequestStatus.APPROVED,
-        RoleName.EXECUTIVE_DIRECTOR,
-    ),
-}
-
-# Rejection map: current_status → required_role
-_REJECTION_ROLES = {
-    LeaveRequestStatus.PENDING_TEAM_LEAD: RoleName.TEAM_LEAD,
-    LeaveRequestStatus.PENDING_SUPERVISOR: RoleName.SUPERVISOR,
-    LeaveRequestStatus.PENDING_MANAGER: RoleName.LINE_MANAGER,
-    LeaveRequestStatus.PENDING_HR: RoleName.HR,
-    LeaveRequestStatus.PENDING_ED: RoleName.EXECUTIVE_DIRECTOR,
-}
+_APPROVAL_TRANSITIONS = LEGACY_TRANSITIONS
+_REJECTION_ROLES = {status: role for status, (_, role) in LEGACY_TRANSITIONS.items()}
 
 
 class LeaveRequestViewSet(viewsets.ModelViewSet):
@@ -413,8 +853,10 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             raise ValidationError(
                 {
                     "status": (
-                        "You can only edit your own leave requests while they are in DRAFT status. "
-                        f"Current status: {leave_request.status}."
+                        "You can only edit your own leave requests while they are still drafts. "
+                        f"This request is currently "
+                        f"{leave_messages.leave_request_status_label(leave_request.status)}. "
+                        "Cancel it and create a new request, or ask HR for help."
                     )
                 }
             )
@@ -448,7 +890,11 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="eligible-relievers")
     def eligible_relievers(self, request):
-        scope_result = get_eligible_relievers(request.user)
+        leave_type = None
+        leave_type_id = request.query_params.get("leave_type")
+        if leave_type_id:
+            leave_type = LeaveType.objects.filter(pk=leave_type_id).first()
+        scope_result = get_eligible_relievers(request.user, leave_type)
         return Response(
             {
                 "scope_level": scope_result.scope_level,
@@ -670,70 +1116,65 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
         if leave_request.status != LeaveRequestStatus.DRAFT:
             raise ValidationError(
-                {"status": f"Only DRAFT requests can be submitted. Current status: {leave_request.status}."}
+                {"status": leave_messages.submit_not_draft(leave_request.status)}
             )
 
-        # Determine first approval stage based on employee org context + role-based skipping.
-        employee = leave_request.employee
-
-        skip_hr_stage = False
-        manager_approver_is_management = False
-        if employee.has_role(RoleName.MANAGING_DIRECTOR) or employee.has_role(RoleName.EXECUTIVE_DIRECTOR):
-            first_status = LeaveRequestStatus.APPROVED
-        elif employee.has_role(RoleName.HR):
-            # Special-case: HR requester -> Line Manager of HR department -> ED (skip HR stage)
-            first_status = LeaveRequestStatus.PENDING_MANAGER
-            skip_hr_stage = True
-        elif employee.has_role(RoleName.LINE_MANAGER):
-            # LINE_MANAGER requester: route to Management department's line manager first.
-            first_status = LeaveRequestStatus.PENDING_MANAGER
-            manager_approver_is_management = True
-        elif employee.has_role(RoleName.SUPERVISOR) or employee.has_role(RoleName.TEAM_LEAD):
-            first_status = LeaveRequestStatus.PENDING_MANAGER
-        elif getattr(employee, "team_id", None) and getattr(employee.team, "team_lead_id", None):
-            first_status = LeaveRequestStatus.PENDING_TEAM_LEAD
-        elif getattr(employee, "unit_id", None) and getattr(employee.unit, "supervisor_id", None):
-            first_status = LeaveRequestStatus.PENDING_SUPERVISOR
-        else:
-            first_status = LeaveRequestStatus.PENDING_MANAGER
-
-        # For any non-auto-approved flow, we must have a department line manager assigned.
-        if first_status != LeaveRequestStatus.APPROVED:
-            if manager_approver_is_management:
-                mgmt = get_or_create_management_department()
-                if mgmt.line_manager_id is None:
-                    raise ValidationError({"department": "Management department has no line manager assigned. Contact HR."})
-            else:
-                lm = leave_request.employee.get_department_line_manager()
-                if lm is None:
-                    raise ValidationError(
-                        {"department": "Your department has no line manager assigned. Contact HR."}
-                    )
+        plan = plan_leave_submission(leave_request.employee, leave_request.leave_type)
+        first_status = plan["first_status"]
+        skip_hr_stage = plan["skip_hr_stage"]
+        manager_approver_is_management = plan["manager_approver_is_management"]
+        workflow_snapshot = plan["workflow_snapshot"]
 
         validate_cover_person_for_submission(leave_request, hr_override=False)
 
         prev_status = leave_request.status
-        leave_request.status = first_status
-        leave_request.skip_hr_stage = skip_hr_stage
-        leave_request.manager_approver_is_management = manager_approver_is_management
-        leave_request.save(update_fields=["status", "skip_hr_stage", "manager_approver_is_management", "updated_at"])
+        now = timezone.now()
+        with transaction.atomic():
+            apply_policy_snapshot(leave_request)
+            leave_request.status = first_status
+            leave_request.skip_hr_stage = skip_hr_stage
+            leave_request.manager_approver_is_management = manager_approver_is_management
+            leave_request.workflow_snapshot = workflow_snapshot
+            leave_request.stage_entered_at = now
+            leave_request.sla_notified_at = None
+            leave_request.save(
+                update_fields=[
+                    "status",
+                    "skip_hr_stage",
+                    "manager_approver_is_management",
+                    "workflow_snapshot",
+                    "stage_entered_at",
+                    "sla_notified_at",
+                    "policy",
+                    "policy_version",
+                    "updated_at",
+                ]
+            )
 
-        _create_log(
-            leave_request=leave_request,
-            actor=request.user,
-            action=ApprovalAction.MODIFY,
-            previous_status=prev_status,
-            new_status=first_status,
-            comment="Submitted for approval.",
-        )
+            _create_log(
+                leave_request=leave_request,
+                actor=request.user,
+                action=ApprovalAction.MODIFY,
+                previous_status=prev_status,
+                new_status=first_status,
+                comment="Submitted for approval.",
+            )
+
+            if first_status == LeaveRequestStatus.APPROVED:
+                deduct_leave_balance(
+                    leave_request,
+                    source=BalanceTransactionSource.APPROVAL,
+                    actor=request.user,
+                    reason="Auto-approved based on requester role.",
+                )
+            else:
+                reserve_leave_balance(
+                    leave_request,
+                    actor=request.user,
+                    reason="Leave submitted; balance reserved.",
+                )
 
         if first_status == LeaveRequestStatus.APPROVED:
-            deduct_leave_balance(
-                leave_request,
-                source=BalanceTransactionSource.APPROVAL,
-                actor=request.user,
-                reason="Auto-approved based on requester role.",
-            )
             _queue_final_approval_notifications(
                 leave_request,
                 decision_comment="Auto-approved based on requester role.",
@@ -765,63 +1206,62 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         leave_request = serializer.save()
 
-        # Determine first approval stage as in submit()
-        employee = leave_request.employee
-        skip_hr_stage = False
-        manager_approver_is_management = False
-        if employee.has_role(RoleName.MANAGING_DIRECTOR) or employee.has_role(RoleName.EXECUTIVE_DIRECTOR):
-            first_status = LeaveRequestStatus.APPROVED
-        elif employee.has_role(RoleName.HR):
-            first_status = LeaveRequestStatus.PENDING_MANAGER
-            skip_hr_stage = True
-        elif employee.has_role(RoleName.LINE_MANAGER):
-            first_status = LeaveRequestStatus.PENDING_MANAGER
-            manager_approver_is_management = True
-        elif employee.has_role(RoleName.SUPERVISOR) or employee.has_role(RoleName.TEAM_LEAD):
-            first_status = LeaveRequestStatus.PENDING_MANAGER
-        elif getattr(employee, "team_id", None) and getattr(employee.team, "team_lead_id", None):
-            first_status = LeaveRequestStatus.PENDING_TEAM_LEAD
-        elif getattr(employee, "unit_id", None) and getattr(employee.unit, "supervisor_id", None):
-            first_status = LeaveRequestStatus.PENDING_SUPERVISOR
-        else:
-            first_status = LeaveRequestStatus.PENDING_MANAGER
-
-        if first_status != LeaveRequestStatus.APPROVED:
-            if manager_approver_is_management:
-                mgmt = get_or_create_management_department()
-                if mgmt.line_manager_id is None:
-                    raise ValidationError({"department": "Management department has no line manager assigned. Contact HR."})
-            else:
-                lm = leave_request.employee.get_department_line_manager()
-                if lm is None:
-                    raise ValidationError(
-                        {"department": "Your department has no line manager assigned. Contact HR."}
-                    )
+        plan = plan_leave_submission(leave_request.employee, leave_request.leave_type)
+        first_status = plan["first_status"]
+        skip_hr_stage = plan["skip_hr_stage"]
+        manager_approver_is_management = plan["manager_approver_is_management"]
+        workflow_snapshot = plan["workflow_snapshot"]
 
         validate_cover_person_for_submission(leave_request, hr_override=False)
 
         prev_status = leave_request.status
-        leave_request.status = first_status
-        leave_request.skip_hr_stage = skip_hr_stage
-        leave_request.manager_approver_is_management = manager_approver_is_management
-        leave_request.save(update_fields=["status", "skip_hr_stage", "manager_approver_is_management", "updated_at"])
+        now = timezone.now()
+        with transaction.atomic():
+            apply_policy_snapshot(leave_request)
+            leave_request.status = first_status
+            leave_request.skip_hr_stage = skip_hr_stage
+            leave_request.manager_approver_is_management = manager_approver_is_management
+            leave_request.workflow_snapshot = workflow_snapshot
+            leave_request.stage_entered_at = now
+            leave_request.sla_notified_at = None
+            leave_request.save(
+                update_fields=[
+                    "status",
+                    "skip_hr_stage",
+                    "manager_approver_is_management",
+                    "workflow_snapshot",
+                    "stage_entered_at",
+                    "sla_notified_at",
+                    "policy",
+                    "policy_version",
+                    "updated_at",
+                ]
+            )
 
-        _create_log(
-            leave_request=leave_request,
-            actor=request.user,
-            action=ApprovalAction.MODIFY,
-            previous_status=prev_status,
-            new_status=first_status,
-            comment="Created and submitted for approval.",
-        )
+            _create_log(
+                leave_request=leave_request,
+                actor=request.user,
+                action=ApprovalAction.MODIFY,
+                previous_status=prev_status,
+                new_status=first_status,
+                comment="Created and submitted for approval.",
+            )
+
+            if first_status == LeaveRequestStatus.APPROVED:
+                deduct_leave_balance(
+                    leave_request,
+                    source=BalanceTransactionSource.APPROVAL,
+                    actor=request.user,
+                    reason="Auto-approved based on requester role.",
+                )
+            else:
+                reserve_leave_balance(
+                    leave_request,
+                    actor=request.user,
+                    reason="Leave submitted; balance reserved.",
+                )
 
         if first_status == LeaveRequestStatus.APPROVED:
-            deduct_leave_balance(
-                leave_request,
-                source=BalanceTransactionSource.APPROVAL,
-                actor=request.user,
-                reason="Auto-approved based on requester role.",
-            )
             _queue_final_approval_notifications(
                 leave_request,
                 decision_comment="Auto-approved based on requester role.",
@@ -1099,77 +1539,52 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         if leave_request.status not in _APPROVAL_TRANSITIONS:
             raise ValidationError(
                 {
-                    "status": (
-                        f"Request cannot be approved from status '{leave_request.status}'. "
-                        f"Approvable statuses: {list(_APPROVAL_TRANSITIONS)}"
+                    "status": leave_messages.approve_invalid_status(
+                        leave_request.status,
+                        _APPROVAL_TRANSITIONS,
                     )
                 }
             )
 
-        next_status, required_role = _APPROVAL_TRANSITIONS[leave_request.status]
-
         user = request.user
-
-        # Role check
-        if not user.has_role(required_role):
-            raise PermissionDenied(
-                f"Only a user with role '{required_role}' can approve at this stage "
-                f"(current status: {leave_request.status})."
+        comment = request.data.get("comment", "")
+        approve_required, _ = comment_requirements(leave_request)
+        if approve_required and not str(comment).strip():
+            raise ValidationError(
+                {"comment": leave_messages.comment_required_for_approve()}
             )
 
-        if leave_request.status == LeaveRequestStatus.PENDING_MANAGER and leave_request.manager_approver_is_management:
-            mgmt = get_or_create_management_department()
-            if mgmt.line_manager_id != user.pk:
-                raise PermissionDenied(
-                    "Only the Management department line manager can approve at this stage for this request."
-                )
-
-        # Additional identity check for team lead stage: must be team lead of the employee's team
-        # (configured lead) OR a TEAM_LEAD who belongs to the same team.
-        if leave_request.status == LeaveRequestStatus.PENDING_TEAM_LEAD:
-            team = getattr(leave_request.employee, "team", None)
-            if not team:
-                raise PermissionDenied("Only the team lead of the employee's team can approve at this stage.")
-            same_team_member = getattr(user, "team_id", None) == team.pk
-            is_configured_lead = team.team_lead_id == user.pk
-            if not (is_configured_lead or same_team_member):
-                raise PermissionDenied(
-                    "Only the team lead of the employee's team can approve at this stage."
-                )
-
-        # Additional identity check for supervisor stage: must be supervisor of the employee's unit
-        # (configured supervisor) OR a SUPERVISOR who belongs to the same unit.
-        if leave_request.status == LeaveRequestStatus.PENDING_SUPERVISOR:
-            unit = getattr(leave_request.employee, "unit", None)
-            if not unit:
-                raise PermissionDenied("Only the supervisor of the employee's unit can approve at this stage.")
-            same_unit_member = getattr(user, "unit_id", None) == unit.pk
-            is_configured_supervisor = unit.supervisor_id == user.pk
-            if not (is_configured_supervisor or same_unit_member):
-                raise PermissionDenied(
-                    "Only the supervisor of the employee's unit can approve at this stage."
-                )
+        actor_may_decide(
+            user,
+            leave_request,
+            prevent_self_approval=get_leave_settings().prevent_self_approval,
+        )
 
         prev_status = leave_request.status
+        next_status = next_status_from_snapshot(leave_request)
+        now = timezone.now()
 
         with transaction.atomic():
-            # HR-requester special-case: manager stage should jump straight to ED.
-            if (
-                leave_request.skip_hr_stage
-                and leave_request.status == LeaveRequestStatus.PENDING_MANAGER
-                and next_status == LeaveRequestStatus.PENDING_HR
-            ):
-                next_status = LeaveRequestStatus.PENDING_ED
-
             leave_request.status = next_status
-            leave_request.save(update_fields=["status", "updated_at"])
+            leave_request.workflow_snapshot = advance_snapshot_pointer(leave_request, next_status)
+            leave_request.stage_entered_at = now
+            leave_request.sla_notified_at = None
+            leave_request.save(
+                update_fields=[
+                    "status",
+                    "workflow_snapshot",
+                    "stage_entered_at",
+                    "sla_notified_at",
+                    "updated_at",
+                ]
+            )
 
             if next_status == LeaveRequestStatus.APPROVED:
                 deduct_leave_balance(
                     leave_request,
                     source=BalanceTransactionSource.APPROVAL,
                     actor=request.user,
-                    reason=request.data.get("comment", ""),
+                    reason=comment,
                 )
 
             _create_log(
@@ -1178,7 +1593,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                 action=ApprovalAction.APPROVE,
                 previous_status=prev_status,
                 new_status=next_status,
-                comment=request.data.get("comment", ""),
+                comment=comment,
             )
 
         transaction.on_commit(
@@ -1187,7 +1602,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         if next_status == LeaveRequestStatus.APPROVED:
             _queue_final_approval_notifications(
                 leave_request,
-                decision_comment=request.data.get("comment", ""),
+                decision_comment=comment,
             )
 
         return Response(LeaveRequestReadSerializer(leave_request).data)
@@ -1201,53 +1616,40 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         leave_request = LeaveRequest.objects.select_related("employee", "employee__department", "employee__unit", "employee__team").get(pk=pk)
 
         comment = request.data.get("comment", "").strip()
-        if not comment:
-            raise ValidationError({"comment": "A comment is required when rejecting a request."})
+        _, reject_required = comment_requirements(leave_request)
+        if reject_required and not comment:
+            raise ValidationError(
+                {"comment": leave_messages.comment_required_for_reject()}
+            )
 
         if leave_request.status not in _REJECTION_ROLES:
             raise ValidationError(
                 {
-                    "status": (
-                        f"Request cannot be rejected from status '{leave_request.status}'. "
-                        f"Rejectable statuses: {list(_REJECTION_ROLES)}"
+                    "status": leave_messages.reject_invalid_status(
+                        leave_request.status,
+                        _REJECTION_ROLES,
                     )
                 }
             )
 
-        required_role = _REJECTION_ROLES[leave_request.status]
-        user = request.user
-        if not user.has_role(required_role):
-            raise PermissionDenied(
-                f"Only a user with role '{required_role}' can reject at this stage."
-            )
-
-        if leave_request.status == LeaveRequestStatus.PENDING_TEAM_LEAD:
-            team = getattr(leave_request.employee, "team", None)
-            if not team:
-                raise PermissionDenied("Only the team lead of the employee's team can reject at this stage.")
-            same_team_member = getattr(user, "team_id", None) == team.pk
-            is_configured_lead = team.team_lead_id == user.pk
-            if not (is_configured_lead or same_team_member):
-                raise PermissionDenied(
-                    "Only the team lead of the employee's team can reject at this stage."
-                )
-
-        if leave_request.status == LeaveRequestStatus.PENDING_SUPERVISOR:
-            unit = getattr(leave_request.employee, "unit", None)
-            if not unit:
-                raise PermissionDenied("Only the supervisor of the employee's unit can reject at this stage.")
-            same_unit_member = getattr(user, "unit_id", None) == unit.pk
-            is_configured_supervisor = unit.supervisor_id == user.pk
-            if not (is_configured_supervisor or same_unit_member):
-                raise PermissionDenied(
-                    "Only the supervisor of the employee's unit can reject at this stage."
-                )
+        actor_may_decide(
+            request.user,
+            leave_request,
+            prevent_self_approval=get_leave_settings().prevent_self_approval,
+        )
 
         prev_status = leave_request.status
 
         with transaction.atomic():
             leave_request.status = LeaveRequestStatus.REJECTED
             leave_request.save(update_fields=["status", "updated_at"])
+
+            release_leave_balance(
+                leave_request,
+                actor=request.user,
+                reason=comment,
+                source=BalanceTransactionSource.REJECT_RELEASE,
+            )
 
             _create_log(
                 leave_request=leave_request,
@@ -1284,7 +1686,11 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
 
         if leave_request.status in terminal_statuses:
             raise ValidationError(
-                {"status": f"Request is already {leave_request.status} and cannot be cancelled."}
+                {
+                    "status": leave_messages.cancel_not_allowed(
+                        leave_request.status
+                    )
+                }
             )
 
         if is_hr:
@@ -1300,8 +1706,11 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                 raise ValidationError(
                     {
                         "status": (
-                            "You can only cancel requests in DRAFT or PENDING_MANAGER status. "
-                            f"Current status: {leave_request.status}."
+                            "You can only cancel your own leave while it is still a draft "
+                            "or waiting for team lead, supervisor, or manager approval. "
+                            f"This request is currently "
+                            f"{leave_messages.leave_request_status_label(leave_request.status)}. "
+                            "Contact HR if you need to withdraw it after that stage."
                         )
                     }
                 )
@@ -1321,6 +1730,13 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
                     leave_request,
                     actor=user,
                     reason=cancel_comment or "Leave request cancelled.",
+                )
+            else:
+                release_leave_balance(
+                    leave_request,
+                    actor=user,
+                    reason=cancel_comment or "Leave request cancelled.",
+                    source=BalanceTransactionSource.CANCEL_RELEASE,
                 )
 
             _create_log(
@@ -1446,3 +1862,525 @@ class DepartmentCalendarView(APIView):
         qs = qs.order_by("start_date")
         serializer = CalendarEntrySerializer(qs, many=True)
         return Response(serializer.data)
+
+
+class LeaveAccrualPreviewView(APIView):
+    """
+    POST /api/v1/leave-accrual/preview/ — HR/Admin dry-run of accrual/rollover.
+    Never writes balances; use the management command or Beat to apply.
+    """
+
+    permission_classes = [permissions.IsAuthenticated, (IsHR | permissions.IsAdminUser)]
+
+    def post(self, request):
+        serializer = LeaveAccrualPreviewSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payload = preview_or_run_accrual(
+            as_of=serializer.validated_data.get("as_of"),
+            year=serializer.validated_data.get("year"),
+            month=serializer.validated_data.get("month"),
+            include_rollover=serializer.validated_data.get("include_rollover", True),
+            include_monthly=serializer.validated_data.get("include_monthly", True),
+            include_weekly=serializer.validated_data.get("include_weekly", False),
+            include_anniversary=serializer.validated_data.get("include_anniversary", False),
+            include_carry_expiry=serializer.validated_data.get("include_carry_expiry", True),
+            dry_run=True,
+        )
+        return Response(payload)
+
+
+class LeaveSettingsView(APIView):
+    """GET/PATCH /api/v1/leave-settings/ — singleton org settings."""
+
+    def get_permissions(self):
+        if self.request.method == "GET":
+            return [permissions.IsAuthenticated()]
+        return [permissions.IsAuthenticated(), (IsHR | permissions.IsAdminUser)()]
+
+    def get(self, request):
+        return Response(LeaveSettingsSerializer(get_leave_settings()).data)
+
+    def patch(self, request):
+        instance = get_leave_settings()
+        previous = snapshot_leave_settings(instance)
+        serializer = LeaveSettingsSerializer(instance, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        instance.refresh_from_db()
+        record_settings_audit(
+            actor=request.user,
+            object_type="LeaveSettings",
+            object_id=instance.pk,
+            action=SettingsAuditAction.UPDATE,
+            previous_values=previous,
+            new_values=snapshot_leave_settings(instance),
+            reason=request.data.get("reason", ""),
+            request=request,
+        )
+        return Response(LeaveSettingsSerializer(instance).data)
+
+
+def _json_safe(value):
+    return json.loads(json.dumps(value, default=str))
+
+
+def _audit_calendar_write(*, actor, request, instance, action, object_type, previous, new_values):
+    record_settings_audit(
+        actor=actor,
+        object_type=object_type,
+        object_id=instance.pk,
+        action=action,
+        previous_values=_json_safe(previous) if previous is not None else None,
+        new_values=_json_safe(new_values) if new_values is not None else None,
+        reason=request.data.get("reason", "") if hasattr(request, "data") else "",
+        request=request,
+    )
+
+
+class _CalendarWriteMixin:
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [permissions.IsAuthenticated()]
+        return [permissions.IsAuthenticated(), (IsHR | permissions.IsAdminUser)()]
+
+
+class WorkingCalendarViewSet(_CalendarWriteMixin, viewsets.ModelViewSet):
+    queryset = WorkingCalendar.objects.all()
+    serializer_class = WorkingCalendarSerializer
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        _audit_calendar_write(
+            actor=self.request.user,
+            request=self.request,
+            instance=instance,
+            action=SettingsAuditAction.CREATE,
+            object_type="WorkingCalendar",
+            previous=None,
+            new_values=WorkingCalendarSerializer(instance).data,
+        )
+
+    def perform_update(self, serializer):
+        previous = WorkingCalendarSerializer(serializer.instance).data
+        instance = serializer.save()
+        _audit_calendar_write(
+            actor=self.request.user,
+            request=self.request,
+            instance=instance,
+            action=SettingsAuditAction.UPDATE,
+            object_type="WorkingCalendar",
+            previous=previous,
+            new_values=WorkingCalendarSerializer(instance).data,
+        )
+
+    def perform_destroy(self, instance):
+        previous = WorkingCalendarSerializer(instance).data
+        pk = instance.pk
+        instance.delete()
+        record_settings_audit(
+            actor=self.request.user,
+            object_type="WorkingCalendar",
+            object_id=pk,
+            action=SettingsAuditAction.DELETE,
+            previous_values=_json_safe(previous),
+            new_values=None,
+            reason=self.request.data.get("reason", "") if hasattr(self.request, "data") else "",
+            request=self.request,
+        )
+
+
+class HolidayCalendarViewSet(_CalendarWriteMixin, viewsets.ModelViewSet):
+    queryset = HolidayCalendar.objects.prefetch_related("holidays").all()
+    serializer_class = HolidayCalendarSerializer
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        _audit_calendar_write(
+            actor=self.request.user,
+            request=self.request,
+            instance=instance,
+            action=SettingsAuditAction.CREATE,
+            object_type="HolidayCalendar",
+            previous=None,
+            new_values=HolidayCalendarSerializer(instance).data,
+        )
+
+    def perform_update(self, serializer):
+        previous = HolidayCalendarSerializer(serializer.instance).data
+        instance = serializer.save()
+        _audit_calendar_write(
+            actor=self.request.user,
+            request=self.request,
+            instance=instance,
+            action=SettingsAuditAction.UPDATE,
+            object_type="HolidayCalendar",
+            previous=previous,
+            new_values=HolidayCalendarSerializer(instance).data,
+        )
+
+    def perform_destroy(self, instance):
+        previous = HolidayCalendarSerializer(instance).data
+        pk = instance.pk
+        instance.delete()
+        record_settings_audit(
+            actor=self.request.user,
+            object_type="HolidayCalendar",
+            object_id=pk,
+            action=SettingsAuditAction.DELETE,
+            previous_values=_json_safe(previous),
+            new_values=None,
+            reason=self.request.data.get("reason", "") if hasattr(self.request, "data") else "",
+            request=self.request,
+        )
+
+    @action(detail=True, methods=["post"], url_path="holidays")
+    def add_holiday(self, request, pk=None):
+        calendar = self.get_object()
+        serializer = CalendarHolidaySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        holiday = CalendarHoliday.objects.create(calendar=calendar, **serializer.validated_data)
+        record_settings_audit(
+            actor=request.user,
+            object_type="CalendarHoliday",
+            object_id=holiday.pk,
+            action=SettingsAuditAction.CREATE,
+            previous_values=None,
+            new_values=_json_safe(CalendarHolidaySerializer(holiday).data),
+            reason=request.data.get("reason", ""),
+            request=request,
+        )
+        return Response(CalendarHolidaySerializer(holiday).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["delete"], url_path="holidays/(?P<holiday_id>[^/.]+)")
+    def delete_holiday(self, request, pk=None, holiday_id=None):
+        calendar = self.get_object()
+        holiday = CalendarHoliday.objects.filter(calendar=calendar, pk=holiday_id).first()
+        if holiday is None:
+            raise ValidationError({"holiday_id": "Holiday not found on this calendar."})
+        previous = CalendarHolidaySerializer(holiday).data
+        hid = holiday.pk
+        holiday.delete()
+        record_settings_audit(
+            actor=request.user,
+            object_type="CalendarHoliday",
+            object_id=hid,
+            action=SettingsAuditAction.DELETE,
+            previous_values=_json_safe(previous),
+            new_values=None,
+            reason=request.data.get("reason", "") if hasattr(request, "data") else "",
+            request=request,
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class CalendarAssignmentViewSet(_CalendarWriteMixin, viewsets.ModelViewSet):
+    queryset = CalendarAssignment.objects.select_related(
+        "working_calendar", "holiday_calendar", "employee", "department"
+    ).all()
+    serializer_class = CalendarAssignmentSerializer
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        _audit_calendar_write(
+            actor=self.request.user,
+            request=self.request,
+            instance=instance,
+            action=SettingsAuditAction.CREATE,
+            object_type="CalendarAssignment",
+            previous=None,
+            new_values=CalendarAssignmentSerializer(instance).data,
+        )
+
+    def perform_update(self, serializer):
+        previous = CalendarAssignmentSerializer(serializer.instance).data
+        instance = serializer.save()
+        _audit_calendar_write(
+            actor=self.request.user,
+            request=self.request,
+            instance=instance,
+            action=SettingsAuditAction.UPDATE,
+            object_type="CalendarAssignment",
+            previous=previous,
+            new_values=CalendarAssignmentSerializer(instance).data,
+        )
+
+    def perform_destroy(self, instance):
+        previous = CalendarAssignmentSerializer(instance).data
+        pk = instance.pk
+        instance.delete()
+        record_settings_audit(
+            actor=self.request.user,
+            object_type="CalendarAssignment",
+            object_id=pk,
+            action=SettingsAuditAction.DELETE,
+            previous_values=_json_safe(previous),
+            new_values=None,
+            reason=self.request.data.get("reason", "") if hasattr(self.request, "data") else "",
+            request=self.request,
+        )
+
+
+class LeaveWorkflowTemplateViewSet(_CalendarWriteMixin, viewsets.ModelViewSet):
+    queryset = LeaveWorkflowTemplate.objects.prefetch_related("stages").all()
+    serializer_class = LeaveWorkflowTemplateSerializer
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        record_settings_audit(
+            actor=self.request.user,
+            object_type="LeaveWorkflowTemplate",
+            object_id=instance.pk,
+            action=SettingsAuditAction.CREATE,
+            previous_values=None,
+            new_values=_json_safe(LeaveWorkflowTemplateSerializer(instance).data),
+            reason=self.request.data.get("reason", ""),
+            request=self.request,
+        )
+
+    def perform_update(self, serializer):
+        previous = LeaveWorkflowTemplateSerializer(serializer.instance).data
+        instance = serializer.save()
+        record_settings_audit(
+            actor=self.request.user,
+            object_type="LeaveWorkflowTemplate",
+            object_id=instance.pk,
+            action=SettingsAuditAction.UPDATE,
+            previous_values=_json_safe(previous),
+            new_values=_json_safe(LeaveWorkflowTemplateSerializer(instance).data),
+            reason=self.request.data.get("reason", ""),
+            request=self.request,
+        )
+
+    def perform_destroy(self, instance):
+        previous = LeaveWorkflowTemplateSerializer(instance).data
+        pk = instance.pk
+        instance.delete()
+        record_settings_audit(
+            actor=self.request.user,
+            object_type="LeaveWorkflowTemplate",
+            object_id=pk,
+            action=SettingsAuditAction.DELETE,
+            previous_values=_json_safe(previous),
+            new_values=None,
+            reason=self.request.data.get("reason", "") if hasattr(self.request, "data") else "",
+            request=self.request,
+        )
+
+    @action(detail=True, methods=["post"], url_path="simulate")
+    def simulate(self, request, pk=None):
+        template = self.get_object()
+        serializer = LeaveWorkflowSimulateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payload = simulate_workflow(
+            template,
+            serializer.validated_data["employee"],
+            leave_type=serializer.validated_data.get("leave_type"),
+        )
+        return Response(payload)
+
+
+class ApproverDelegateViewSet(viewsets.ModelViewSet):
+    serializer_class = ApproverDelegateSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = ApproverDelegate.objects.select_related("user", "delegate").all()
+        user = self.request.user
+        if user.is_staff or user.has_role(RoleName.HR):
+            return qs
+        return qs.filter(Q(user=user) | Q(delegate=user))
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        is_hr = user.is_staff or user.has_role(RoleName.HR)
+        target = serializer.validated_data.get("user")
+        if not is_hr and target != user:
+            raise PermissionDenied("You can only create delegations for yourself.")
+        instance = serializer.save()
+        record_settings_audit(
+            actor=user,
+            object_type="ApproverDelegate",
+            object_id=instance.pk,
+            action=SettingsAuditAction.CREATE,
+            previous_values=None,
+            new_values=_json_safe(ApproverDelegateSerializer(instance).data),
+            reason=self.request.data.get("reason", ""),
+            request=self.request,
+        )
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        is_hr = user.is_staff or user.has_role(RoleName.HR)
+        if not is_hr and serializer.instance.user_id != user.pk:
+            raise PermissionDenied("You can only edit your own delegations.")
+        previous = ApproverDelegateSerializer(serializer.instance).data
+        instance = serializer.save()
+        record_settings_audit(
+            actor=user,
+            object_type="ApproverDelegate",
+            object_id=instance.pk,
+            action=SettingsAuditAction.UPDATE,
+            previous_values=_json_safe(previous),
+            new_values=_json_safe(ApproverDelegateSerializer(instance).data),
+            reason=self.request.data.get("reason", ""),
+            request=self.request,
+        )
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        is_hr = user.is_staff or user.has_role(RoleName.HR)
+        if not is_hr and instance.user_id != user.pk:
+            raise PermissionDenied("You can only delete your own delegations.")
+        previous = ApproverDelegateSerializer(instance).data
+        pk = instance.pk
+        instance.delete()
+        record_settings_audit(
+            actor=user,
+            object_type="ApproverDelegate",
+            object_id=pk,
+            action=SettingsAuditAction.DELETE,
+            previous_values=_json_safe(previous),
+            new_values=None,
+            reason=self.request.data.get("reason", "") if hasattr(self.request, "data") else "",
+            request=self.request,
+        )
+
+
+class LeaveBlackoutPeriodViewSet(_CalendarWriteMixin, viewsets.ModelViewSet):
+    queryset = LeaveBlackoutPeriod.objects.prefetch_related("leave_types").select_related(
+        "department"
+    )
+    serializer_class = LeaveBlackoutPeriodSerializer
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        _audit_calendar_write(
+            actor=self.request.user,
+            request=self.request,
+            instance=instance,
+            action=SettingsAuditAction.CREATE,
+            object_type="LeaveBlackoutPeriod",
+            previous=None,
+            new_values=LeaveBlackoutPeriodSerializer(instance).data,
+        )
+
+    def perform_update(self, serializer):
+        previous = LeaveBlackoutPeriodSerializer(serializer.instance).data
+        instance = serializer.save()
+        _audit_calendar_write(
+            actor=self.request.user,
+            request=self.request,
+            instance=instance,
+            action=SettingsAuditAction.UPDATE,
+            object_type="LeaveBlackoutPeriod",
+            previous=previous,
+            new_values=LeaveBlackoutPeriodSerializer(instance).data,
+        )
+
+    def perform_destroy(self, instance):
+        previous = LeaveBlackoutPeriodSerializer(instance).data
+        pk = instance.pk
+        instance.delete()
+        record_settings_audit(
+            actor=self.request.user,
+            object_type="LeaveBlackoutPeriod",
+            object_id=pk,
+            action=SettingsAuditAction.DELETE,
+            previous_values=_json_safe(previous),
+            new_values=None,
+            reason=self.request.data.get("reason", "") if hasattr(self.request, "data") else "",
+            request=self.request,
+        )
+
+
+class LeaveReportsView(APIView):
+    """
+    GET /api/v1/leave-reports/{kind}/
+    kind: utilization | who-is-out | liability
+    Optional ?format=csv for HR export.
+    """
+
+    permission_classes = [permissions.IsAuthenticated, (IsHR | permissions.IsAdminUser)]
+
+    def get(self, request, kind):
+        from .services import liability_report, utilization_report, who_is_out_report
+
+        today = datetime.date.today()
+        year = request.query_params.get("year", today.year)
+        try:
+            year = int(year)
+        except (TypeError, ValueError):
+            raise ValidationError({"year": "year must be an integer."})
+        department_id = request.query_params.get("department") or None
+        as_csv = (request.query_params.get("export") or request.query_params.get("format") or "").lower() == "csv"
+
+        if kind == "utilization":
+            rows = utilization_report(year=year, department_id=department_id)
+            headers = [
+                "department_id",
+                "department_name",
+                "leave_type_id",
+                "leave_type_name",
+                "leave_type_code",
+                "allocated_days",
+                "used_days",
+                "pending_days",
+                "utilization",
+            ]
+        elif kind == "liability":
+            rows = liability_report(year=year, department_id=department_id)
+            headers = [
+                "department_id",
+                "department_name",
+                "leave_type_id",
+                "leave_type_name",
+                "leave_type_code",
+                "allocated_days",
+                "used_days",
+                "pending_days",
+                "utilization",
+                "liability_days",
+            ]
+        elif kind == "who-is-out":
+            scope = (request.query_params.get("scope") or "today").lower()
+            if scope == "week":
+                start = today - datetime.timedelta(days=today.weekday())
+                end = start + datetime.timedelta(days=6)
+            else:
+                start = end = today
+            date_from = request.query_params.get("from")
+            date_to = request.query_params.get("to")
+            if date_from:
+                start = datetime.date.fromisoformat(date_from)
+            if date_to:
+                end = datetime.date.fromisoformat(date_to)
+            rows = who_is_out_report(
+                start_date=start, end_date=end, department_id=department_id
+            )
+            headers = [
+                "id",
+                "employee_id",
+                "employee_email",
+                "department_id",
+                "department_name",
+                "leave_type",
+                "leave_type_code",
+                "start_date",
+                "end_date",
+                "total_working_days",
+            ]
+        else:
+            raise ValidationError(
+                {"kind": "kind must be utilization, who-is-out, or liability."}
+            )
+
+        if as_csv:
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+            response = HttpResponse(buf.getvalue(), content_type="text/csv")
+            response["Content-Disposition"] = f'attachment; filename="leave-{kind}.csv"'
+            return response
+        return Response({"kind": kind, "year": year, "results": rows})

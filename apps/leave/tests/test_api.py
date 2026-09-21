@@ -326,7 +326,8 @@ class LeaveApiTests(APITestCase):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("leave_balance", response.data)
-        self.assertIn("Insufficient leave balance", str(response.data["leave_balance"]))
+        self.assertIn("Insufficient", str(response.data["leave_balance"]))
+        self.assertIn("available", str(response.data["leave_balance"]).lower())
 
     def test_full_approval_chain(self):
         leave_request_id = self._create_and_submit()
@@ -389,7 +390,7 @@ class LeaveApiTests(APITestCase):
         )
         self.assertEqual(overlap_resp.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("leave_request", overlap_resp.data)
-        self.assertIn("overlapping leave request", str(overlap_resp.data["leave_request"]))
+        self.assertIn("different date range", str(overlap_resp.data["leave_request"]).lower())
 
     def test_cancel_by_employee(self):
         create_resp = self._create_request(self.employee)
