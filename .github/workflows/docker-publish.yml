@@ -32,17 +32,14 @@ jobs:
             requirements/dev.txt
 
       - name: Install dependencies
-        run: pip install -r requirements/base.txt -r requirements/dev.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements/base.txt -r requirements/dev.txt
 
       - name: Run full test suite
         env:
-          DJANGO_SETTINGS_MODULE: hrm_backend.settings.base
-          # CI-only values — not production secrets
+          DJANGO_SETTINGS_MODULE: hrm_backend.settings.test
           SECRET_KEY: django-insecure-ci-test-key-not-for-production
-          DEBUG: "True"
-          ALLOWED_HOSTS: localhost,127.0.0.1
-          EMAIL_BACKEND: django.core.mail.backends.console.EmailBackend
-          FRONTEND_BASE_URL: http://localhost:3000
         run: python manage.py test
 
   docker-build-and-push:

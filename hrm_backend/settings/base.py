@@ -295,13 +295,14 @@ CACHES = {
     }
 }
 
-# Use in-memory cache for test runs so tests do not depend on Redis.
+# Notifications (SSE + Redis Pub/Sub)
+NOTIFICATIONS_REDIS_URL = REDIS_URL
+
+# Tests should not depend on Redis (cache or notification pub/sub).
 if "test" in sys.argv:
     CACHES = {
         "default": {
             "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
         }
     }
-
-# Notifications (SSE + Redis Pub/Sub)
-NOTIFICATIONS_REDIS_URL = REDIS_URL
+    NOTIFICATIONS_REDIS_URL = ""
