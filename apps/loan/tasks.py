@@ -109,14 +109,20 @@ def _send_email_if_possible(
 
 
 def _publish_notifications(*, redis_url: str, user_ids: list[str], payload: dict) -> None:
-    if not user_ids:
+    if not user_ids or not redis_url:
         return
     import redis
 
-    client = redis.from_url(redis_url, decode_responses=True)
     data = json.dumps(payload)
-    for user_id in user_ids:
-        client.publish(f"notifications:user:{user_id}", data)
+    try:
+        client = redis.from_url(redis_url, decode_responses=True)
+        for user_id in user_ids:
+            client.publish(f"notifications:user:{user_id}", data)
+    except redis.RedisError:
+        logger.exception(
+            "Failed to publish in-app notifications over Redis. user_ids=%s",
+            user_ids,
+        )
 
 
 def _notify_users_in_app(*, users: list, title: str, body: str, ntype: str, data: dict) -> None:

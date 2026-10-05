@@ -5,3 +5,6 @@ class LeaveConfig(AppConfig):
     default_auto_field = "django.db.models.BigAutoField"
     name = "apps.leave"
     verbose_name = "Leave Management"
+
+    def ready(self):
+        import apps.leave.signals  # noqa: F401

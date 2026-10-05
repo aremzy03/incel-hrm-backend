@@ -43,7 +43,7 @@ THIRD_PARTY_APPS = [
 
 LOCAL_APPS = [
     "apps.accounts",
-    "apps.leave",
+    "apps.leave.apps.LeaveConfig",
     "apps.loan",
     "apps.notifications",
 ]
@@ -254,6 +254,30 @@ CELERY_BEAT_SCHEDULE = {
         "task": "apps.leave.tasks.notify_upcoming_approved_leaves",
         "schedule": crontab(minute=0),  # hourly; sends ~24h before start day
     },
+    "leave-year-rollover": {
+        "task": "apps.leave.tasks.run_leave_year_rollover",
+        "schedule": crontab(month_of_year=1, day_of_month=1, hour=0, minute=10),
+    },
+    "leave-monthly-accrual": {
+        "task": "apps.leave.tasks.run_leave_monthly_accrual",
+        "schedule": crontab(day_of_month=1, hour=0, minute=20),
+    },
+    "leave-weekly-accrual": {
+        "task": "apps.leave.tasks.run_leave_weekly_accrual",
+        "schedule": crontab(day_of_week=1, hour=0, minute=25),
+    },
+    "leave-anniversary-accrual": {
+        "task": "apps.leave.tasks.run_leave_anniversary_accrual",
+        "schedule": crontab(hour=0, minute=35),
+    },
+    "leave-carry-forward-expiry": {
+        "task": "apps.leave.tasks.run_leave_carry_forward_expiry",
+        "schedule": crontab(hour=0, minute=40),
+    },
+    "leave-approval-sla-escalation": {
+        "task": "apps.leave.tasks.escalate_stale_leave_approvals",
+        "schedule": crontab(minute=15),
+    },
 }
 
 
@@ -273,3 +297,12 @@ CACHES = {
 
 # Notifications (SSE + Redis Pub/Sub)
 NOTIFICATIONS_REDIS_URL = REDIS_URL
+
+# Tests should not depend on Redis (cache or notification pub/sub).
+if "test" in sys.argv:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        }
+    }
+    NOTIFICATIONS_REDIS_URL = ""

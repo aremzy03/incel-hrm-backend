@@ -196,11 +196,21 @@ class LeaveReconcileApiTests(APITestCase):
         self.assertGreater(self.balance.used_days, 21)
 
     def test_reconcile_respects_backdating_policy(self):
-        LeavePolicy.objects.create(
-            leave_type=self.leave_type,
-            annual_entitlement=21,
-            allow_backdated=False,
-        )
+        from apps.leave.models import LeavePolicyStatus
+        from apps.leave.services import get_active_policy
+
+        policy = get_active_policy(self.leave_type)
+        if policy is None:
+            LeavePolicy.objects.create(
+                leave_type=self.leave_type,
+                annual_entitlement=21,
+                allow_backdated=False,
+                status=LeavePolicyStatus.ACTIVE,
+                version=1,
+            )
+        else:
+            policy.allow_backdated = False
+            policy.save(update_fields=["allow_backdated", "updated_at"])
         self._auth(self.hr_user)
         response = self.client.post(
             self.reconcile_url,
