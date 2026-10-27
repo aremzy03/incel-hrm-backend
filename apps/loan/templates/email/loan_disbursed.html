@@ -1,0 +1,58 @@
+{% extends "email/base.html" %}
+
+{% block content %}
+  <p class="title">Your loan has been disbursed</p>
+  <p class="muted">
+    Dear {{ employee_name }}, your approved loan has been disbursed and is now active.
+  </p>
+
+  <div class="divider"></div>
+
+  <table class="kv" role="presentation" cellpadding="0" cellspacing="0" width="100%">
+    <tr><td class="k">Loan type</td><td class="v">{{ loan_type }}</td></tr>
+    <tr><td class="k">Disbursed amount</td><td class="v">{{ amount }}</td></tr>
+    <tr><td class="k">Tenure</td><td class="v">{{ tenure_months }} month(s)</td></tr>
+    <tr><td class="k">Monthly installment</td><td class="v">{{ monthly_installment }}</td></tr>
+    <tr><td class="k">Outstanding balance</td><td class="v">{{ outstanding_balance }}</td></tr>
+    <tr><td class="k">Status</td><td class="v">Active</td></tr>
+  </table>
+
+  <div class="divider"></div>
+  <p class="muted"><strong>Repayment schedule:</strong></p>
+  {% if schedule_items %}
+    <table style="width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px;" cellpadding="6">
+      <thead>
+        <tr style="border-bottom: 2px solid #d6d3d1; text-align: left; color: #6b7280;">
+          <th style="padding: 6px 4px;">#</th>
+          <th style="padding: 6px 4px;">Due Date</th>
+          <th style="padding: 6px 4px;">Amount Due</th>
+          <th style="padding: 6px 4px;">Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in schedule_items %}
+          <tr style="border-bottom: 1px solid #e7e5e4;">
+            <td style="padding: 6px 4px; color: #6b7280;">#{{ item.installment_number }}</td>
+            <td style="padding: 6px 4px;">{{ item.due_date }}</td>
+            <td style="padding: 6px 4px; font-weight: 600;">{{ item.amount_due }}</td>
+            <td style="padding: 6px 4px; color: #4b5563;">{{ item.payment_status }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if remaining_schedule_count %}
+      <p class="muted" style="margin-top: 8px;">… and {{ remaining_schedule_count }} more installment(s)</p>
+    {% endif %}
+  {% else %}
+    <p class="muted" style="margin-top: 6px;">(Repayment schedule will be updated shortly.)</p>
+  {% endif %}
+
+  {% if action_url %}
+    <div class="buttonWrap">
+      <a class="button" href="{{ action_url }}" target="_blank" rel="noopener noreferrer">View loan details</a>
+    </div>
+    <p class="muted" style="margin-top: 10px;">
+      If the button doesn’t work, copy and paste this URL: {{ action_url }}
+    </p>
+  {% endif %}
+{% endblock %}

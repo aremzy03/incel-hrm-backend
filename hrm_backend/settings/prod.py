@@ -24,3 +24,22 @@ if _proxy_header:
     SECURE_PROXY_SSL_HEADER = (_proto_key.strip(), _proto_val.strip())
 else:
     SECURE_PROXY_SSL_HEADER = None
+
+# WhiteNoise: serve static files directly in production via Gunicorn
+_security_idx = (
+    MIDDLEWARE.index("django.middleware.security.SecurityMiddleware")
+    if "django.middleware.security.SecurityMiddleware" in MIDDLEWARE
+    else -1
+)
+MIDDLEWARE = list(MIDDLEWARE)
+MIDDLEWARE.insert(_security_idx + 1, "whitenoise.middleware.WhiteNoiseMiddleware")
+
+STORAGES = {
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
+

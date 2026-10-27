@@ -1,0 +1,29 @@
+{% if approved %}Your Loan Application Has Been Approved
+
+Dear {{ employee_name }},
+
+Your loan application has been approved.
+
+Loan type: {{ loan_type }}
+Amount: {{ amount }}
+Tenure: {{ tenure_months }} month(s)
+Monthly installment: {{ monthly_installment }}
+Status: Approved
+
+Next steps:
+- HR will disburse the approved amount according to company policy.
+- You will receive a further update when the loan is activated and repayment schedule is available.
+{% else %}Your Loan Application Was Not Approved
+
+Dear {{ employee_name }},
+
+We regret to inform you that your loan application was not approved.
+
+Loan type: {{ loan_type }}
+Amount: {{ amount }}
+Tenure: {{ tenure_months }} month(s)
+Status: Not Approved
+{% if comment %}Rejection comment: {{ comment }}
+{% endif %}{% endif %}
+{% if action_url %}View application: {{ action_url }}
+{% endif %}
