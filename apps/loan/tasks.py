@@ -165,7 +165,31 @@ def _submitted_timestamp(loan: LoanApplication) -> str:
     return django_timezone.localtime(ts).strftime("%Y-%m-%d %H:%M %Z")
 
 
-def _approval_history_summary(loan: LoanApplication) -> str:
+def _format_amount(val) -> str:
+    if val is None:
+        return "-"
+    try:
+        return f"{Decimal(str(val)):,.2f}"
+    except Exception:
+        return str(val)
+
+
+def _employee_department(loan: LoanApplication) -> str:
+    dept = getattr(loan.employee, "department", None)
+    return getattr(dept, "name", "") if dept else ""
+
+
+def _monthly_installment_val(loan: LoanApplication) -> str:
+    if loan.monthly_installment is not None:
+        return _format_amount(loan.monthly_installment)
+    approx = (Decimal(loan.amount) / Decimal(loan.tenure_months)).quantize(
+        Decimal("0.01"), rounding=ROUND_CEILING
+    )
+    return f"{approx:,.2f} (approx.)"
+
+
+def _approval_history_data(loan: LoanApplication) -> tuple[list[dict], str]:
+    items: list[dict] = []
     lines: list[str] = []
     for log in (
         LoanApprovalLog.objects.filter(loan=loan)
@@ -177,21 +201,36 @@ def _approval_history_summary(loan: LoanApplication) -> str:
         )
         prev = log.previous_status or "(start)"
         extra = f" — {log.comment}" if log.comment else ""
+        formatted_ts = django_timezone.localtime(log.timestamp).strftime("%Y-%m-%d %H:%M")
+        items.append({
+            "timestamp": formatted_ts,
+            "action": log.get_action_display(),
+            "from_status": prev,
+            "to_status": log.new_status,
+            "actor": actor_label,
+            "comment": log.comment or "",
+        })
         lines.append(
-            f"- {django_timezone.localtime(log.timestamp):%Y-%m-%d %H:%M} — "
+            f"- {formatted_ts} — "
             f"{log.get_action_display()}: {prev} → {log.new_status} ({actor_label}){extra}"
         )
-    return "\n".join(lines) if lines else "(No approval history yet.)"
+    text_summary = "\n".join(lines) if lines else "(No approval history yet.)"
+    return items, text_summary
+
+
+def _approval_history_summary(loan: LoanApplication) -> str:
+    _, text_summary = _approval_history_data(loan)
+    return text_summary
 
 
 def _monthly_installment_line(loan: LoanApplication) -> str:
     if loan.monthly_installment is not None:
-        return f"Monthly installment: {loan.monthly_installment}\n"
+        return f"Monthly installment: {_format_amount(loan.monthly_installment)}\n"
     approx = (Decimal(loan.amount) / Decimal(loan.tenure_months)).quantize(
         Decimal("0.01"), rounding=ROUND_CEILING
     )
     return (
-        f"Monthly installment: {approx} (principal ÷ tenure; final figure set at disbursement)\n"
+        f"Monthly installment: {approx:,.2f} (principal ÷ tenure; final figure set at disbursement)\n"
     )
 
 
@@ -246,24 +285,48 @@ def notify_loan_approver_required(loan_id: str) -> bool:
     body = (
         f"Employee: {employee_name}\n"
         f"Loan type: {loan.loan_type.name}\n"
-        f"Amount: {loan.amount}\n"
+        f"Amount: {_format_amount(loan.amount)}\n"
         f"Tenure: {loan.tenure_months} month(s)\n"
         f"Purpose: {loan.purpose}\n"
-        f"Current status: {loan.status}\n"
+        f"Current status: {loan.get_status_display()}\n"
     )
+    submitted_ts = ""
     if loan.status == LoanApplicationStatus.PENDING_HR:
+        submitted_ts = _submitted_timestamp(loan)
         body = (
             f"{body}"
-            f"Date submitted: {_submitted_timestamp(loan)}\n"
+            f"Date submitted: {submitted_ts}\n"
         )
 
+    action_url = _loan_action_url(loan)
+    context = {
+        "title": subject_prefix,
+        "employee_name": employee_name,
+        "department": _employee_department(loan),
+        "loan_type": loan.loan_type.name,
+        "amount": _format_amount(loan.amount),
+        "tenure_months": loan.tenure_months,
+        "monthly_installment": _monthly_installment_val(loan),
+        "purpose": loan.purpose,
+        "status": loan.get_status_display(),
+        "date_submitted": submitted_ts,
+        "action_url": action_url,
+    }
+
     emails = [u.email for u in recipient_users if u.email]
-    _send_email_if_possible(subject=subject, text_body=body, recipients=emails)
+    _send_email_if_possible(
+        subject=subject,
+        text_body=body,
+        recipients=emails,
+        html_template="email/loan_action_required.html",
+        text_template="email/loan_action_required.txt",
+        template_context=context,
+    )
 
     data = {
         "loan_id": str(loan.id),
         "status": loan.status,
-        "action_url": _loan_action_url(loan),
+        "action_url": action_url,
     }
     _notify_users_in_app(
         users=recipient_users,
@@ -279,7 +342,10 @@ def notify_loan_approver_required(loan_id: str) -> bool:
 def notify_loan_observers(loan_id: str) -> bool:
     """FYI notification to configured observer department/unit members."""
     try:
-        loan = LoanApplication.objects.select_related("employee", "loan_type").get(pk=loan_id)
+        loan = (
+            LoanApplication.objects.select_related("employee", "employee__department", "loan_type")
+            .get(pk=loan_id)
+        )
     except LoanApplication.DoesNotExist:
         logger.warning("notify_loan_observers: LoanApplication missing. loan_id=%s", loan_id)
         return False
@@ -295,17 +361,37 @@ def notify_loan_observers(loan_id: str) -> bool:
         f"This loan application is for your information only — no action is required.\n\n"
         f"Employee: {employee_name}\n"
         f"Loan type: {loan.loan_type.name}\n"
-        f"Amount: {loan.amount}\n"
+        f"Amount: {_format_amount(loan.amount)}\n"
         f"Tenure: {loan.tenure_months} month(s)\n"
-        f"Current status: {loan.status}\n"
+        f"Current status: {loan.get_status_display()}\n"
     )
+    action_url = _loan_action_url(loan)
+    context = {
+        "employee_name": employee_name,
+        "department": _employee_department(loan),
+        "loan_type": loan.loan_type.name,
+        "amount": _format_amount(loan.amount),
+        "tenure_months": loan.tenure_months,
+        "monthly_installment": _monthly_installment_val(loan),
+        "purpose": loan.purpose,
+        "status": loan.get_status_display(),
+        "action_url": action_url,
+    }
+
     emails = [u.email for u in observers if u.email]
-    _send_email_if_possible(subject=subject, text_body=body, recipients=emails)
+    _send_email_if_possible(
+        subject=subject,
+        text_body=body,
+        recipients=emails,
+        html_template="email/loan_observer_notice.html",
+        text_template="email/loan_observer_notice.txt",
+        template_context=context,
+    )
 
     data = {
         "loan_id": str(loan.id),
         "status": loan.status,
-        "action_url": _loan_action_url(loan),
+        "action_url": action_url,
     }
     _notify_users_in_app(
         users=observers,
@@ -327,7 +413,10 @@ def notify_loan_submitted(loan_id: str) -> bool:
 def notify_loan_decision(loan_id: str, decision: str, comment: str = "") -> bool:
     """Email the employee when a loan is fully approved or rejected."""
     try:
-        loan = LoanApplication.objects.select_related("employee", "loan_type").get(pk=loan_id)
+        loan = (
+            LoanApplication.objects.select_related("employee", "employee__department", "loan_type")
+            .get(pk=loan_id)
+        )
     except LoanApplication.DoesNotExist:
         logger.warning("notify_loan_decision: LoanApplication missing. loan_id=%s", loan_id)
         return False
@@ -337,12 +426,14 @@ def notify_loan_decision(loan_id: str, decision: str, comment: str = "") -> bool
         logger.info("notify_loan_decision: employee has no email. loan_id=%s", loan_id)
         return False
 
-    if decision == LoanApplicationStatus.APPROVED:
+    approved = decision == LoanApplicationStatus.APPROVED
+    action_url = _loan_action_url(loan)
+    if approved:
         subject = "Your Loan Application Has Been Approved"
         body = (
             f"Dear {_employee_name(loan)},\n\n"
             f"Your loan application has been approved.\n\n"
-            f"Amount: {loan.amount}\n"
+            f"Amount: {_format_amount(loan.amount)}\n"
             f"Tenure: {loan.tenure_months} month(s)\n"
             f"{_monthly_installment_line(loan)}"
             "\nNext steps:\n"
@@ -357,7 +448,7 @@ def notify_loan_decision(loan_id: str, decision: str, comment: str = "") -> bool
             f"Dear {_employee_name(loan)},\n\n"
             f"We regret to inform you that your loan application was not approved.\n\n"
             f"Loan type: {loan.loan_type.name}\n"
-            f"Amount: {loan.amount}\n"
+            f"Amount: {_format_amount(loan.amount)}\n"
             f"Rejection comment: {comment or 'No comment provided.'}\n"
         )
         ntype = NotificationType.LOAN_REJECTED
@@ -367,7 +458,26 @@ def notify_loan_decision(loan_id: str, decision: str, comment: str = "") -> bool
         )
         return False
 
-    _send_email_if_possible(subject=subject, text_body=body, recipients=[employee.email])
+    context = {
+        "employee_name": _employee_name(loan),
+        "approved": approved,
+        "decision": decision,
+        "loan_type": loan.loan_type.name,
+        "amount": _format_amount(loan.amount),
+        "tenure_months": loan.tenure_months,
+        "monthly_installment": _monthly_installment_val(loan),
+        "comment": comment,
+        "action_url": action_url,
+    }
+
+    _send_email_if_possible(
+        subject=subject,
+        text_body=body,
+        recipients=[employee.email],
+        html_template="email/loan_decision.html",
+        text_template="email/loan_decision.txt",
+        template_context=context,
+    )
 
     _notify_users_in_app(
         users=[employee],
@@ -378,7 +488,7 @@ def notify_loan_decision(loan_id: str, decision: str, comment: str = "") -> bool
             "loan_id": str(loan.id),
             "status": loan.status,
             "decision": decision,
-            "action_url": _loan_action_url(loan),
+            "action_url": action_url,
         },
     )
     return True
@@ -393,7 +503,10 @@ def notify_next_approver(loan_id: str) -> bool:
     PENDING_MD (notify Managing Directors).
     """
     try:
-        loan = LoanApplication.objects.select_related("employee", "loan_type").get(pk=loan_id)
+        loan = (
+            LoanApplication.objects.select_related("employee", "employee__department", "loan_type")
+            .get(pk=loan_id)
+        )
     except LoanApplication.DoesNotExist:
         logger.warning("notify_next_approver: LoanApplication missing. loan_id=%s", loan_id)
         return False
@@ -414,13 +527,14 @@ def notify_next_approver(loan_id: str) -> bool:
     emails = [u.email for u in recipients if u.email]
     employee_name = _employee_name(loan)
     subject = f"Loan Application Awaiting Your Approval — {employee_name}"
+    history_items, history_text = _approval_history_data(loan)
     body = (
         f"A loan application is awaiting your approval.\n\n"
         f"Employee: {employee_name}\n"
         f"Loan type: {loan.loan_type.name}\n"
-        f"Amount: {loan.amount}\n"
+        f"Amount: {_format_amount(loan.amount)}\n"
         f"Tenure: {loan.tenure_months} month(s)\n\n"
-        f"Approval history:\n{_approval_history_summary(loan)}\n"
+        f"Approval history:\n{history_text}\n"
     )
     if not emails:
         logger.info(
@@ -428,27 +542,68 @@ def notify_next_approver(loan_id: str) -> bool:
         )
         return False
 
-    _send_email_if_possible(subject=subject, text_body=body, recipients=emails)
+    action_url = _loan_action_url(loan)
+    context = {
+        "employee_name": employee_name,
+        "department": _employee_department(loan),
+        "loan_type": loan.loan_type.name,
+        "amount": _format_amount(loan.amount),
+        "tenure_months": loan.tenure_months,
+        "monthly_installment": _monthly_installment_val(loan),
+        "purpose": loan.purpose,
+        "status": loan.get_status_display(),
+        "approval_history_items": history_items,
+        "approval_history_text": history_text,
+        "action_url": action_url,
+    }
+
+    _send_email_if_possible(
+        subject=subject,
+        text_body=body,
+        recipients=emails,
+        html_template="email/loan_next_approver.html",
+        text_template="email/loan_next_approver.txt",
+        template_context=context,
+    )
     return True
 
 
-def _schedule_summary_lines(loan: LoanApplication, limit: int = 6) -> str:
+def _schedule_summary_data(loan: LoanApplication, limit: int = 6) -> tuple[list[dict], int, str]:
     rows = list(
         loan.repayment_schedule.order_by("installment_number").values(
             "installment_number", "due_date", "amount_due", "payment_status"
         )
     )
     if not rows:
-        return "(Repayment schedule not available yet.)\n"
+        return [], 0, "(Repayment schedule not available yet.)\n"
+    items: list[dict] = []
     lines: list[str] = []
     for row in rows[:limit]:
+        amount_str = _format_amount(row["amount_due"])
+        due_str = (
+            row["due_date"].strftime("%d %b %Y")
+            if hasattr(row["due_date"], "strftime")
+            else str(row["due_date"])
+        )
+        items.append({
+            "installment_number": row["installment_number"],
+            "due_date": due_str,
+            "amount_due": amount_str,
+            "payment_status": row["payment_status"],
+        })
         lines.append(
             f"- #{row['installment_number']}: due {row['due_date']}, "
             f"{row['amount_due']} ({row['payment_status']})"
         )
-    if len(rows) > limit:
-        lines.append(f"- … and {len(rows) - limit} more installment(s)")
-    return "\n".join(lines) + "\n"
+    remaining = max(0, len(rows) - limit)
+    if remaining > 0:
+        lines.append(f"- … and {remaining} more installment(s)")
+    return items, remaining, "\n".join(lines) + "\n"
+
+
+def _schedule_summary_lines(loan: LoanApplication, limit: int = 6) -> str:
+    _, _, text_summary = _schedule_summary_data(loan, limit=limit)
+    return text_summary
 
 
 @shared_task
@@ -469,17 +624,39 @@ def notify_loan_disbursed(loan_id: str) -> bool:
         logger.info("notify_loan_disbursed: employee has no email. loan_id=%s", loan_id)
         return False
 
+    schedule_items, remaining_count, schedule_text = _schedule_summary_data(loan)
     subject = "Your Loan Has Been Disbursed"
     body = (
         f"Dear {_employee_name(loan)},\n\n"
         f"Your approved loan has been disbursed and is now active.\n\n"
         f"Loan type: {loan.loan_type.name}\n"
-        f"Amount: {loan.amount}\n"
+        f"Amount: {_format_amount(loan.amount)}\n"
         f"{_monthly_installment_line(loan)}"
-        f"Outstanding balance: {loan.outstanding_balance}\n\n"
-        f"Repayment schedule:\n{_schedule_summary_lines(loan)}"
+        f"Outstanding balance: {_format_amount(loan.outstanding_balance)}\n\n"
+        f"Repayment schedule:\n{schedule_text}"
     )
-    _send_email_if_possible(subject=subject, text_body=body, recipients=[employee.email])
+    action_url = _loan_action_url(loan)
+    context = {
+        "employee_name": _employee_name(loan),
+        "loan_type": loan.loan_type.name,
+        "amount": _format_amount(loan.amount),
+        "tenure_months": loan.tenure_months,
+        "monthly_installment": _monthly_installment_val(loan),
+        "outstanding_balance": _format_amount(loan.outstanding_balance),
+        "schedule_items": schedule_items,
+        "remaining_schedule_count": remaining_count,
+        "schedule_summary_text": schedule_text,
+        "action_url": action_url,
+    }
+
+    _send_email_if_possible(
+        subject=subject,
+        text_body=body,
+        recipients=[employee.email],
+        html_template="email/loan_disbursed.html",
+        text_template="email/loan_disbursed.txt",
+        template_context=context,
+    )
     _notify_users_in_app(
         users=[employee],
         title=subject,
@@ -488,7 +665,7 @@ def notify_loan_disbursed(loan_id: str) -> bool:
         data={
             "loan_id": str(loan.id),
             "status": loan.status,
-            "action_url": _loan_action_url(loan),
+            "action_url": action_url,
         },
     )
     return True
@@ -514,9 +691,24 @@ def notify_loan_liquidated(loan_id: str) -> bool:
         f"Your active loan has been liquidated by HR. No further repayments are due "
         f"under this loan.\n\n"
         f"Loan type: {loan.loan_type.name}\n"
-        f"Original amount: {loan.amount}\n"
+        f"Original amount: {_format_amount(loan.amount)}\n"
     )
-    _send_email_if_possible(subject=subject, text_body=body, recipients=[employee.email])
+    action_url = _loan_action_url(loan)
+    context = {
+        "employee_name": _employee_name(loan),
+        "loan_type": loan.loan_type.name,
+        "amount": _format_amount(loan.amount),
+        "action_url": action_url,
+    }
+
+    _send_email_if_possible(
+        subject=subject,
+        text_body=body,
+        recipients=[employee.email],
+        html_template="email/loan_liquidated.html",
+        text_template="email/loan_liquidated.txt",
+        template_context=context,
+    )
     _notify_users_in_app(
         users=[employee],
         title=subject,
@@ -525,7 +717,7 @@ def notify_loan_liquidated(loan_id: str) -> bool:
         data={
             "loan_id": str(loan.id),
             "status": loan.status,
-            "action_url": _loan_action_url(loan),
+            "action_url": action_url,
         },
     )
     return True
@@ -552,9 +744,24 @@ def notify_loan_closed(loan_id: str) -> bool:
         f"The outstanding balance has been handled per company policy "
         f"(deducted from final entitlement where applicable).\n\n"
         f"Loan type: {loan.loan_type.name}\n"
-        f"Original amount: {loan.amount}\n"
+        f"Original amount: {_format_amount(loan.amount)}\n"
     )
-    _send_email_if_possible(subject=subject, text_body=body, recipients=[employee.email])
+    action_url = _loan_action_url(loan)
+    context = {
+        "employee_name": _employee_name(loan),
+        "loan_type": loan.loan_type.name,
+        "amount": _format_amount(loan.amount),
+        "action_url": action_url,
+    }
+
+    _send_email_if_possible(
+        subject=subject,
+        text_body=body,
+        recipients=[employee.email],
+        html_template="email/loan_closed.html",
+        text_template="email/loan_closed.txt",
+        template_context=context,
+    )
     _notify_users_in_app(
         users=[employee],
         title=subject,
@@ -563,10 +770,11 @@ def notify_loan_closed(loan_id: str) -> bool:
         data={
             "loan_id": str(loan.id),
             "status": loan.status,
-            "action_url": _loan_action_url(loan),
+            "action_url": action_url,
         },
     )
     return True
+
 
 
 @shared_task
