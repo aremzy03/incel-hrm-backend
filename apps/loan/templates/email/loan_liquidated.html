@@ -1,0 +1,26 @@
+{% extends "email/base.html" %}
+
+{% block content %}
+  <p class="title">Your loan has been liquidated</p>
+  <p class="muted">
+    Dear {{ employee_name }}, your active loan has been liquidated by HR.
+    No further repayments are due under this loan.
+  </p>
+
+  <div class="divider"></div>
+
+  <table class="kv" role="presentation" cellpadding="0" cellspacing="0" width="100%">
+    <tr><td class="k">Loan type</td><td class="v">{{ loan_type }}</td></tr>
+    <tr><td class="k">Original amount</td><td class="v">{{ amount }}</td></tr>
+    <tr><td class="k">Status</td><td class="v">Liquidated</td></tr>
+  </table>
+
+  {% if action_url %}
+    <div class="buttonWrap">
+      <a class="button" href="{{ action_url }}" target="_blank" rel="noopener noreferrer">View loan details</a>
+    </div>
+    <p class="muted" style="margin-top: 10px;">
+      If the button doesn’t work, copy and paste this URL: {{ action_url }}
+    </p>
+  {% endif %}
+{% endblock %}

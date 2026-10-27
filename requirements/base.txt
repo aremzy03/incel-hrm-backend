@@ -12,3 +12,4 @@ django-anymail
 gunicorn
 gevent
 psycogreen
+whitenoise
