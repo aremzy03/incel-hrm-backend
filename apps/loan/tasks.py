@@ -19,6 +19,7 @@ from django.utils.html import strip_tags
 from django.utils import timezone as django_timezone
 
 from apps.accounts.models import RoleName, get_or_create_management_department
+from apps.accounts.services import build_magic_link_url
 from apps.notifications.models import Notification, NotificationType
 
 from .models import (
@@ -37,11 +38,14 @@ def _employee_name(loan: LoanApplication) -> str:
     return loan.employee.get_full_name() or loan.employee.email
 
 
-def _loan_action_url(loan: LoanApplication) -> str:
+def _loan_action_url(loan: LoanApplication, recipient_user: User = None) -> str:
+    path = f"/loans/requests/{loan.id}"
+    if recipient_user is not None:
+        return build_magic_link_url(user=recipient_user, destination_path=path)
     base = (getattr(settings, "FRONTEND_BASE_URL", "") or "").rstrip("/")
     if not base:
-        return ""
-    return f"{base}/loans/requests/{loan.id}"
+        return path
+    return f"{base}{path}"
 
 
 def _users_with_role(role_name: str):
@@ -313,15 +317,18 @@ def notify_loan_approver_required(loan_id: str) -> bool:
         "action_url": action_url,
     }
 
-    emails = [u.email for u in recipient_users if u.email]
-    _send_email_if_possible(
-        subject=subject,
-        text_body=body,
-        recipients=emails,
-        html_template="email/loan_action_required.html",
-        text_template="email/loan_action_required.txt",
-        template_context=context,
-    )
+    valid_recipients = [u for u in recipient_users if u.email]
+    for user in valid_recipients:
+        user_action_url = _loan_action_url(loan, recipient_user=user)
+        user_context = {**context, "action_url": user_action_url}
+        _send_email_if_possible(
+            subject=subject,
+            text_body=body,
+            recipients=[user.email],
+            html_template="email/loan_action_required.html",
+            text_template="email/loan_action_required.txt",
+            template_context=user_context,
+        )
 
     data = {
         "loan_id": str(loan.id),
@@ -378,15 +385,18 @@ def notify_loan_observers(loan_id: str) -> bool:
         "action_url": action_url,
     }
 
-    emails = [u.email for u in observers if u.email]
-    _send_email_if_possible(
-        subject=subject,
-        text_body=body,
-        recipients=emails,
-        html_template="email/loan_observer_notice.html",
-        text_template="email/loan_observer_notice.txt",
-        template_context=context,
-    )
+    valid_observers = [u for u in observers if u.email]
+    for user in valid_observers:
+        user_action_url = _loan_action_url(loan, recipient_user=user)
+        user_context = {**context, "action_url": user_action_url}
+        _send_email_if_possible(
+            subject=subject,
+            text_body=body,
+            recipients=[user.email],
+            html_template="email/loan_observer_notice.html",
+            text_template="email/loan_observer_notice.txt",
+            template_context=user_context,
+        )
 
     data = {
         "loan_id": str(loan.id),
@@ -427,7 +437,7 @@ def notify_loan_decision(loan_id: str, decision: str, comment: str = "") -> bool
         return False
 
     approved = decision == LoanApplicationStatus.APPROVED
-    action_url = _loan_action_url(loan)
+    action_url = _loan_action_url(loan, recipient_user=employee)
     if approved:
         subject = "Your Loan Application Has Been Approved"
         body = (
@@ -557,14 +567,18 @@ def notify_next_approver(loan_id: str) -> bool:
         "action_url": action_url,
     }
 
-    _send_email_if_possible(
-        subject=subject,
-        text_body=body,
-        recipients=emails,
-        html_template="email/loan_next_approver.html",
-        text_template="email/loan_next_approver.txt",
-        template_context=context,
-    )
+    valid_recipients = [u for u in recipients if u.email]
+    for user in valid_recipients:
+        user_action_url = _loan_action_url(loan, recipient_user=user)
+        user_context = {**context, "action_url": user_action_url}
+        _send_email_if_possible(
+            subject=subject,
+            text_body=body,
+            recipients=[user.email],
+            html_template="email/loan_next_approver.html",
+            text_template="email/loan_next_approver.txt",
+            template_context=user_context,
+        )
     return True
 
 
@@ -635,7 +649,7 @@ def notify_loan_disbursed(loan_id: str) -> bool:
         f"Outstanding balance: {_format_amount(loan.outstanding_balance)}\n\n"
         f"Repayment schedule:\n{schedule_text}"
     )
-    action_url = _loan_action_url(loan)
+    action_url = _loan_action_url(loan, recipient_user=employee)
     context = {
         "employee_name": _employee_name(loan),
         "loan_type": loan.loan_type.name,
@@ -693,7 +707,7 @@ def notify_loan_liquidated(loan_id: str) -> bool:
         f"Loan type: {loan.loan_type.name}\n"
         f"Original amount: {_format_amount(loan.amount)}\n"
     )
-    action_url = _loan_action_url(loan)
+    action_url = _loan_action_url(loan, recipient_user=employee)
     context = {
         "employee_name": _employee_name(loan),
         "loan_type": loan.loan_type.name,
@@ -746,7 +760,7 @@ def notify_loan_closed(loan_id: str) -> bool:
         f"Loan type: {loan.loan_type.name}\n"
         f"Original amount: {_format_amount(loan.amount)}\n"
     )
-    action_url = _loan_action_url(loan)
+    action_url = _loan_action_url(loan, recipient_user=employee)
     context = {
         "employee_name": _employee_name(loan),
         "loan_type": loan.loan_type.name,

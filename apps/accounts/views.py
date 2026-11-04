@@ -25,12 +25,15 @@ from .models import (
     UserRole,
     UserTutorialProgress,
 )
-from .throttles import PasswordChangeThrottle, RegisterThrottle
+from .throttles import MagicLinkExchangeThrottle, PasswordChangeThrottle, RegisterThrottle
 from .permissions import IsExecutiveDirector, IsHR, IsOwnerOrHR
+from .services import MagicLinkError, exchange_magic_link_token, inspect_magic_link_token
 from .serializers import (
     BulkUserIdsSerializer,
     DepartmentLineManagerSerializer,
     DepartmentSerializer,
+    MagicLinkExchangeSerializer,
+    MagicLinkInspectSerializer,
     RegisterSerializer,
     RoleSerializer,
     TeamSerializer,
@@ -66,6 +69,8 @@ __all__ = [
     "TutorialProgressView",
     "UserProfileView",
     "PasswordChangeView",
+    "MagicLinkExchangeView",
+    "MagicLinkInspectView",
     "PasswordResetView",
     "UserViewSet",
     "RoleViewSet",
@@ -190,6 +195,76 @@ class PasswordChangeView(APIView):
         user.save(update_fields=["password", "updated_at"])
         _blacklist_user_refresh_tokens(user)
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+def _get_client_ip(request):
+    x_forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
+    if x_forwarded_for:
+        return x_forwarded_for.split(",")[0].strip()
+    return request.META.get("REMOTE_ADDR")
+
+
+class MagicLinkExchangeView(APIView):
+    """
+    POST /api/v1/auth/magic-link/exchange/
+
+    Exchanges a single-use magic link token for JWT access and refresh tokens.
+    """
+
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = [MagicLinkExchangeThrottle]
+
+    def post(self, request):
+        serializer = MagicLinkExchangeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        raw_token = serializer.validated_data["token"]
+
+        ip = _get_client_ip(request)
+        user_agent = request.META.get("HTTP_USER_AGENT", "")
+
+        try:
+            user, destination_path, tokens = exchange_magic_link_token(
+                raw_token=raw_token,
+                ip=ip,
+                user_agent=user_agent,
+            )
+        except MagicLinkError as err:
+            return Response(
+                {"detail": err.message, "code": err.code},
+                status=err.status_code,
+            )
+
+        return Response(
+            {
+                "access": tokens["access"],
+                "refresh": tokens["refresh"],
+                "destination_path": destination_path,
+                "user": UserSerializer(user).data,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class MagicLinkInspectView(APIView):
+    """
+    GET /api/v1/auth/magic-link/inspect/?token=...
+
+    Inspects token validity and target email without consuming it.
+    """
+
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = [MagicLinkExchangeThrottle]
+
+    def get(self, request):
+        token = request.query_params.get("token", "")
+        try:
+            data = inspect_magic_link_token(token)
+            return Response(data, status=status.HTTP_200_OK)
+        except MagicLinkError as err:
+            return Response(
+                {"detail": err.message, "code": err.code},
+                status=err.status_code,
+            )
 
 
 class PasswordResetView(APIView):

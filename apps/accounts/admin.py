@@ -1,7 +1,7 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 
-from .models import Department, Role, Team, Unit, User, UserRole
+from .models import Department, MagicLinkToken, Role, Team, Unit, User, UserRole
 
 
 @admin.register(User)
@@ -100,3 +100,27 @@ class TeamAdmin(admin.ModelAdmin):
     list_display = ("name", "unit", "team_lead", "created_at")
     search_fields = ("name", "unit__name", "unit__department__name", "team_lead__email")
     readonly_fields = ("id", "created_at", "updated_at")
+
+
+@admin.register(MagicLinkToken)
+class MagicLinkTokenAdmin(admin.ModelAdmin):
+    list_display = (
+        "user",
+        "destination_path",
+        "created_at",
+        "expires_at",
+        "consumed_at",
+        "consumed_by_ip",
+    )
+    list_filter = ("consumed_at", "created_at", "expires_at")
+    search_fields = ("user__email", "destination_path", "consumed_by_ip")
+    readonly_fields = (
+        "id",
+        "token_hash",
+        "created_at",
+        "expires_at",
+        "consumed_at",
+        "consumed_by_ip",
+        "consumed_user_agent",
+    )
+

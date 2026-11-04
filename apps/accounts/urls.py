@@ -4,16 +4,18 @@ from rest_framework.routers import DefaultRouter
 from .throttled_auth_views import ThrottledTokenObtainPairView, ThrottledTokenRefreshView
 from .views import (
     AssignRoleView,
-    PasswordChangeView,
-    PasswordResetView,
-    DepartmentDetailView,
     DepartmentBulkAddMembersView,
     DepartmentBulkRemoveMembersView,
+    DepartmentDetailView,
     DepartmentLineManagerView,
     DepartmentMembersView,
     DepartmentViewSet,
     EmployeeConfirmView,
+    MagicLinkExchangeView,
+    MagicLinkInspectView,
     MeView,
+    PasswordChangeView,
+    PasswordResetView,
     RegisterView,
     RemoveRoleView,
     RoleViewSet,
@@ -38,6 +40,8 @@ auth_urlpatterns = [
     ),
     path("profile/", UserProfileView.as_view(), name="profile"),
     path("password/change/", PasswordChangeView.as_view(), name="password-change"),
+    path("magic-link/exchange/", MagicLinkExchangeView.as_view(), name="magic-link-exchange"),
+    path("magic-link/inspect/", MagicLinkInspectView.as_view(), name="magic-link-inspect"),
 ]
 
 role_router = DefaultRouter()
