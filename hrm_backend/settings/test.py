@@ -52,5 +52,6 @@ REST_FRAMEWORK = {
         "register": "10000/minute",
         "refresh": "10000/minute",
         "password_change": "10000/minute",
+        "magic_link_exchange": "10000/minute",
     },
 }

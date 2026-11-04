@@ -796,3 +796,17 @@ class TutorialProgressUpdateSerializer(serializers.Serializer):
         if value not in VALID_TOUR_IDS:
             raise serializers.ValidationError(f"Unknown tour_id: {value}")
         return value
+
+
+# ---------------------------------------------------------------------------
+# Magic Link
+# ---------------------------------------------------------------------------
+
+
+class MagicLinkExchangeSerializer(serializers.Serializer):
+    token = serializers.CharField(required=True, trim_whitespace=True)
+
+
+class MagicLinkInspectSerializer(serializers.Serializer):
+    token = serializers.CharField(required=True, trim_whitespace=True)
+
