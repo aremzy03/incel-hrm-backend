@@ -435,3 +435,44 @@ class UserTutorialProgress(models.Model):
 
     def __str__(self):
         return f"{self.user.email} — {self.tour_id} ({self.status})"
+
+
+# ---------------------------------------------------------------------------
+# Magic Link Token (Deep link passwordless authentication for email notifications)
+# ---------------------------------------------------------------------------
+
+class MagicLinkToken(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="magic_link_tokens",
+    )
+    token_hash = models.CharField(max_length=64, db_index=True)
+    destination_path = models.CharField(max_length=512)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(db_index=True)
+    consumed_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    consumed_by_ip = models.GenericIPAddressField(null=True, blank=True)
+    consumed_user_agent = models.TextField(blank=True, default="")
+
+    class Meta:
+        verbose_name = "Magic Link Token"
+        verbose_name_plural = "Magic Link Tokens"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["token_hash", "consumed_at"]),
+        ]
+
+    def __str__(self):
+        status = "consumed" if self.consumed_at else ("expired" if self.is_expired else "active")
+        return f"MagicLinkToken({self.user.email}, {status})"
+
+    @property
+    def is_expired(self) -> bool:
+        return timezone.now() >= self.expires_at
+
+    @property
+    def is_valid(self) -> bool:
+        return self.consumed_at is None and not self.is_expired
+

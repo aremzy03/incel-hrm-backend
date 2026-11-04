@@ -46,6 +46,12 @@ class RefreshThrottle(AuthEndpointThrottle):
     scope = "refresh"
 
 
+class MagicLinkExchangeThrottle(AuthEndpointThrottle):
+    """IP-based throttle for exchanging magic link tokens."""
+
+    scope = "magic_link_exchange"
+
+
 class PasswordChangeThrottle(ScopedRateThrottle):
     """Per-user throttle for authenticated password change (mitigate current-password guessing)."""
 
