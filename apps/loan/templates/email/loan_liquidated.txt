@@ -1,0 +1,11 @@
+Your Loan Has Been Liquidated
+
+Dear {{ employee_name }},
+
+Your active loan has been liquidated by HR. No further repayments are due under this loan.
+
+Loan type: {{ loan_type }}
+Original amount: {{ amount }}
+Status: Liquidated
+{% if action_url %}View loan details: {{ action_url }}
+{% endif %}

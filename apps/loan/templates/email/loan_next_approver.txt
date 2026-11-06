@@ -1,0 +1,17 @@
+Loan Application Awaiting Your Approval — {{ employee_name }}
+
+A loan application is awaiting your approval.
+
+Employee: {{ employee_name }}
+{% if department %}Department: {{ department }}
+{% endif %}Loan type: {{ loan_type }}
+Amount: {{ amount }}
+Tenure: {{ tenure_months }} month(s)
+Monthly installment: {{ monthly_installment }}
+Current stage: {{ status }}
+{% if purpose %}Purpose: {{ purpose }}
+{% endif %}
+Approval history:
+{{ approval_history_text }}
+{% if action_url %}Review application: {{ action_url }}
+{% endif %}

@@ -140,7 +140,7 @@ USE_TZ = True
 # Static files
 # ---------------------------------------------------------------------------
 
-STATIC_URL = "static/"
+STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
 
@@ -177,6 +177,7 @@ REST_FRAMEWORK = {
         "register": "15/hour",
         "refresh": "120/hour",
         "password_change": "10/hour",
+        "magic_link_exchange": "60/hour",
     },
 }
 
@@ -192,6 +193,9 @@ SIMPLE_JWT = {
     "BLACKLIST_AFTER_ROTATION": True,
     "UPDATE_LAST_LOGIN": True,
 }
+
+MAGIC_LINK_EXPIRE_HOURS = config("MAGIC_LINK_EXPIRE_HOURS", default=72, cast=int)
+
 
 
 # ---------------------------------------------------------------------------

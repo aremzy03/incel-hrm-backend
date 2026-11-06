@@ -1,0 +1,11 @@
+Your Loan Has Been Closed
+
+Dear {{ employee_name }},
+
+Your active loan has been closed following resignation processing. The outstanding balance has been handled per company policy (deducted from final entitlement where applicable).
+
+Loan type: {{ loan_type }}
+Original amount: {{ amount }}
+Status: Closed
+{% if action_url %}View loan details: {{ action_url }}
+{% endif %}

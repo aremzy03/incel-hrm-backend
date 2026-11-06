@@ -1,0 +1,36 @@
+{% extends "email/base.html" %}
+
+{% block content %}
+  <p class="title">Loan application update (FYI)</p>
+  <p class="muted">
+    This notification is for your information only — no approval action is required.
+  </p>
+
+  <div class="divider"></div>
+
+  <table class="kv" role="presentation" cellpadding="0" cellspacing="0" width="100%">
+    <tr><td class="k">Employee</td><td class="v">{{ employee_name }}</td></tr>
+    {% if department %}
+      <tr><td class="k">Department</td><td class="v">{{ department }}</td></tr>
+    {% endif %}
+    <tr><td class="k">Loan type</td><td class="v">{{ loan_type }}</td></tr>
+    <tr><td class="k">Amount</td><td class="v">{{ amount }}</td></tr>
+    <tr><td class="k">Tenure</td><td class="v">{{ tenure_months }} month(s)</td></tr>
+    <tr><td class="k">Monthly installment</td><td class="v">{{ monthly_installment }}</td></tr>
+    <tr><td class="k">Current status</td><td class="v">{{ status }}</td></tr>
+  </table>
+
+  {% if purpose %}
+    <div class="divider"></div>
+    <p class="muted"><strong>Purpose:</strong> {{ purpose }}</p>
+  {% endif %}
+
+  {% if action_url %}
+    <div class="buttonWrap">
+      <a class="button" href="{{ action_url }}" target="_blank" rel="noopener noreferrer">View application</a>
+    </div>
+    <p class="muted" style="margin-top: 10px;">
+      If the button doesn’t work, copy and paste this URL: {{ action_url }}
+    </p>
+  {% endif %}
+{% endblock %}

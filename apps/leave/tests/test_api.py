@@ -205,6 +205,16 @@ class LeaveApiTests(APITestCase):
         self.assertEqual(submit_resp.status_code, status.HTTP_200_OK)
         return leave_request_id
 
+    def _department_reminder_recipient_emails(self, employee=None):
+        from apps.leave.services import get_department_leave_reminder_recipients
+
+        employee = employee or self.employee
+        return {
+            user.email
+            for user in get_department_leave_reminder_recipients(employee)
+            if getattr(user, "email", None)
+        }
+
     def test_employee_can_submit_leave_request(self):
         create_resp = self._create_request(self.employee)
         self.assertEqual(create_resp.status_code, status.HTTP_201_CREATED)
@@ -587,13 +597,17 @@ class LeaveApiTests(APITestCase):
 
         self.assertEqual(ed_approve.status_code, status.HTTP_200_OK)
 
-        # Immediate department reminder because start is within ~24h.
+        # One email per recipient so each person gets their own action link.
         department_mails = [
             m for m in mail.outbox if "Upcoming leave" in m.subject
         ]
-        self.assertEqual(len(department_mails), 1)
-        recipients = set(department_mails[0].to)
+        expected = self._department_reminder_recipient_emails()
+        self.assertEqual(len(department_mails), len(expected))
+        self.assertTrue(all(len(m.to) == 1 for m in department_mails))
+        recipients = {m.to[0] for m in department_mails}
+        self.assertEqual(recipients, expected)
         self.assertIn(colleague.email, recipients)
+        self.assertIn(self.supervisor.email, recipients)
         self.assertIn(self.line_manager.email, recipients)
         self.assertIn(self.hr_user.email, recipients)
         self.assertIn(self.executive_director.email, recipients)
@@ -644,9 +658,12 @@ class LeaveApiTests(APITestCase):
 
         mail.outbox.clear()
         sent_count = notify_upcoming_approved_leaves()
+        expected = self._department_reminder_recipient_emails()
         self.assertEqual(sent_count, 1)
-        self.assertEqual(len(mail.outbox), 1)
-        self.assertIn("Upcoming leave", mail.outbox[0].subject)
+        self.assertEqual(len(mail.outbox), len(expected))
+        self.assertTrue(all(len(m.to) == 1 for m in mail.outbox))
+        self.assertEqual({m.to[0] for m in mail.outbox}, expected)
+        self.assertTrue(all("Upcoming leave" in m.subject for m in mail.outbox))
         leave_request.refresh_from_db()
         self.assertIsNotNone(leave_request.department_reminder_sent_at)
 

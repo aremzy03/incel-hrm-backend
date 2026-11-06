@@ -13,6 +13,7 @@ from django.utils.html import strip_tags
 import redis
 
 from apps.accounts.models import RoleName, get_or_create_management_department
+from apps.accounts.services import build_magic_link_url
 from apps.notifications.models import Notification, NotificationType
 
 from . import messages as leave_messages
@@ -34,14 +35,18 @@ def _employee_name(leave_request: LeaveRequest) -> str:
     return leave_messages.user_display_name(leave_request.employee)
 
 
-def _leave_request_action_url(leave_request: LeaveRequest) -> str:
+def _leave_request_action_url(leave_request: LeaveRequest, recipient_user: User = None) -> str:
+    path = f"/leave/requests/{leave_request.id}"
+    if recipient_user is not None:
+        return build_magic_link_url(user=recipient_user, destination_path=path)
     base = (getattr(settings, "FRONTEND_BASE_URL", "") or "").rstrip("/")
     if not base:
-        return ""
-    return f"{base}/leave/requests/{leave_request.id}"
+        return path
+    return f"{base}{path}"
 
 
-def _email_template_context(leave_request: LeaveRequest, **extra) -> dict:
+def _email_template_context(leave_request: LeaveRequest, recipient_user: User = None, **extra) -> dict:
+    action_url = extra.get("action_url") or _leave_request_action_url(leave_request, recipient_user=recipient_user)
     ctx = {
         "employee_name": _employee_name(leave_request),
         "leave_type": leave_messages.leave_type_label(leave_request.leave_type),
@@ -50,7 +55,7 @@ def _email_template_context(leave_request: LeaveRequest, **extra) -> dict:
         "total_days": leave_messages.format_working_days(leave_request.total_working_days),
         "status": leave_request.status,
         "reason": leave_request.reason or "",
-        "action_url": _leave_request_action_url(leave_request),
+        "action_url": action_url,
     }
     ctx.update(extra)
     return ctx
@@ -144,7 +149,7 @@ def notify_leave_submitted(leave_request_id: str) -> bool:
         return False
 
     employee_name = _employee_name(leave_request)
-    action_url = _leave_request_action_url(leave_request)
+    action_url = _leave_request_action_url(leave_request, recipient_user=manager)
     subject = leave_messages.email_action_required_subject(employee_name)
     body = leave_messages.email_action_required_body(leave_request, action_url=action_url)
 
@@ -176,7 +181,7 @@ def notify_leave_submitted(leave_request_id: str) -> bool:
         text_body=body,
         recipients=[manager.email],
         html_template="email/leave_action_required.html",
-        template_context=_email_template_context(leave_request),
+        template_context=_email_template_context(leave_request, recipient_user=manager, action_url=action_url),
     )
 
 
@@ -194,7 +199,7 @@ def notify_leave_decision(leave_request_id: str, decision: str, comment: str = "
 
     employee_name = _employee_name(leave_request)
     approved = decision == LeaveRequestStatus.APPROVED
-    action_url = _leave_request_action_url(leave_request)
+    action_url = _leave_request_action_url(leave_request, recipient_user=leave_request.employee)
     subject = leave_messages.email_decision_subject(employee_name, approved=approved)
     body = leave_messages.email_decision_body(
         leave_request,
@@ -237,6 +242,8 @@ def notify_leave_decision(leave_request_id: str, decision: str, comment: str = "
         html_template="email/leave_decision.html",
         template_context=_email_template_context(
             leave_request,
+            recipient_user=leave_request.employee,
+            action_url=action_url,
             decision_message=body.split("\n\n")[0],
             comment=comment or "",
         ),
@@ -307,7 +314,6 @@ def notify_approver_required(leave_request_id: str) -> bool:
     action_url = _leave_request_action_url(leave_request)
     subject = leave_messages.email_action_required_subject(employee_name)
     body = leave_messages.email_action_required_body(leave_request, action_url=action_url)
-    recipients = [u.email for u in recipient_users if getattr(u, "email", None)]
     user_ids: list[str] = []
     for user in recipient_users:
         notification = Notification.objects.create(
@@ -333,13 +339,29 @@ def notify_approver_required(leave_request_id: str) -> bool:
                 "created_at": notification.created_at.isoformat(),
             },
         )
-    return _send_email_if_possible(
-        subject=subject,
-        text_body=body,
-        recipients=recipients,
-        html_template="email/leave_action_required.html",
-        template_context=_email_template_context(leave_request),
-    )
+
+    valid_recipients = [u for u in recipient_users if getattr(u, "email", None)]
+    if not valid_recipients:
+        return False
+
+    sent_any = False
+    for user in valid_recipients:
+        user_action_url = _leave_request_action_url(leave_request, recipient_user=user)
+        user_body = leave_messages.email_action_required_body(leave_request, action_url=user_action_url)
+        sent = _send_email_if_possible(
+            subject=subject,
+            text_body=user_body,
+            recipients=[user.email],
+            html_template="email/leave_action_required.html",
+            template_context=_email_template_context(
+                leave_request,
+                recipient_user=user,
+                action_url=user_action_url,
+            ),
+        )
+        if sent:
+            sent_any = True
+    return sent_any
 
 
 @shared_task
@@ -363,7 +385,7 @@ def notify_reliever_assigned(leave_request_id: str) -> bool:
         return False
 
     employee_name = _employee_name(leave_request)
-    action_url = _leave_request_action_url(leave_request)
+    action_url = _leave_request_action_url(leave_request, recipient_user=cover_person)
     subject = leave_messages.email_reliever_subject(employee_name)
     body = leave_messages.email_reliever_body(leave_request, action_url=action_url)
 
@@ -397,6 +419,8 @@ def notify_reliever_assigned(leave_request_id: str) -> bool:
         html_template="email/leave_reliever.html",
         template_context=_email_template_context(
             leave_request,
+            recipient_user=cover_person,
+            action_url=action_url,
             reliever_name=leave_messages.user_display_name(cover_person),
         ),
     )
@@ -468,22 +492,34 @@ def notify_department_leave_reminder(leave_request_id: str) -> bool:
             },
         )
 
-    recipients = [u.email for u in recipient_users if getattr(u, "email", None)]
-    sent = _send_email_if_possible(
-        subject=subject,
-        text_body=body,
-        recipients=recipients,
-        html_template="email/leave_department_reminder.html",
-        template_context=_email_template_context(
+    valid_recipients = [u for u in recipient_users if getattr(u, "email", None)]
+    sent_any = False
+    for user in valid_recipients:
+        user_action_url = _leave_request_action_url(leave_request, recipient_user=user)
+        user_body = leave_messages.email_department_reminder_body(
             leave_request,
             department_name=department_name,
-        ),
-    )
+            action_url=user_action_url,
+        )
+        sent = _send_email_if_possible(
+            subject=subject,
+            text_body=user_body,
+            recipients=[user.email],
+            html_template="email/leave_department_reminder.html",
+            template_context=_email_template_context(
+                leave_request,
+                recipient_user=user,
+                action_url=user_action_url,
+                department_name=department_name,
+            ),
+        )
+        if sent:
+            sent_any = True
 
     LeaveRequest.objects.filter(pk=leave_request.pk).update(
         department_reminder_sent_at=timezone.now()
     )
-    return sent
+    return sent_any
 
 
 @shared_task
@@ -532,8 +568,6 @@ def notify_leave_reconciled(
         action_url=action_url,
     )
 
-    recipients = [u.email for u in users_by_id.values() if getattr(u, "email", None)]
-
     for user in users_by_id.values():
         notification = Notification.objects.create(
             recipient=user,
@@ -559,17 +593,32 @@ def notify_leave_reconciled(
             },
         )
 
-    return _send_email_if_possible(
-        subject=subject,
-        text_body=body,
-        recipients=recipients,
-        html_template="email/leave_reconciled.html",
-        template_context=_email_template_context(
+    valid_users = [u for u in users_by_id.values() if getattr(u, "email", None)]
+    sent_any = False
+    for user in valid_users:
+        user_action_url = _leave_request_action_url(leave_request, recipient_user=user)
+        user_body = leave_messages.email_reconciled_body(
             leave_request,
             reconciled_by_name=reconciled_by_name,
-            reconciliation_note=leave_request.reconciliation_note or "",
-        ),
-    )
+            action_url=user_action_url,
+        )
+        sent = _send_email_if_possible(
+            subject=subject,
+            text_body=user_body,
+            recipients=[user.email],
+            html_template="email/leave_reconciled.html",
+            template_context=_email_template_context(
+                leave_request,
+                recipient_user=user,
+                action_url=user_action_url,
+                reconciled_by_name=reconciled_by_name,
+                reconciliation_note=leave_request.reconciliation_note or "",
+            ),
+        )
+        if sent:
+            sent_any = True
+
+    return sent_any
 
 
 @shared_task

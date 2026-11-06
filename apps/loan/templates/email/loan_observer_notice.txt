@@ -1,0 +1,15 @@
+Loan Application Update (FYI)
+
+This loan application is for your information only — no action is required.
+
+Employee: {{ employee_name }}
+{% if department %}Department: {{ department }}
+{% endif %}Loan type: {{ loan_type }}
+Amount: {{ amount }}
+Tenure: {{ tenure_months }} month(s)
+Monthly installment: {{ monthly_installment }}
+Current status: {{ status }}
+{% if purpose %}Purpose: {{ purpose }}
+{% endif %}
+{% if action_url %}View application: {{ action_url }}
+{% endif %}

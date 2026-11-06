@@ -1,0 +1,15 @@
+Your Loan Has Been Disbursed
+
+Dear {{ employee_name }},
+
+Your approved loan has been disbursed and is now active.
+
+Loan type: {{ loan_type }}
+Amount: {{ amount }}
+Monthly installment: {{ monthly_installment }}
+Outstanding balance: {{ outstanding_balance }}
+
+Repayment schedule:
+{{ schedule_summary_text }}
+{% if action_url %}View loan details: {{ action_url }}
+{% endif %}

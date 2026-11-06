@@ -1,0 +1,64 @@
+{% extends "email/base.html" %}
+
+{% block content %}
+  <p class="title">Loan application awaiting your approval</p>
+  <p class="muted">
+    A loan application for {{ employee_name }} is awaiting your review and approval.
+    Please review the application and its approval history below.
+  </p>
+
+  <div class="divider"></div>
+
+  <table class="kv" role="presentation" cellpadding="0" cellspacing="0" width="100%">
+    <tr><td class="k">Employee</td><td class="v">{{ employee_name }}</td></tr>
+    {% if department %}
+      <tr><td class="k">Department</td><td class="v">{{ department }}</td></tr>
+    {% endif %}
+    <tr><td class="k">Loan type</td><td class="v">{{ loan_type }}</td></tr>
+    <tr><td class="k">Requested amount</td><td class="v">{{ amount }}</td></tr>
+    <tr><td class="k">Tenure</td><td class="v">{{ tenure_months }} month(s)</td></tr>
+    <tr><td class="k">Monthly installment</td><td class="v">{{ monthly_installment }}</td></tr>
+    <tr><td class="k">Current stage</td><td class="v">{{ status }}</td></tr>
+  </table>
+
+  {% if purpose %}
+    <div class="divider"></div>
+    <p class="muted"><strong>Purpose:</strong> {{ purpose }}</p>
+  {% endif %}
+
+  <div class="divider"></div>
+  <p class="muted"><strong>Approval history:</strong></p>
+  {% if approval_history_items %}
+    <table style="width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px;" cellpadding="6">
+      <thead>
+        <tr style="border-bottom: 2px solid #d6d3d1; text-align: left; color: #6b7280;">
+          <th style="padding: 6px 4px;">Date</th>
+          <th style="padding: 6px 4px;">Action</th>
+          <th style="padding: 6px 4px;">Actor</th>
+          <th style="padding: 6px 4px;">Comment</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for h in approval_history_items %}
+          <tr style="border-bottom: 1px solid #e7e5e4;">
+            <td style="padding: 6px 4px; color: #6b7280;">{{ h.timestamp }}</td>
+            <td style="padding: 6px 4px; font-weight: 600;">{{ h.action }} ({{ h.to_status }})</td>
+            <td style="padding: 6px 4px;">{{ h.actor }}</td>
+            <td style="padding: 6px 4px; color: #4b5563;">{{ h.comment|default:"—" }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted" style="margin-top: 6px;">(No prior approval history recorded.)</p>
+  {% endif %}
+
+  {% if action_url %}
+    <div class="buttonWrap">
+      <a class="button" href="{{ action_url }}" target="_blank" rel="noopener noreferrer">Review application</a>
+    </div>
+    <p class="muted" style="margin-top: 10px;">
+      If the button doesn’t work, copy and paste this URL: {{ action_url }}
+    </p>
+  {% endif %}
+{% endblock %}
