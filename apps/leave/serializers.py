@@ -11,6 +11,7 @@ from .models import (
     CalendarHoliday,
     HolidayCalendar,
     LeaveApprovalLog,
+    LeaveAttachment,
     LeaveBalance,
     LeaveBalanceTransaction,
     LeaveBlackoutPeriod,
@@ -36,6 +37,7 @@ from .services import (
     get_eligible_relievers,
     reconcile_leave_request,
     reliever_required,
+    resolved_policy_requires_attachment,
     validate_assignment_scope,
     validate_blackout_periods,
     validate_cover_person_assignment,
@@ -275,6 +277,7 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = LeaveRequest
         fields = (
+            "id",
             "leave_type",
             "start_date",
             "end_date",
@@ -285,6 +288,7 @@ class LeaveRequestCreateSerializer(serializers.ModelSerializer):
             "half_day_period",
             "blackout_override_reason",
         )
+        read_only_fields = ("id",)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -545,6 +549,24 @@ class LeaveRequestReadSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class LeaveAttachmentSerializer(serializers.ModelSerializer):
+    """Attachment metadata. File bytes are never exposed as a stored URL."""
+
+    uploaded_by = _EmployeeMinimalSerializer(read_only=True)
+
+    class Meta:
+        model = LeaveAttachment
+        fields = (
+            "id",
+            "original_filename",
+            "content_type",
+            "size",
+            "uploaded_by",
+            "created_at",
+        )
+        read_only_fields = fields
+
+
 # ---------------------------------------------------------------------------
 # LeaveRequest — HR reconciliation
 # ---------------------------------------------------------------------------
@@ -568,6 +590,9 @@ class LeaveRequestReconcileSerializer(serializers.Serializer):
     )
     allow_insufficient_balance = serializers.BooleanField(required=False, default=False)
     notify_department_colleagues = serializers.BooleanField(required=False, default=False)
+    attachment_override_reason = serializers.CharField(
+        required=False, allow_blank=True, default=""
+    )
 
     def validate_reconciliation_note(self, value):
         note = (value or "").strip()
@@ -584,6 +609,22 @@ class LeaveRequestReconcileSerializer(serializers.Serializer):
             cover_person=attrs.get("cover_person"),
             allow_insufficient_balance=attrs.get("allow_insufficient_balance", False),
         )
+        override = (attrs.get("attachment_override_reason") or "").strip()
+        # Single reconcile is not emergency sick. Bulk reconcile does not use this serializer.
+        if resolved_policy_requires_attachment(
+            attrs["leave_type"],
+            employee=attrs["employee"],
+            on_date=attrs["start_date"],
+            is_emergency=False,
+        ) and not override:
+            raise serializers.ValidationError(
+                {
+                    "attachment_override_reason": (
+                        leave_messages.attachment_override_reason_required()
+                    )
+                }
+            )
+        attrs["attachment_override_reason"] = override
         return attrs
 
     def create(self, validated_data):
@@ -598,6 +639,7 @@ class LeaveRequestReconcileSerializer(serializers.Serializer):
             reconciliation_note=validated_data["reconciliation_note"],
             cover_person=validated_data.get("cover_person"),
             allow_insufficient_balance=validated_data.get("allow_insufficient_balance", False),
+            attachment_override_reason=validated_data.get("attachment_override_reason", ""),
         )
 
 
@@ -852,6 +894,7 @@ class LeavePolicySerializer(serializers.ModelSerializer):
             "allow_backdated",
             "maximum_backdate_days",
             "reliever_required",
+            "requires_attachment",
             "reliever_scope",
             "overlap_control_enabled",
             "overlap_scope",

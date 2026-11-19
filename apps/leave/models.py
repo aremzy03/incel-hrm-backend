@@ -1,3 +1,4 @@
+import os
 import uuid
 from decimal import Decimal
 
@@ -5,7 +6,26 @@ from django.conf import settings
 from django.db import models
 from django.utils import timezone
 
+from .storage import LeaveAttachmentStorage
 from .utils import calculate_working_days, slug_leave_type_code
+
+
+def leave_attachment_upload_to(instance, filename):
+    """Store the file under a UUID name. The original name is kept on the row."""
+    by_type = {
+        "application/pdf": ".pdf",
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+    }
+    ext = by_type.get(getattr(instance, "content_type", "") or "")
+    if not ext:
+        ext = os.path.splitext(filename or "")[1].lower()
+        if ext == ".jpeg":
+            ext = ".jpg"
+        if ext not in {".pdf", ".jpg", ".png", ".webp"}:
+            ext = ""
+    return f"{uuid.uuid4()}{ext}"
 
 
 def _code_from_leave_type_name(name: str) -> str:
@@ -180,6 +200,13 @@ class LeavePolicy(TimeStampedModel):
     reliever_required = models.BooleanField(
         default=True,
         help_text="When True, a cover person is required before submission (MD/ED and emergency still exempt).",
+    )
+    requires_attachment = models.BooleanField(
+        default=False,
+        help_text=(
+            "When True, a supporting document must be attached before submission. "
+            "Emergency sick leave is exempt."
+        ),
     )
     reliever_scope = models.CharField(
         max_length=16,
@@ -734,6 +761,40 @@ class LeaveRequest(TimeStampedModel):
             f"{self.employee.email} — {self.leave_type.name} "
             f"({self.start_date} → {self.end_date}) [{self.status}]"
         )
+
+
+class LeaveAttachment(TimeStampedModel):
+    """Private supporting document for a leave request. Max 5 per request."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    request = models.ForeignKey(
+        LeaveRequest,
+        on_delete=models.CASCADE,
+        related_name="attachments",
+    )
+    file = models.FileField(
+        storage=LeaveAttachmentStorage(),
+        upload_to=leave_attachment_upload_to,
+    )
+    original_filename = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=128)
+    size = models.PositiveIntegerField()
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="leave_attachments_uploaded",
+    )
+
+    class Meta:
+        verbose_name = "Leave Attachment"
+        verbose_name_plural = "Leave Attachments"
+        ordering = ["created_at"]
+        indexes = [
+            models.Index(fields=["request", "created_at"]),
+        ]
+
+    def __str__(self):
+        return self.original_filename or str(self.id)
 
 
 # ---------------------------------------------------------------------------

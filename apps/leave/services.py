@@ -90,6 +90,7 @@ POLICY_SNAPSHOT_FIELDS = (
     "allow_backdated",
     "maximum_backdate_days",
     "reliever_required",
+    "requires_attachment",
     "reliever_scope",
     "overlap_control_enabled",
     "overlap_scope",
@@ -1052,6 +1053,7 @@ def clone_leave_policy(policy, *, actor, reason: str = "", request=None) -> Leav
         allow_backdated=policy.allow_backdated,
         maximum_backdate_days=policy.maximum_backdate_days,
         reliever_required=policy.reliever_required,
+        requires_attachment=policy.requires_attachment,
         reliever_scope=policy.reliever_scope,
         overlap_control_enabled=policy.overlap_control_enabled,
         overlap_scope=policy.overlap_scope,
@@ -1600,6 +1602,7 @@ def reconcile_leave_request(
     reconciliation_note: str,
     cover_person=None,
     allow_insufficient_balance: bool = False,
+    attachment_override_reason: str = "",
 ) -> LeaveRequest:
     """
     Create an APPROVED, backdated leave request recorded by HR, deduct balance,
@@ -1618,6 +1621,12 @@ def reconcile_leave_request(
         allow_insufficient_balance=allow_insufficient_balance,
     )
 
+    note = (reconciliation_note or "").strip()
+    override = (attachment_override_reason or "").strip()
+    audit_comment = note
+    if override:
+        audit_comment = f"{note}\n\nAttachment override: {override}"
+
     with transaction.atomic():
         leave_request = LeaveRequest(
             employee=employee,
@@ -1630,7 +1639,7 @@ def reconcile_leave_request(
             is_reconciled=True,
             reconciled_by=hr_user,
             reconciled_at=timezone.now(),
-            reconciliation_note=reconciliation_note,
+            reconciliation_note=note,
         )
         apply_policy_snapshot(leave_request)
         leave_request.save()
@@ -1640,13 +1649,13 @@ def reconcile_leave_request(
             action=ApprovalAction.RECONCILE,
             previous_status="",
             new_status=LeaveRequestStatus.APPROVED,
-            comment=reconciliation_note,
+            comment=audit_comment,
         )
         deduct_leave_balance(
             leave_request,
             source=BalanceTransactionSource.RECONCILE,
             actor=hr_user,
-            reason=reconciliation_note,
+            reason=note,
             allow_insufficient_balance=allow_insufficient_balance,
         )
 
@@ -1940,6 +1949,39 @@ def validate_cover_person_for_submission(
         leave_request.cover_person,
         hr_override=hr_override,
     )
+
+
+def resolved_policy_requires_attachment(
+    leave_type,
+    *,
+    employee,
+    on_date,
+    is_emergency: bool = False,
+) -> bool:
+    """True when the resolved policy requires a file and emergency sick does not apply."""
+    policy = get_active_policy(leave_type, on_date=on_date, employee=employee)
+    if policy is None or not policy.requires_attachment:
+        return False
+    if is_emergency and _leave_type_code(leave_type) == LeaveType.Code.SICK:
+        return False
+    return True
+
+
+def validate_attachments_for_submission(leave_request) -> None:
+    """Block submit when the resolved policy requires a file and none is attached.
+
+    Emergency sick is exempt. Maternity stays required even when marked emergency.
+    """
+    if not resolved_policy_requires_attachment(
+        leave_request.leave_type,
+        employee=leave_request.employee,
+        on_date=leave_request.start_date,
+        is_emergency=leave_request.is_emergency,
+    ):
+        return
+    if leave_request.attachments.exists():
+        return
+    raise ValidationError({"attachments": leave_messages.attachment_required()})
 
 
 def validate_half_day_request(

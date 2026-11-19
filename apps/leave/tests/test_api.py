@@ -691,3 +691,175 @@ class LeaveApiTests(APITestCase):
         self.assertEqual(hr_reject.data["status"], LeaveRequestStatus.REJECTED)
         self.assertEqual(len(mail.outbox), 3)  # requester decision
         self.assertEqual(mail.outbox[2].to, [self.employee.email])
+
+    def _result_ids(self, response):
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.data
+        if isinstance(data, dict) and "results" in data:
+            data = data["results"]
+        return {str(item["id"]) for item in data}
+
+    def test_list_search_matches_name_or_email_not_reason_or_hidden(self):
+        """?search= matches employee name/email across pages, not reason or hidden rows."""
+        from django.conf import settings
+
+        page_size = settings.REST_FRAMEWORK["PAGE_SIZE"]
+        now = timezone.now()
+        other_department = Department.objects.create(name="Search Other Department")
+
+        target = self._create_user_with_roles(
+            "zara.quill@test.com",
+            [RoleName.EMPLOYEE],
+            department=self.department,
+        )
+        target.first_name = "Zara"
+        target.last_name = "Quill"
+        target.save(update_fields=["first_name", "last_name", "updated_at"])
+
+        reason_owner = self._create_user_with_roles(
+            "reason.only@test.com",
+            [RoleName.EMPLOYEE],
+            department=self.department,
+        )
+        reason_owner.first_name = "Reason"
+        reason_owner.last_name = "Only"
+        reason_owner.save(update_fields=["first_name", "last_name", "updated_at"])
+
+        hidden = self._create_user_with_roles(
+            "nora.secret@other.test",
+            [RoleName.EMPLOYEE],
+            department=other_department,
+        )
+        hidden.first_name = "Nora"
+        hidden.last_name = "Secret"
+        hidden.save(update_fields=["first_name", "last_name", "updated_at"])
+
+        draft_owner = self._create_user_with_roles(
+            "drafty.unseen@test.com",
+            [RoleName.EMPLOYEE],
+            department=self.department,
+        )
+        draft_owner.first_name = "Drafty"
+        draft_owner.last_name = "Unseen"
+        draft_owner.save(update_fields=["first_name", "last_name", "updated_at"])
+
+        def build_request(employee, *, created_at, status_value, reason="", day_offset=0):
+            start = self.base_start + datetime.timedelta(days=day_offset)
+            return LeaveRequest(
+                employee=employee,
+                leave_type=self.leave_type,
+                start_date=start,
+                end_date=start + datetime.timedelta(days=1),
+                status=status_value,
+                total_working_days=1,
+                reason=reason,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+
+        # Oldest approved row: a full newer page must hide it from page 1.
+        target_stamp = now - datetime.timedelta(days=page_size + 5)
+        rows = [
+            build_request(
+                target,
+                created_at=target_stamp,
+                status_value=LeaveRequestStatus.APPROVED,
+                reason="Family visit",
+                day_offset=0,
+            ),
+            build_request(
+                reason_owner,
+                created_at=now - datetime.timedelta(days=2),
+                status_value=LeaveRequestStatus.APPROVED,
+                reason="xylophoneholiday mention of Zara Quill",
+                day_offset=3,
+            ),
+            build_request(
+                hidden,
+                created_at=now - datetime.timedelta(days=1),
+                status_value=LeaveRequestStatus.APPROVED,
+                reason="Other department",
+                day_offset=5,
+            ),
+            build_request(
+                draft_owner,
+                created_at=now,
+                status_value=LeaveRequestStatus.DRAFT,
+                reason="Still a draft",
+                day_offset=7,
+            ),
+        ]
+        fillers = []
+        for index in range(page_size):
+            filler = User.objects.create_user(
+                email=f"filler{index}@search-filler.test",
+                password=self.password,
+                first_name=f"Filler{index}",
+                last_name="Person",
+                department=self.department,
+            )
+            fillers.append(filler)
+            rows.append(
+                build_request(
+                    filler,
+                    created_at=now - datetime.timedelta(minutes=page_size - index),
+                    status_value=LeaveRequestStatus.APPROVED,
+                    reason="Filler annual leave",
+                    day_offset=10 + index,
+                )
+            )
+
+        LeaveRequest.objects.bulk_create(rows)
+        target_id = str(LeaveRequest.objects.get(employee=target).id)
+        reason_id = str(LeaveRequest.objects.get(employee=reason_owner).id)
+        hidden_id = str(LeaveRequest.objects.get(employee=hidden).id)
+        draft_id = str(LeaveRequest.objects.get(employee=draft_owner).id)
+
+        self._auth(self.hr_user)
+        page_one = self.client.get(self.list_url)
+        page_one_ids = self._result_ids(page_one)
+        self.assertGreater(page_one.data["count"], page_size)
+        self.assertEqual(len(page_one_ids), page_size)
+        self.assertNotIn(target_id, page_one_ids)
+
+        unfiltered_count = page_one.data["count"]
+        blank_search = self.client.get(self.list_url, {"search": "   "})
+        self.assertEqual(blank_search.data["count"], unfiltered_count)
+
+        by_last_name = self._result_ids(self.client.get(self.list_url, {"search": "Quill"}))
+        self.assertIn(target_id, by_last_name)
+        self.assertNotIn(reason_id, by_last_name)
+
+        by_full_name = self._result_ids(
+            self.client.get(self.list_url, {"search": "  Zara   Quill  "})
+        )
+        self.assertEqual(by_full_name, {target_id})
+
+        by_email = self._result_ids(
+            self.client.get(self.list_url, {"search": "zara.quill@"})
+        )
+        self.assertEqual(by_email, {target_id})
+
+        by_reason = self._result_ids(
+            self.client.get(self.list_url, {"search": "xylophoneholiday"})
+        )
+        self.assertEqual(by_reason, set())
+
+        # Caller cannot already see the other department's request or someone else's draft.
+        self._auth(self.employee)
+        employee_hidden = self._result_ids(
+            self.client.get(self.list_url, {"search": "Nora Secret"})
+        )
+        self.assertNotIn(hidden_id, employee_hidden)
+        employee_draft = self._result_ids(
+            self.client.get(self.list_url, {"search": "Drafty"})
+        )
+        self.assertNotIn(draft_id, employee_draft)
+
+        self._auth(self.hr_user)
+        hr_hidden = self._result_ids(
+            self.client.get(self.list_url, {"search": "Nora Secret"})
+        )
+        self.assertEqual(hr_hidden, {hidden_id})
+        hr_draft = self._result_ids(self.client.get(self.list_url, {"search": "Drafty"}))
+        self.assertNotIn(draft_id, hr_draft)

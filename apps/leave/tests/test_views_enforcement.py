@@ -11,6 +11,7 @@ Covers:
 import datetime
 
 from django.contrib.auth import get_user_model
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from django.urls import reverse
 from rest_framework import status
@@ -1255,9 +1256,21 @@ class LeaveRequestRelieverTests(TestCase):
         resp = self._post_create(self.applicant, self.sick, cover_person=None)
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
         leave_request = LeaveRequest.objects.filter(employee=self.applicant, leave_type=self.sick).latest("created_at")
+        upload = self.client.post(
+            reverse("leave-request-attachments", args=[leave_request.id]),
+            {
+                "file": SimpleUploadedFile(
+                    "note.pdf",
+                    b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF",
+                    content_type="application/pdf",
+                )
+            },
+            format="multipart",
+        )
+        self.assertEqual(upload.status_code, status.HTTP_201_CREATED, upload.data)
         submit_url = reverse("leave-request-submit", args=[leave_request.id])
         submit_resp = self.client.post(submit_url)
-        self.assertEqual(submit_resp.status_code, status.HTTP_200_OK)
+        self.assertEqual(submit_resp.status_code, status.HTTP_200_OK, submit_resp.data)
 
     def test_submit_emergency_annual_without_reliever_succeeds(self):
         self._create_balance(self.applicant, self.annual)

@@ -9,3 +9,4 @@ isort
 pytest
 pytest-django
 factory-boy
+
