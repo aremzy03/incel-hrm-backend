@@ -4,6 +4,7 @@ from decimal import Decimal
 from django.conf import settings
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
+from django.utils import timezone
 
 
 class TimeStampedModel(models.Model):
@@ -86,6 +87,49 @@ class AppraisalCycle(TimeStampedModel):
         return f"{self.name} ({self.get_status_display()})"
 
 
+class TemplateScope(models.TextChoices):
+    ORG = "ORG", "Organization-wide"
+    DEPARTMENT = "DEPARTMENT", "Department"
+    UNIT = "UNIT", "Unit"
+    TEAM = "TEAM", "Team"
+
+
+class TemplateVersionStatus(models.TextChoices):
+    DRAFT = "DRAFT", "Draft"
+    PUBLISHED = "PUBLISHED", "Published"
+    ARCHIVED = "ARCHIVED", "Archived"
+
+
+class SectionKind(models.TextChoices):
+    SCORED = "SCORED", "Scored"
+    INFORMATIONAL_RATING = "INFORMATIONAL_RATING", "Informational rating"
+    NARRATIVE = "NARRATIVE", "Narrative"
+    CHECKBOX = "CHECKBOX", "Checkboxes"
+
+
+class SectionAudience(models.TextChoices):
+    EMPLOYEE = "EMPLOYEE", "Employee"
+    SUPERVISOR = "SUPERVISOR", "Supervisor"
+    BOTH = "BOTH", "Employee and supervisor"
+    HR = "HR", "HR"
+    MANAGEMENT = "MANAGEMENT", "Management"
+
+
+class QuestionResponseType(models.TextChoices):
+    RATING = "RATING", "Rating"
+    SHORT_TEXT = "SHORT_TEXT", "Short text"
+    LONG_TEXT = "LONG_TEXT", "Long text"
+    YES_NO = "YES_NO", "Yes / No"
+    MULTI_SELECT = "MULTI_SELECT", "Multi-select"
+
+
+class AnswerRespondent(models.TextChoices):
+    EMPLOYEE = "EMPLOYEE", "Employee"
+    SUPERVISOR = "SUPERVISOR", "Supervisor"
+    HR = "HR", "HR"
+    MANAGEMENT = "MANAGEMENT", "Management"
+
+
 class AppraisalTemplate(TimeStampedModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     appraisal_type = models.ForeignKey(
@@ -94,45 +138,193 @@ class AppraisalTemplate(TimeStampedModel):
         related_name="templates",
     )
     title = models.CharField(max_length=200)
+    description = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    scope = models.CharField(
+        max_length=20,
+        choices=TemplateScope.choices,
+        blank=True,
+        default="",
+    )
+    scope_key = models.CharField(max_length=80, editable=False)
     department = models.ForeignKey(
         "accounts.Department",
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
         related_name="appraisal_templates",
-        help_text="Leave empty for organization-wide default template",
     )
-    description = models.TextField(blank=True)
-    is_active = models.BooleanField(default=True)
+    unit = models.ForeignKey(
+        "accounts.Unit",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="appraisal_templates",
+    )
+    team = models.ForeignKey(
+        "accounts.Team",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="appraisal_templates",
+    )
 
     class Meta:
         verbose_name = "Appraisal Template"
         verbose_name_plural = "Appraisal Templates"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["appraisal_type", "scope_key"],
+                name="unique_appraisal_template_target",
+            ),
+        ]
 
     def __str__(self):
-        dept_str = f" - {self.department.name}" if self.department else " (General)"
-        return f"{self.title}{dept_str}"
+        return f"{self.title} ({self.scope or 'unassigned'})"
+
+    @property
+    def assignment_locked(self) -> bool:
+        if not self.pk:
+            return False
+        return self.versions.filter(
+            status__in=[TemplateVersionStatus.PUBLISHED, TemplateVersionStatus.ARCHIVED]
+        ).exists()
+
+    def save(self, *args, **kwargs):
+        if not self.scope:
+            if self.team_id:
+                self.scope = TemplateScope.TEAM
+            elif self.unit_id:
+                self.scope = TemplateScope.UNIT
+            elif self.department_id:
+                self.scope = TemplateScope.DEPARTMENT
+
+        if self.scope == TemplateScope.ORG:
+            self.department_id = None
+            self.unit_id = None
+            self.team_id = None
+            self.scope_key = "ORG"
+        elif self.scope == TemplateScope.DEPARTMENT and self.department_id:
+            self.unit_id = None
+            self.team_id = None
+            self.scope_key = f"DEPARTMENT:{self.department_id}"
+        elif self.scope == TemplateScope.UNIT and self.unit_id:
+            self.team_id = None
+            self.scope_key = f"UNIT:{self.unit_id}"
+        elif self.scope == TemplateScope.TEAM and self.team_id:
+            self.scope_key = f"TEAM:{self.team_id}"
+        else:
+            self.scope = ""
+            if self.pk and self.scope_key.startswith("UNASSIGNED:"):
+                pass
+            elif self.pk:
+                self.scope_key = f"UNASSIGNED:{self.pk}"
+            else:
+                self.scope_key = f"UNASSIGNED:{uuid.uuid4()}"
+        super().save(*args, **kwargs)
+
+
+class AppraisalTemplateVersion(TimeStampedModel):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    template = models.ForeignKey(
+        AppraisalTemplate,
+        on_delete=models.CASCADE,
+        related_name="versions",
+    )
+    version_number = models.PositiveIntegerField()
+    status = models.CharField(
+        max_length=20,
+        choices=TemplateVersionStatus.choices,
+        default=TemplateVersionStatus.DRAFT,
+    )
+    published_at = models.DateTimeField(null=True, blank=True)
+    published_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="published_appraisal_template_versions",
+    )
+
+    class Meta:
+        verbose_name = "Appraisal Template Version"
+        verbose_name_plural = "Appraisal Template Versions"
+        ordering = ["-version_number"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["template", "version_number"],
+                name="unique_template_version_number",
+            ),
+            models.UniqueConstraint(
+                fields=["template"],
+                condition=models.Q(status=TemplateVersionStatus.DRAFT),
+                name="one_draft_version_per_template",
+            ),
+            models.UniqueConstraint(
+                fields=["template"],
+                condition=models.Q(status=TemplateVersionStatus.PUBLISHED),
+                name="one_published_version_per_template",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.template.title} v{self.version_number} ({self.status})"
+
+
+class AppraisalPhase(TimeStampedModel):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    version = models.ForeignKey(
+        AppraisalTemplateVersion,
+        on_delete=models.CASCADE,
+        related_name="phases",
+    )
+    title = models.CharField(max_length=255)
+    order = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        verbose_name = "Appraisal Phase"
+        verbose_name_plural = "Appraisal Phases"
+        ordering = ["order", "created_at"]
+
+    def __str__(self):
+        return self.title
 
 
 class AppraisalSection(TimeStampedModel):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    template = models.ForeignKey(
-        AppraisalTemplate,
+    version = models.ForeignKey(
+        AppraisalTemplateVersion,
+        on_delete=models.CASCADE,
+        related_name="sections",
+    )
+    phase = models.ForeignKey(
+        AppraisalPhase,
         on_delete=models.CASCADE,
         related_name="sections",
     )
     title = models.CharField(max_length=255)
     section_code = models.CharField(max_length=50, blank=True)
+    kind = models.CharField(
+        max_length=30,
+        choices=SectionKind.choices,
+        default=SectionKind.NARRATIVE,
+    )
+    audience = models.CharField(
+        max_length=20,
+        choices=SectionAudience.choices,
+        default=SectionAudience.EMPLOYEE,
+    )
     weight = models.DecimalField(
         max_digits=5,
         decimal_places=2,
-        help_text="Percentage weight of this section in total score, e.g. 15.00 for 15%",
+        default=Decimal("0.00"),
+        help_text="Percentage weight of this section in the official score. Only scored sections use this.",
         validators=[MinValueValidator(Decimal("0.00")), MaxValueValidator(Decimal("100.00"))],
     )
     rating_scale_max = models.PositiveSmallIntegerField(
         default=5,
         validators=[MinValueValidator(1), MaxValueValidator(10)],
-        help_text="Maximum Likert rating scale value for questions in this section (e.g. 5 or 4)",
+        help_text="Maximum rating for questions in this section (for example 5 or 4)",
     )
     order = models.PositiveIntegerField(default=1)
 
@@ -142,7 +334,7 @@ class AppraisalSection(TimeStampedModel):
         ordering = ["order", "created_at"]
 
     def __str__(self):
-        return f"{self.title} ({self.weight}%)"
+        return f"{self.title} ({self.kind})"
 
 
 class AppraisalQuestion(TimeStampedModel):
@@ -155,6 +347,22 @@ class AppraisalQuestion(TimeStampedModel):
     prompt = models.TextField()
     description = models.TextField(blank=True)
     order = models.PositiveIntegerField(default=1)
+    response_type = models.CharField(
+        max_length=20,
+        choices=QuestionResponseType.choices,
+        default=QuestionResponseType.RATING,
+    )
+    counts_toward_score = models.BooleanField(default=False)
+    required = models.BooleanField(default=False)
+    weight = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0.00")), MaxValueValidator(Decimal("100.00"))],
+        help_text="Weight among scoring questions in the section. Scoring questions in a section sum to 100.",
+    )
+    options = models.JSONField(default=list, blank=True)
 
     class Meta:
         verbose_name = "Appraisal Question"
@@ -213,6 +421,13 @@ class EmployeeAppraisal(TimeStampedModel):
         on_delete=models.PROTECT,
         related_name="employee_appraisals",
     )
+    template_version = models.ForeignKey(
+        AppraisalTemplateVersion,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="employee_appraisals",
+    )
     status = models.CharField(
         max_length=35,
         choices=EmployeeAppraisalStatus.choices,
@@ -224,6 +439,11 @@ class EmployeeAppraisal(TimeStampedModel):
         default=Decimal("0.00"),
     )
     supervisor_score_total = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("0.00"),
+    )
+    official_score = models.DecimalField(
         max_digits=5,
         decimal_places=2,
         default=Decimal("0.00"),
@@ -250,6 +470,35 @@ class EmployeeAppraisal(TimeStampedModel):
 
     def __str__(self):
         return f"Appraisal: {self.employee.get_full_name()} ({self.cycle.name})"
+
+
+class AppraisalPhaseSubmission(TimeStampedModel):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    appraisal = models.ForeignKey(
+        EmployeeAppraisal,
+        on_delete=models.CASCADE,
+        related_name="phase_submissions",
+    )
+    phase = models.ForeignKey(
+        AppraisalPhase,
+        on_delete=models.CASCADE,
+        related_name="submissions",
+    )
+    respondent = models.CharField(max_length=20, choices=AnswerRespondent.choices)
+    submitted_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        verbose_name = "Appraisal Phase Submission"
+        verbose_name_plural = "Appraisal Phase Submissions"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["appraisal", "phase", "respondent"],
+                name="unique_phase_submission",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.respondent} submitted {self.phase}"
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +549,12 @@ class AppraisalQuestionAnswer(TimeStampedModel):
         on_delete=models.PROTECT,
         related_name="answers",
     )
+    respondent = models.CharField(
+        max_length=20,
+        choices=AnswerRespondent.choices,
+        default=AnswerRespondent.EMPLOYEE,
+    )
+    value = models.JSONField(null=True, blank=True)
     self_rating = models.PositiveSmallIntegerField(null=True, blank=True)
     supervisor_rating = models.PositiveSmallIntegerField(null=True, blank=True)
     comments = models.TextField(blank=True)
@@ -307,7 +562,7 @@ class AppraisalQuestionAnswer(TimeStampedModel):
     class Meta:
         verbose_name = "Appraisal Question Answer"
         verbose_name_plural = "Appraisal Question Answers"
-        unique_together = ("appraisal", "question")
+        unique_together = ("appraisal", "question", "respondent")
 
 
 # ---------------------------------------------------------------------------

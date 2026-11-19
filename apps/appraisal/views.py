@@ -10,26 +10,31 @@ from apps.accounts.models import RoleName
 from apps.accounts.permissions import IsHR
 
 from .models import (
+    AnswerRespondent,
     AppraisalAuditLog,
     AppraisalCycle,
     AppraisalCycleStatus,
     AppraisalPhase4Signoff,
-    AppraisalQuestion,
     AppraisalQuestionAnswer,
     AppraisalSelfPhase1,
     AppraisalSupervisorPhase3,
     AppraisalTemplate,
+    AppraisalTemplateVersion,
     AppraisalType,
     EmployeeAppraisal,
     EmployeeAppraisalStatus,
+    TemplateScope,
 )
 from .serializers import (
     AppraisalAuditLogSerializer,
     AppraisalCycleSerializer,
-    AppraisalPhase4SignoffSerializer,
+    AppraisalTemplateListSerializer,
     AppraisalTemplateSerializer,
+    AppraisalTemplateVersionSerializer,
+    AppraisalTemplateWriteSerializer,
     AppraisalTypeSerializer,
     AppraiseeSignoffSerializer,
+    DynamicStepSubmitSerializer,
     EmployeeAppraisalDetailSerializer,
     EmployeeAppraisalListSerializer,
     HRCalibrationSerializer,
@@ -38,7 +43,26 @@ from .serializers import (
     Phase2And3SupervisorSubmitSerializer,
     ReopenAppraisalSerializer,
 )
-from .services import calculate_appraisal_scores, transition_appraisal_status
+from .services import (
+    TemplateBuildError,
+    calculate_appraisal_scores,
+    clear_phase_submissions,
+    content_phases_complete,
+    duplicate_template,
+    missing_required_prompts,
+    publish_template,
+    published_version_for,
+    record_phase_submission,
+    resolve_appraisal_supervisor,
+    resolve_submit_phase,
+    resolve_template_for_employee,
+    respondents_required_for_phase,
+    save_actor_answers,
+    save_template_document,
+    spawn_answer_shells,
+    sync_phase_workflow,
+    transition_appraisal_status,
+)
 
 User = get_user_model()
 
@@ -73,75 +97,157 @@ class AppraisalCycleViewSet(viewsets.ModelViewSet):
         if cycle.status == AppraisalCycleStatus.ACTIVE:
             return Response({"detail": "Appraisal cycle is already active."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Spawn EmployeeAppraisal instances for all active employees
-        employees = User.objects.filter(is_active=True)
+        org_template, org_version = published_version_for(cycle.appraisal_type_id, TemplateScope.ORG)
+        if org_version is None:
+            return Response(
+                {
+                    "detail": "Publish an organization-wide template for this appraisal type before activating the cycle."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        employees = User.objects.filter(is_active=True).select_related(
+            "department__line_manager",
+            "unit__supervisor",
+            "team",
+        )
         spawned_count = 0
+        by_template: dict[str, int] = {}
 
         with transaction.atomic():
             cycle.status = AppraisalCycleStatus.ACTIVE
             cycle.save()
 
             for emp in employees:
-                # Find department template or default template
-                template = AppraisalTemplate.objects.filter(
-                    appraisal_type=cycle.appraisal_type,
-                    department=emp.department,
-                    is_active=True,
-                ).first()
+                template, version = resolve_template_for_employee(emp, cycle.appraisal_type)
+                if version is None:
+                    template, version = org_template, org_version
 
-                if not template:
-                    template = AppraisalTemplate.objects.filter(
-                        appraisal_type=cycle.appraisal_type,
-                        department__isnull=True,
-                        is_active=True,
-                    ).first()
-
-                if not template:
-                    continue
-
-                # Supervisor detection: employee's line manager or department line manager
-                supervisor = getattr(emp, "line_manager", None)
-                if not supervisor and emp.department:
-                    supervisor = getattr(emp.department, "line_manager", None)
+                supervisor = resolve_appraisal_supervisor(emp)
 
                 appraisal, created = EmployeeAppraisal.objects.get_or_create(
                     employee=emp,
                     cycle=cycle,
                     defaults={
                         "template": template,
+                        "template_version": version,
                         "supervisor": supervisor,
                         "status": EmployeeAppraisalStatus.DRAFT,
                     },
                 )
                 if created:
                     spawned_count += 1
-                    # Initialize answers shell
-                    questions = AppraisalQuestion.objects.filter(section__template=template)
-                    for q in questions:
-                        AppraisalQuestionAnswer.objects.create(appraisal=appraisal, question=q)
+                    by_template[str(template.id)] = by_template.get(str(template.id), 0) + 1
+                    spawn_answer_shells(appraisal)
 
         return Response({
             "detail": f"Appraisal cycle activated successfully. {spawned_count} employee appraisals created.",
             "spawned_count": spawned_count,
+            "by_template": by_template,
         })
 
 
 class AppraisalTemplateViewSet(viewsets.ModelViewSet):
-    queryset = AppraisalTemplate.objects.all()
-    serializer_class = AppraisalTemplateSerializer
+    queryset = AppraisalTemplate.objects.select_related(
+        "appraisal_type", "department", "unit", "team"
+    ).prefetch_related(
+        "versions",
+        "versions__phases",
+        "versions__phases__sections",
+        "versions__phases__sections__questions",
+        "versions__sections",
+        "versions__sections__questions",
+    )
     permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return AppraisalTemplateListSerializer
+        return AppraisalTemplateSerializer
 
     def get_permissions(self):
-        if self.action in ["create", "update", "partial_update", "destroy"]:
+        if self.action in ["create", "partial_update", "publish", "duplicate"]:
             return [IsHR()]
         return [IsAuthenticated()]
+
+    def _template_error(self, exc: TemplateBuildError):
+        body = {"detail": exc.detail}
+        if exc.existing_template_id:
+            body["existing_template_id"] = exc.existing_template_id
+        return Response(body, status=status.HTTP_400_BAD_REQUEST)
+
+    def create(self, request, *args, **kwargs):
+        serializer = AppraisalTemplateWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        template = AppraisalTemplate(
+            title=serializer.validated_data["title"],
+            appraisal_type=serializer.validated_data["appraisal_type"],
+        )
+        try:
+            save_template_document(template, serializer.validated_data)
+        except TemplateBuildError as exc:
+            return self._template_error(exc)
+        return Response(AppraisalTemplateSerializer(template).data, status=status.HTTP_201_CREATED)
+
+    def partial_update(self, request, *args, **kwargs):
+        template = self.get_object()
+        serializer = AppraisalTemplateWriteSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        data = {
+            key: serializer.validated_data[key]
+            for key in request.data
+            if key in serializer.validated_data
+        }
+        try:
+            save_template_document(template, data)
+        except TemplateBuildError as exc:
+            return self._template_error(exc)
+        template.refresh_from_db()
+        return Response(AppraisalTemplateSerializer(template).data)
+
+    @action(detail=True, methods=["post"], url_path="publish")
+    def publish(self, request, pk=None):
+        template = self.get_object()
+        try:
+            publish_template(template, request.user)
+        except TemplateBuildError as exc:
+            return self._template_error(exc)
+        template.refresh_from_db()
+        return Response(AppraisalTemplateSerializer(template).data)
+
+    @action(detail=True, methods=["post"], url_path="duplicate")
+    def duplicate(self, request, pk=None):
+        template = self.get_object()
+        copy = duplicate_template(template)
+        return Response(AppraisalTemplateSerializer(copy).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get"], url_path="versions")
+    def versions(self, request, pk=None):
+        template = self.get_object()
+        versions = template.versions.all()
+        return Response(AppraisalTemplateVersionSerializer(versions, many=True).data)
+
+    @action(detail=True, methods=["get"], url_path=r"versions/(?P<version_id>[^/.]+)")
+    def version_detail(self, request, pk=None, version_id=None):
+        template = self.get_object()
+        version = get_object_or_404(AppraisalTemplateVersion, pk=version_id, template=template)
+        return Response(AppraisalTemplateVersionSerializer(version).data)
 
 
 class EmployeeAppraisalViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = EmployeeAppraisal.objects.select_related(
-        "employee", "supervisor", "cycle", "template"
+        "employee", "supervisor", "cycle", "template", "template_version"
     ).prefetch_related(
-        "answers", "answers__question", "answers__question__section"
+        "answers",
+        "answers__question",
+        "answers__question__section",
+        "template_version__phases",
+        "template_version__phases__sections",
+        "template_version__phases__sections__questions",
+        "template_version__sections",
+        "template_version__sections__questions",
+        "phase_submissions",
     ).all()
     permission_classes = [IsAuthenticated]
 
@@ -190,6 +296,15 @@ class EmployeeAppraisalViewSet(viewsets.ReadOnlyModelViewSet):
         if appraisal.status not in valid_statuses:
             return Response({"detail": f"Appraisal cannot be modified in state {appraisal.get_status_display()}"}, status=status.HTTP_400_BAD_REQUEST)
 
+        if appraisal.template_version_id:
+            return self._submit_versioned(
+                request,
+                appraisal,
+                actor="employee",
+                next_status=EmployeeAppraisalStatus.SELF_SUBMITTED,
+                comment="Employee submitted their section of the appraisal",
+            )
+
         serializer = Phase1And2SelfSubmitSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
@@ -237,9 +352,26 @@ class EmployeeAppraisalViewSet(viewsets.ReadOnlyModelViewSet):
         appraisal = self.get_object()
         user = request.user
 
+        if appraisal.supervisor_id is None:
+            return Response(
+                {
+                    "detail": "This appraisal has no supervisor. Assign a unit supervisor or a department line manager first."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         is_supervisor = appraisal.supervisor == user or user.has_role(RoleName.LINE_MANAGER) or user.has_role(RoleName.SUPERVISOR)
         if not is_supervisor and not (user.is_staff or user.has_role(RoleName.HR)):
             return Response({"detail": "Only assigned supervisor, Line Manager, or HR can submit supervisor assessment."}, status=status.HTTP_403_FORBIDDEN)
+
+        if appraisal.template_version_id:
+            return self._submit_versioned(
+                request,
+                appraisal,
+                actor="supervisor",
+                next_status=EmployeeAppraisalStatus.PENDING_APPRAISEE_ACCEPTANCE,
+                comment="Supervisor submitted their section of the appraisal",
+            )
 
         valid_statuses = [
             EmployeeAppraisalStatus.SELF_SUBMITTED,
@@ -308,6 +440,12 @@ class EmployeeAppraisalViewSet(viewsets.ReadOnlyModelViewSet):
         if appraisal.status != EmployeeAppraisalStatus.PENDING_APPRAISEE_ACCEPTANCE:
             return Response({"detail": f"Appraisal is not pending appraisee sign-off (State: {appraisal.get_status_display()})"}, status=status.HTTP_400_BAD_REQUEST)
 
+        if appraisal.template_version_id and not content_phases_complete(appraisal):
+            return Response(
+                {"detail": "Finish every phase before sign-off."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         serializer = AppraiseeSignoffSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
@@ -340,6 +478,15 @@ class EmployeeAppraisalViewSet(viewsets.ReadOnlyModelViewSet):
         if appraisal.status != EmployeeAppraisalStatus.PENDING_HR_CALIBRATION:
             return Response({"detail": f"Appraisal is not pending HR calibration (State: {appraisal.get_status_display()})"}, status=status.HTTP_400_BAD_REQUEST)
 
+        if appraisal.template_version_id:
+            return self._submit_versioned(
+                request,
+                appraisal,
+                actor="hr",
+                next_status=EmployeeAppraisalStatus.PENDING_MANAGEMENT_DECISION,
+                comment="HR completed calibration",
+            )
+
         serializer = HRCalibrationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
@@ -371,6 +518,15 @@ class EmployeeAppraisalViewSet(viewsets.ReadOnlyModelViewSet):
 
         if appraisal.status != EmployeeAppraisalStatus.PENDING_MANAGEMENT_DECISION:
             return Response({"detail": f"Appraisal is not pending management decision (State: {appraisal.get_status_display()})"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if appraisal.template_version_id:
+            return self._submit_versioned(
+                request,
+                appraisal,
+                actor="management",
+                next_status=EmployeeAppraisalStatus.FINALIZED,
+                comment="Management finalized the appraisal",
+            )
 
         serializer = ManagementFinalizeSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -411,6 +567,10 @@ class EmployeeAppraisalViewSet(viewsets.ReadOnlyModelViewSet):
             actor=user,
             comments=f"Reopened by HR to {target_stage}. Reason: {reason}",
         )
+        if target_stage == EmployeeAppraisalStatus.REOPENED_FOR_EMPLOYEE:
+            clear_phase_submissions(appraisal, "employee")
+        elif target_stage == EmployeeAppraisalStatus.REOPENED_FOR_SUPERVISOR:
+            clear_phase_submissions(appraisal, "supervisor")
 
         return Response(EmployeeAppraisalDetailSerializer(appraisal).data)
 
@@ -419,3 +579,46 @@ class EmployeeAppraisalViewSet(viewsets.ReadOnlyModelViewSet):
         appraisal = self.get_object()
         logs = appraisal.audit_logs.all()
         return Response(AppraisalAuditLogSerializer(logs, many=True).data)
+
+    def _submit_versioned(self, request, appraisal, actor, next_status, comment):
+        serializer = DynamicStepSubmitSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        phase, block = resolve_submit_phase(appraisal, actor, data.get("phase_id"))
+        if block:
+            return Response({"detail": block}, status=status.HTTP_400_BAD_REQUEST)
+        with transaction.atomic():
+            errors = save_actor_answers(appraisal, actor, data.get("answers") or [], phase)
+            if errors:
+                transaction.set_rollback(True)
+                return Response(errors, status=status.HTTP_400_BAD_REQUEST)
+            if phase is not None and actor == "supervisor" and not data.get("is_draft"):
+                required = respondents_required_for_phase(phase)
+                employee_submitted = appraisal.phase_submissions.filter(
+                    phase=phase,
+                    respondent=AnswerRespondent.EMPLOYEE,
+                ).exists()
+                if AnswerRespondent.EMPLOYEE in required and not employee_submitted:
+                    transaction.set_rollback(True)
+                    return Response(
+                        {"detail": "The employee must submit this phase first."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            if not data.get("is_draft"):
+                missing = missing_required_prompts(appraisal, actor, phase)
+                if missing:
+                    transaction.set_rollback(True)
+                    return Response(
+                        {
+                            "detail": "Answer the required questions before submitting.",
+                            "missing": missing,
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if phase is not None:
+                    record_phase_submission(appraisal, phase, actor)
+            calculate_appraisal_scores(appraisal)
+            if not data.get("is_draft"):
+                sync_phase_workflow(appraisal, actor, request.user, comment, next_status)
+        appraisal.refresh_from_db()
+        return Response(EmployeeAppraisalDetailSerializer(appraisal).data)

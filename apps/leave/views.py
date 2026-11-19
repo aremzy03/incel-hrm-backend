@@ -9,6 +9,9 @@ LeaveRequestViewSet        – Full CRUD minus DELETE, role-filtered queryset
   custom actions:
     POST  submit/:id/      – Employee: DRAFT → PENDING_MANAGER
     POST  create-and-submit/ – Create + submit atomically
+    GET/POST attachments/:id/ – List or upload supporting documents
+    DELETE attachments/:id/:attachment_id/ – Owner removes a file while DRAFT
+    POST  attachments/:id/:attachment_id/link/ – 5-minute view or download link
     POST  reconcile/       – HR: backdated leave without approval workflow
     POST  bulk-reconcile/  – HR: batch backdated leave
     POST  bulk-reconcile-csv/ – HR: CSV upload for bulk reconcile
@@ -28,6 +31,7 @@ import json
 from django.db import transaction
 from django.db.models import Q
 from django.http import HttpResponse
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
@@ -46,6 +50,7 @@ from .models import (
     CalendarHoliday,
     HolidayCalendar,
     LeaveApprovalLog,
+    LeaveAttachment,
     LeaveBalance,
     LeaveBalanceTransaction,
     LeaveBlackoutPeriod,
@@ -67,6 +72,7 @@ from .serializers import (
     CalendarHolidaySerializer,
     HolidayCalendarSerializer,
     LeaveApprovalLogSerializer,
+    LeaveAttachmentSerializer,
     LeaveBalanceAdjustSerializer,
     LeaveBalanceSerializer,
     LeaveBalanceTransactionSerializer,
@@ -114,8 +120,21 @@ from .services import (
     snapshot_leave_settings,
     snapshot_leave_type,
     sync_public_holiday_to_default_calendar,
+    validate_attachments_for_submission,
     validate_cover_person_for_submission,
     validate_reconcile_row,
+)
+from .attachments import (
+    save_leave_attachment,
+    user_can_add_leave_attachment,
+    user_can_delete_leave_attachment,
+)
+from .storage import (
+    DISPOSITION_ATTACHMENT,
+    DISPOSITION_INLINE,
+    PRESIGN_EXPIRES_SECONDS,
+    presign_leave_attachment_url,
+    stream_leave_attachment,
 )
 from .workflow import (
     LEGACY_TRANSITIONS,
@@ -1083,6 +1102,18 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
             elif is_reconciled.lower() in ("false", "0", "no"):
                 qs = qs.filter(is_reconciled=False)
 
+        # Name/email search. Every token must match first name, last name, or
+        # email (AND across tokens, OR across those fields). Applied on the
+        # already visibility-scoped queryset. Reason text is not searched.
+        search = (self.request.query_params.get("search") or "").strip()
+        if search:
+            for token in search.split():
+                qs = qs.filter(
+                    Q(employee__first_name__icontains=token)
+                    | Q(employee__last_name__icontains=token)
+                    | Q(employee__email__icontains=token)
+                )
+
         return qs
 
     # ------------------------------------------------------------------
@@ -1101,6 +1132,95 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         return Response(
             {"detail": "DELETE is not supported. Use the cancel action instead."},
             status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+    # ------------------------------------------------------------------
+    # attachments — list, upload, delete, and short-lived view/download links
+    # ------------------------------------------------------------------
+
+    @action(detail=True, methods=["get", "post"], url_path="attachments")
+    def attachments(self, request, pk=None):
+        """
+        GET/POST /api/v1/leave-requests/{id}/attachments/
+
+        List and link follow the same visibility as opening the request.
+        Upload: owner while DRAFT; owner while a pending emergency Sick request
+        (add only); HR at any status the request is visible to them.
+        """
+        leave_request = self.get_object()
+        if request.method == "GET":
+            rows = leave_request.attachments.select_related("uploaded_by").order_by(
+                "created_at"
+            )
+            return Response(LeaveAttachmentSerializer(rows, many=True).data)
+
+        if not user_can_add_leave_attachment(request.user, leave_request):
+            raise PermissionDenied("You cannot add a document to this leave request.")
+        uploaded = request.FILES.get("file")
+        attachment = save_leave_attachment(leave_request, uploaded, request.user)
+        return Response(
+            LeaveAttachmentSerializer(attachment).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(
+        detail=True,
+        methods=["delete"],
+        url_path=r"attachments/(?P<attachment_id>[^/.]+)",
+    )
+    def delete_attachment(self, request, pk=None, attachment_id=None):
+        """DELETE /api/v1/leave-requests/{id}/attachments/{attachment_id}/"""
+        leave_request = self.get_object()
+        if not user_can_delete_leave_attachment(request.user, leave_request):
+            raise PermissionDenied(
+                "Documents can only be removed from a draft by the person who requested the leave."
+            )
+        attachment = get_object_or_404(
+            LeaveAttachment, pk=attachment_id, request=leave_request
+        )
+        attachment.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path=r"attachments/(?P<attachment_id>[^/.]+)/link",
+    )
+    def attachment_link(self, request, pk=None, attachment_id=None):
+        """
+        POST /api/v1/leave-requests/{id}/attachments/{attachment_id}/link/
+
+        Body: {"disposition": "inline" | "attachment"}.
+
+        S3 returns JSON {"url", "expires_in"} (300 seconds). Local storage
+        streams the file with the same Content-Disposition and Content-Type.
+        The URL is minted on click and is not stored or emailed.
+        """
+        leave_request = self.get_object()
+        attachment = get_object_or_404(
+            LeaveAttachment, pk=attachment_id, request=leave_request
+        )
+        disposition = (request.data.get("disposition") or "").strip().lower()
+        if disposition not in (DISPOSITION_INLINE, DISPOSITION_ATTACHMENT):
+            raise ValidationError(
+                {"disposition": "disposition must be 'inline' or 'attachment'."}
+            )
+        storage = attachment.file.storage
+        if getattr(storage, "uses_s3", False):
+            url = presign_leave_attachment_url(
+                attachment.file.name,
+                disposition=disposition,
+                content_type=attachment.content_type,
+                filename=attachment.original_filename,
+                storage=storage,
+            )
+            return Response({"url": url, "expires_in": PRESIGN_EXPIRES_SECONDS})
+        return stream_leave_attachment(
+            attachment.file.name,
+            disposition=disposition,
+            content_type=attachment.content_type,
+            filename=attachment.original_filename,
+            storage=storage,
         )
 
     # ------------------------------------------------------------------
@@ -1126,6 +1246,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         workflow_snapshot = plan["workflow_snapshot"]
 
         validate_cover_person_for_submission(leave_request, hr_override=False)
+        validate_attachments_for_submission(leave_request)
 
         prev_status = leave_request.status
         now = timezone.now()
@@ -1213,6 +1334,7 @@ class LeaveRequestViewSet(viewsets.ModelViewSet):
         workflow_snapshot = plan["workflow_snapshot"]
 
         validate_cover_person_for_submission(leave_request, hr_override=False)
+        validate_attachments_for_submission(leave_request)
 
         prev_status = leave_request.status
         now = timezone.now()

@@ -3,6 +3,7 @@ from django.contrib import admin
 from .models import (
     AppraisalAuditLog,
     AppraisalCycle,
+    AppraisalPhase,
     AppraisalPhase4Signoff,
     AppraisalQuestion,
     AppraisalQuestionAnswer,
@@ -10,6 +11,7 @@ from .models import (
     AppraisalSelfPhase1,
     AppraisalSupervisorPhase3,
     AppraisalTemplate,
+    AppraisalTemplateVersion,
     AppraisalType,
     EmployeeAppraisal,
 )
@@ -17,12 +19,19 @@ from .models import (
 
 class AppraisalQuestionInline(admin.TabularInline):
     model = AppraisalQuestion
-    extra = 1
+    extra = 0
 
 
 class AppraisalSectionInline(admin.StackedInline):
     model = AppraisalSection
-    extra = 1
+    extra = 0
+    fk_name = "phase"
+
+
+class AppraisalPhaseInline(admin.StackedInline):
+    model = AppraisalPhase
+    extra = 0
+    show_change_link = True
 
 
 @admin.register(AppraisalType)
@@ -40,22 +49,35 @@ class AppraisalCycleAdmin(admin.ModelAdmin):
 
 @admin.register(AppraisalTemplate)
 class AppraisalTemplateAdmin(admin.ModelAdmin):
-    list_display = ("title", "appraisal_type", "department", "is_active", "created_at")
-    list_filter = ("appraisal_type", "department", "is_active")
+    list_display = ("title", "appraisal_type", "scope", "department", "unit", "team", "is_active", "created_at")
+    list_filter = ("appraisal_type", "scope", "is_active")
+    search_fields = ("title",)
+
+
+@admin.register(AppraisalTemplateVersion)
+class AppraisalTemplateVersionAdmin(admin.ModelAdmin):
+    list_display = ("template", "version_number", "status", "published_at")
+    list_filter = ("status",)
+    inlines = [AppraisalPhaseInline]
+
+
+@admin.register(AppraisalPhase)
+class AppraisalPhaseAdmin(admin.ModelAdmin):
+    list_display = ("title", "version", "order")
     inlines = [AppraisalSectionInline]
 
 
 @admin.register(AppraisalSection)
 class AppraisalSectionAdmin(admin.ModelAdmin):
-    list_display = ("title", "template", "section_code", "weight", "rating_scale_max", "order")
-    list_filter = ("template",)
+    list_display = ("title", "phase", "version", "kind", "audience", "section_code", "weight", "rating_scale_max", "order")
+    list_filter = ("kind", "audience")
     inlines = [AppraisalQuestionInline]
 
 
 @admin.register(AppraisalQuestion)
 class AppraisalQuestionAdmin(admin.ModelAdmin):
-    list_display = ("prompt", "section", "order")
-    list_filter = ("section__template", "section")
+    list_display = ("prompt", "section", "response_type", "counts_toward_score", "order")
+    list_filter = ("response_type", "counts_toward_score")
 
 
 class AppraisalQuestionAnswerInline(admin.TabularInline):
