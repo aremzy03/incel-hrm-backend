@@ -2,4 +2,5 @@
 
 whitenoise
 django-storages
+boto3
 sentry-sdk

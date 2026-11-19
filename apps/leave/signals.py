@@ -1,10 +1,21 @@
 """Leave lifecycle hooks (termination forfeiture)."""
 
 from django.contrib.auth import get_user_model
-from django.db.models.signals import pre_save
+from django.db.models.signals import post_delete, pre_save
 from django.dispatch import receiver
 
+from .models import LeaveAttachment
+
 User = get_user_model()
+
+
+@receiver(post_delete, sender=LeaveAttachment)
+def delete_leave_attachment_file(sender, instance, **kwargs):
+    """Remove the stored object when the row is deleted, including cascades."""
+    name = instance.file.name
+    if not name:
+        return
+    instance.file.storage.delete(name)
 
 
 @receiver(pre_save, sender=User)

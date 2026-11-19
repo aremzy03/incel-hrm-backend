@@ -18,4 +18,5 @@ urlpatterns = [
     path("api/v1/", include("apps.leave.urls")),
     path("api/v1/", include("apps.loan.urls")),
     path("api/v1/", include("apps.notifications.urls")),
+    path("api/v1/", include("apps.appraisal.urls")),
 ]

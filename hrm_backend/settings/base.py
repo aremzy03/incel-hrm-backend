@@ -46,6 +46,7 @@ LOCAL_APPS = [
     "apps.leave.apps.LeaveConfig",
     "apps.loan",
     "apps.notifications",
+    "apps.appraisal",
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS

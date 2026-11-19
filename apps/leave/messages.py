@@ -538,6 +538,36 @@ def reconciliation_note_required() -> str:
     )
 
 
+def attachment_required() -> str:
+    return (
+        "A supporting document is required before this leave can be submitted. "
+        "Attach a PDF or image. Emergency sick leave can be submitted without one."
+    )
+
+
+def attachment_override_reason_required() -> str:
+    return (
+        "This leave type requires a supporting document. "
+        "Upload one after recording the leave, or provide an override reason."
+    )
+
+
+def attachment_type_rejected() -> str:
+    return "Only PDF, JPG, PNG, and WEBP files are allowed."
+
+
+def attachment_too_large() -> str:
+    return "Each file must be 5 MB or smaller."
+
+
+def attachment_limit() -> str:
+    return "A leave request can have at most 5 attachments."
+
+
+def attachment_empty() -> str:
+    return "The file is empty. Choose a PDF, JPG, PNG, or WEBP file."
+
+
 def bulk_reconcile_rows_required() -> str:
     return (
         "Provide at least one row to reconcile. "

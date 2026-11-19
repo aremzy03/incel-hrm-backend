@@ -5,6 +5,7 @@ from .models import (
     CalendarAssignment,
     HolidayCalendar,
     LeaveApprovalLog,
+    LeaveAttachment,
     LeaveBalance,
     LeaveBalanceTransaction,
     LeaveBlackoutPeriod,
@@ -62,6 +63,7 @@ class LeavePolicyAdmin(admin.ModelAdmin):
         "prorate_new_joiners",
         "half_day_allowed",
         "reliever_required",
+        "requires_attachment",
         "overlap_control_enabled",
         "allow_backdated",
         "maximum_backdate_days",
@@ -187,6 +189,25 @@ class LeaveRequestAdmin(admin.ModelAdmin):
         "updated_at",
     )
     inlines = (LeaveApprovalLogInline,)
+
+
+@admin.register(LeaveAttachment)
+class LeaveAttachmentAdmin(admin.ModelAdmin):
+    list_display = (
+        "original_filename",
+        "request",
+        "content_type",
+        "size",
+        "uploaded_by",
+        "created_at",
+    )
+    list_filter = ("content_type",)
+    search_fields = (
+        "original_filename",
+        "request__employee__email",
+        "uploaded_by__email",
+    )
+    readonly_fields = ("id", "size", "created_at", "updated_at")
 
 
 @admin.register(LeaveApprovalLog)
